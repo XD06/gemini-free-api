@@ -1,5 +1,5 @@
 # Gemini Web to API
-
+<img src="https://th.bing.com/th/id/ODF.nAWZa6qAQb-ILV5Rp8qOrw?w=32&amp;h=32&amp;qlt=90&amp;pcl=fffffa&amp;o=6&amp;pid=1.2" height="32" width="32" alt="全球 Web 图标" class="rms_img" data-bm="32">
 把 Gemini 网页端封装成 OpenAI / Claude / Gemini 兼容接口的本地代理服务。
 
 本项目是网页端逆向实现，行为依赖 Google Gemini Web 的私有请求结构。适合个人研究、调试和本地客户端接入，不建议当作稳定生产服务使用。
