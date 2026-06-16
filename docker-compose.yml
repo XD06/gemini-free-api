@@ -1,0 +1,33 @@
+services:
+  app:
+    build: .
+    container_name: app
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    environment:
+      - PORT=8787
+      - APP_ENV=production
+      - GEMINI_1PSID=${GEMINI_1PSID}
+      - GEMINI_1PSIDTS=${GEMINI_1PSIDTS}
+      - GEMINI_REFRESH_INTERVAL=2
+      - GEMINI_MAX_RETRIES=3
+    restart: unless-stopped
+    tmpfs:
+      - /tmp
+      - /home/appuser/.cache
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:8787/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

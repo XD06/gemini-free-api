@@ -1,0 +1,17 @@
+version: "3"
+
+tasks:
+  run:
+    desc: Run the server
+    cmds:
+      - go run cmd/server/main.go
+
+  dev:
+    desc: Run the server in development mode
+    cmds:
+      - go run cmd/server/main.go
+
+  build:
+    desc: Build the server binary
+    cmds:
+      - go build -o gemini-free-api cmd/server/main.go

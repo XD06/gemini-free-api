@@ -1,0 +1,9 @@
+.git
+.cookies
+.env
+.env.example
+Dockerfile
+README.md
+vendor/
+bin/
+*.log

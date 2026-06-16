@@ -1,0 +1,1041 @@
+﻿{
+    "swagger": "2.0",
+    "info": {
+        "description": "✨Reverse-engineered API for Gemini web app. It can be used as a genuine API key from OpenAI, Gemini, and Claude.",
+        "title": "Gemini Free API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "host": "localhost:8787",
+    "basePath": "/",
+    "paths": {
+        "/claude/v1/messages": {
+            "post": {
+                "description": "Sends a message to the Claude model. Supports both standard JSON response and streaming (SSE) response.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json",
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "Claude"
+                ],
+                "summary": "Send Message (Claude)",
+                "parameters": [
+                    {
+                        "description": "Message Request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_claude_dto.MessageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "SSE stream of dto.StreamEvent JSON objects",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/claude/v1/messages/count_tokens": {
+            "post": {
+                "description": "Estimates the number of tokens for a request",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Claude"
+                ],
+                "summary": "Count Tokens (Claude)",
+                "parameters": [
+                    {
+                        "description": "Message Request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_claude_dto.MessageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/claude/v1/models": {
+            "get": {
+                "description": "Returns a list of available Claude models",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Claude"
+                ],
+                "summary": "List Claude Models",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/claude/v1/models/{model_id}": {
+            "get": {
+                "description": "Get details of a specific Claude model",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Claude"
+                ],
+                "summary": "Get Claude Model",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Model ID",
+                        "name": "model_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/gemini/v1beta/models": {
+            "get": {
+                "description": "Returns a list of models supported by the Gemini API",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Gemini"
+                ],
+                "summary": "List Gemini Models",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GeminiModelsResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/gemini/v1beta/models/{model}:generateContent": {
+            "post": {
+                "description": "Generates content using the Gemini model",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Gemini"
+                ],
+                "summary": "Generate Content (Gemini)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Model ID",
+                        "name": "model",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Generate Request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GeminiGenerateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GeminiGenerateResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/gemini/v1beta/models/{model}:streamGenerateContent": {
+            "post": {
+                "description": "Streams generated content using the Gemini model",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Gemini"
+                ],
+                "summary": "Stream Generate Content (Gemini)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Model ID",
+                        "name": "model",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Generate Request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GeminiGenerateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Chunked JSON response",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/health": {
+            "get": {
+                "description": "Returns the health status of the service. Used by Docker/K8s/cloud platforms to monitor the service.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "System"
+                ],
+                "summary": "Health check",
+                "responses": {
+                    "200": {
+                        "description": "Service is healthy",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "service": {
+                                    "type": "string"
+                                },
+                                "status": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/openai/v1/chat/completions": {
+            "post": {
+                "description": "Generates a completion for the chat message. Supports both standard JSON and streaming (SSE) response.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json",
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "OpenAI"
+                ],
+                "summary": "Chat Completions (OpenAI)",
+                "parameters": [
+                    {
+                        "description": "Chat Completion Request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ChatCompletionRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "SSE stream of dto.ChatCompletionChunk JSON objects",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/openai/v1/models": {
+            "get": {
+                "description": "Returns a list of models supported by the OpenAI-compatible API",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "OpenAI"
+                ],
+                "summary": "List OpenAI Models",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/gemini-free-api_internal_commons_models.ModelListResponse"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "gemini-free-api_internal_commons_models.Message": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_commons_models.ModelData": {
+            "type": "object",
+            "properties": {
+                "created": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "integer"
+                },
+                "display_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "object": {
+                    "type": "string"
+                },
+                "owned_by": {
+                    "type": "string"
+                },
+                "type": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_commons_models.ModelListResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_commons_models.ModelData"
+                    }
+                },
+                "object": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_commons_models.Usage": {
+            "type": "object",
+            "properties": {
+                "completion_tokens": {
+                    "type": "integer"
+                },
+                "input_tokens": {
+                    "type": "integer"
+                },
+                "output_tokens": {
+                    "type": "integer"
+                },
+                "prompt_tokens": {
+                    "type": "integer"
+                },
+                "total_tokens": {
+                    "type": "integer"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_claude_dto.ConfigContent": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "description": "for tool_use",
+                    "type": "string"
+                },
+                "input": {
+                    "description": "for tool_use",
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "name": {
+                    "description": "for tool_use",
+                    "type": "string"
+                },
+                "text": {
+                    "type": "string"
+                },
+                "type": {
+                    "description": "\"text\" or \"tool_use\"",
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_claude_dto.MessageRequest": {
+            "type": "object",
+            "properties": {
+                "max_tokens": {
+                    "type": "integer"
+                },
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_commons_models.Message"
+                    }
+                },
+                "model": {
+                    "type": "string"
+                },
+                "stream": {
+                    "type": "boolean"
+                },
+                "system": {
+                    "type": "string"
+                },
+                "tool_choice": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_claude_dto.ToolChoice"
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_claude_dto.Tool"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_claude_dto.MessageResponse": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_claude_dto.ConfigContent"
+                    }
+                },
+                "id": {
+                    "type": "string"
+                },
+                "model": {
+                    "type": "string"
+                },
+                "role": {
+                    "description": "\"assistant\"",
+                    "type": "string"
+                },
+                "stop_reason": {
+                    "type": "string"
+                },
+                "type": {
+                    "description": "\"message\"",
+                    "type": "string"
+                },
+                "usage": {
+                    "$ref": "#/definitions/gemini-free-api_internal_commons_models.Usage"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_claude_dto.Tool": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "input_schema": {
+                    "description": "@SchemaType object",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_claude_dto.ToolChoice": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "type": {
+                    "description": "\"auto\", \"any\", \"tool\"",
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.Candidate": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.Content"
+                },
+                "finishMessage": {
+                    "type": "string"
+                },
+                "finishReason": {
+                    "type": "string"
+                },
+                "index": {
+                    "type": "integer"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.Content": {
+            "type": "object",
+            "properties": {
+                "parts": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.Part"
+                    }
+                },
+                "role": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.FunctionCall": {
+            "type": "object",
+            "properties": {
+                "args": {
+                    "description": "@SchemaType object",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.FunctionCallingConfig": {
+            "type": "object",
+            "properties": {
+                "allowed_function_names": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "mode": {
+                    "description": "\"AUTO\", \"ANY\", \"NONE\"",
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.FunctionDeclaration": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "parameters": {
+                    "description": "@SchemaType object",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.FunctionResponse": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "response": {
+                    "description": "@SchemaType object",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.GeminiGenerateRequest": {
+            "type": "object",
+            "properties": {
+                "contents": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.Content"
+                    }
+                },
+                "generationConfig": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GenerationConfig"
+                },
+                "safety_settings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "tool_config": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.ToolConfig"
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.Tool"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.GeminiGenerateResponse": {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.Candidate"
+                    }
+                },
+                "usageMetadata": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.UsageMetadata"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.GeminiModel": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "displayName": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "supportedGenerationMethods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "version": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.GeminiModelsResponse": {
+            "type": "object",
+            "properties": {
+                "models": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GeminiModel"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.GenerationConfig": {
+            "type": "object",
+            "properties": {
+                "maxOutputTokens": {
+                    "type": "integer"
+                },
+                "temperature": {
+                    "type": "number"
+                },
+                "topK": {
+                    "type": "integer"
+                },
+                "topP": {
+                    "type": "number"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.InlineData": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "string"
+                },
+                "mimeType": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.Part": {
+            "type": "object",
+            "properties": {
+                "function_call": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.FunctionCall"
+                },
+                "function_response": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.FunctionResponse"
+                },
+                "inline_data": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.InlineData"
+                },
+                "text": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.ResearchSource": {
+            "type": "object",
+            "properties": {
+                "domain": {
+                    "description": "Domain of the source",
+                    "type": "string"
+                },
+                "snippet": {
+                    "description": "Snippet relevant excerpt from the source",
+                    "type": "string"
+                },
+                "title": {
+                    "description": "Title of the source page",
+                    "type": "string"
+                },
+                "url": {
+                    "description": "URL of the source",
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.ResearchStep": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "description": "Description of what this step did",
+                    "type": "string"
+                },
+                "query": {
+                    "description": "Query used in this step (for search steps)",
+                    "type": "string"
+                },
+                "result": {
+                    "description": "Result summary of this step",
+                    "type": "string"
+                },
+                "step_number": {
+                    "description": "StepNumber ordinal step number",
+                    "type": "integer"
+                },
+                "type": {
+                    "description": "Type of step: \"search\", \"read\", \"synthesize\", \"outline\", \"write\"",
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.Tool": {
+            "type": "object",
+            "properties": {
+                "function_declarations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.FunctionDeclaration"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.ToolConfig": {
+            "type": "object",
+            "properties": {
+                "function_calling_config": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.FunctionCallingConfig"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_gemini_dto.UsageMetadata": {
+            "type": "object",
+            "properties": {
+                "candidatesTokenCount": {
+                    "type": "integer"
+                },
+                "promptTokenCount": {
+                    "type": "integer"
+                },
+                "totalTokenCount": {
+                    "type": "integer"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ChatCompletionMessage": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ChatCompletionRequest": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "description": "Optional OpenAI-compatible extension. Requests with the same ID reuse server-side Gemini web conversation context. If omitted, the server can also infer context from standard OpenAI messages history within the same process.",
+                    "type": "string"
+                },
+                "max_tokens": {
+                    "type": "integer"
+                },
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ChatCompletionMessage"
+                    }
+                },
+                "model": {
+                    "type": "string"
+                },
+                "reasoning": {
+                    "description": "Responses-style reasoning options. reasoning.effort maps to Gemini web thinking level.",
+                    "type": "object",
+                    "properties": {
+                        "effort": {
+                            "type": "string",
+                            "enum": [
+                                "low",
+                                "medium",
+                                "high"
+                            ]
+                        }
+                    }
+                },
+                "reasoning_effort": {
+                    "description": "OpenAI-compatible reasoning effort. low/medium map to Standard; high maps to Extended.",
+                    "type": "string",
+                    "enum": [
+                        "low",
+                        "medium",
+                        "high"
+                    ]
+                },
+                "stream": {
+                    "type": "boolean"
+                },
+                "temperature": {
+                    "type": "number"
+                },
+                "thinking_level": {
+                    "description": "Gemini web thinking level extension. Supported values: standard, extended.",
+                    "type": "string",
+                    "enum": [
+                        "standard",
+                        "extended"
+                    ]
+                },
+                "tool_choice": {
+                    "description": "@SchemaType object",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ToolDefinition"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ChatCompletionResponse": {
+            "type": "object",
+            "properties": {
+                "choices": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.Choice"
+                    }
+                },
+                "created": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "model": {
+                    "type": "string"
+                },
+                "object": {
+                    "type": "string"
+                },
+                "usage": {
+                    "$ref": "#/definitions/gemini-free-api_internal_commons_models.Usage"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ChatCompletionResponseMessage": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                },
+                "tool_calls": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ChatCompletionToolCall"
+                    }
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ChatCompletionToolCall": {
+            "type": "object",
+            "properties": {
+                "function": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ChatCompletionToolCallFunction"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "type": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ChatCompletionToolCallFunction": {
+            "type": "object",
+            "properties": {
+                "arguments": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.Choice": {
+            "type": "object",
+            "properties": {
+                "finish_reason": {
+                    "type": "string"
+                },
+                "index": {
+                    "type": "integer"
+                },
+                "message": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ChatCompletionResponseMessage"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ToolDefinition": {
+            "type": "object",
+            "properties": {
+                "function": {
+                    "$ref": "#/definitions/gemini-free-api_internal_modules_openai_dto.ToolFunctionDefinition"
+                },
+                "type": {
+                    "type": "string"
+                }
+            }
+        },
+        "gemini-free-api_internal_modules_openai_dto.ToolFunctionDefinition": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "parameters": {
+                    "description": "@SchemaType object",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            }
+        }
+    }
+}
