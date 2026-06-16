@@ -9,7 +9,7 @@
 | 能力 | OpenAI 兼容 | Claude 兼容 | Gemini 原生兼容 | 说明 |
 |:---|:---:|:---:|:---:|:---|
 | 普通文本对话 | 支持 | 支持 | 支持 | 三种协议都会转发到 Gemini Web |
-| 流式输出 | 真流式 | 模拟流式 | 模拟流式 | 只有 OpenAI 兼容接口接入 provider 实时流 |
+| 流式输出 | 实时流式 | 模拟流式 | 模拟流式 | 只有 OpenAI 兼容接口接入 provider 实时流 |
 | Thinking Level | **支持** | 未接入 | 未接入 | OpenAI 支持 `reasoning_effort` / `reasoning.effort` / `thinking_level` |
 | 思考内容输出 | 支持 | 未接入 | 未接入 | OpenAI 流式通过 `delta.reasoning_content` 输出 |
 | 服务端多轮上下文 | **实验性支持** | 未接入 | 未接入 | 复用 Gemini Web 的 `c/r/rc/context token`，一轮对话只有一条消息记录 |
@@ -101,7 +101,7 @@ Thinking Level：
 | `gemini-3.1-flash-lite` | 映射到 UI 内部 ID | UI 可见模型 |
 | `gemini-3.1-pro` | 映射到 UI 内部 ID | UI 可见模型 |
 
-原项目会从 Gemini 初始化页面里扫描 `gemini-*` 字符串并暴露出来。本项目没有照搬这个策略，因为当前真流式路径的模型选择依赖 Gemini Web 的 `x-goog-ext-525001261-jspb` header，直接暴露页面里所有字符串容易让客户端误以为存在更多独立可选模型。
+原项目会从 Gemini 初始化页面里扫描 `gemini-*` 字符串并暴露出来。本项目没有照搬这个策略，因为当前实时流式路径的模型选择依赖 Gemini Web 的 `x-goog-ext-525001261-jspb` header，直接暴露页面里所有字符串容易让客户端误以为存在更多独立可选模型。
 
 抓包里出现的 `3.5 Flash 扩展` 更接近 Gemini Web 的扩展/深思档位表现，不作为独立模型暴露。客户端需要深度思考时应使用 Thinking Level，例如 `reasoning_effort: "high"` 或 `thinking_level: "extended"`。
 
@@ -184,7 +184,7 @@ Gemini Web 可能对某些服务端上下文续聊请求返回业务错误，例
 
 这类回退是为了优先保证客户端不空白、不假成功。需要排查是否同话题时，请开启调试文件。
 
-OpenAI 真流式请求会始终携带 Gemini Web 常规流式查询参数（`rt=c`、`hl`、`_reqid`、`bl`、`f.sid`）。续聊时额外携带 `source-path=/app/<cid>`；新话题或重建上下文时不带 `source-path`。这样可以避免新话题请求退化成只带 `at` 的非标准路径，降低“客户端收到回答但网页端不落话题”的风险。
+OpenAI 实时流式请求会始终携带 Gemini Web 常规流式查询参数（`rt=c`、`hl`、`_reqid`、`bl`、`f.sid`）。续聊时额外携带 `source-path=/app/<cid>`；新话题或重建上下文时不带 `source-path`。这样可以避免新话题请求退化成只带 `at` 的非标准路径，降低“客户端收到回答但网页端不落话题”的风险。
 
 ## 排错开关
 
@@ -237,7 +237,7 @@ GEMINI_TRACE_STREAM=true
 GEMINI_STREAM_FINISH_IDLE_MS=15000
 ```
 
-OpenAI 真流式在正文出现后，如果一段时间没有新增正文，会主动结束连接。默认 `15000`，设得太小可能截断长回答或思考模型的中途停顿；设为 `0` 可关闭主动收尾。
+OpenAI 实时流式在正文出现后，如果一段时间没有新增正文，会主动结束连接。默认 `15000`，设得太小可能截断长回答或思考模型的中途停顿；设为 `0` 可关闭主动收尾。
 
 ## 环境变量
 
@@ -292,4 +292,4 @@ go test ./...
 
 ## 说明
 
-本项目基于开源项目 [`ntthanh2603/gemini-web-to-api`]([ntthanh2603/gemini-web-to-api: ✨Reverse-engineered API for Gemini web app. It can be used as a genuine API key from OpenAI, Gemini, and Claude.](https://github.com/ntthanh2603/gemini-web-to-api)) 改造。由于 Gemini Web 私有结构会变化，任何涉及 `f.req`、`x-goog-ext-*`、`c/r/rc/context token` 的行为都应以抓包和回归测试为准。
+本项目基于开源项目 [ntthanh2603/gemini-web-to-api: ✨Reverse-engineered API for Gemini web app. It can be used as a genuine API key from OpenAI, Gemini, and Claude.](https://github.com/ntthanh2603/gemini-web-to-api)) 修改。由于 Gemini网页端结构也许会变化，任何涉及 `f.req`、`x-goog-ext-*`、`c/r/rc/context token` 的行为都应以抓包和回归测试为准。
