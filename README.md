@@ -8,7 +8,7 @@
 
 | 能力 | OpenAI 兼容 | Claude 兼容 | Gemini 原生兼容 | 说明 |
 |:---|:---:|:---:|:---:|:---|
-| 普通文本对话 | 支持 | 支持 | 支持 | 三种协议都会转发到 Gemini Web |
+| 普通文本对话 | 支持 | 支持 | 支持 | 三种协议都会转发到 Gemini  |
 | 流式输出 | 实时流式 | 模拟流式 | 模拟流式 | 只有 OpenAI 兼容接口接入 provider 实时流 |
 | Thinking Level | **支持** | 未接入 | 未接入 | OpenAI 支持 `reasoning_effort` / `reasoning.effort` / `thinking_level` |
 | 思考内容输出 | 支持 | 未接入 | 未接入 | OpenAI 流式通过 `delta.reasoning_content` 输出 |
