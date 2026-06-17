@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -1560,9 +1561,102 @@ func normalizeArguments(raw json.RawMessage) string {
 		}
 	}
 
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return "{}"
+	}
+	parsed = sanitizeToolArgumentValue(parsed)
+
+	sanitized, err := json.Marshal(parsed)
+	if err != nil {
+		return "{}"
+	}
 	var compact bytes.Buffer
-	if err := json.Compact(&compact, []byte(trimmed)); err != nil {
+	if err := json.Compact(&compact, sanitized); err != nil {
 		return "{}"
 	}
 	return compact.String()
+}
+
+func sanitizeToolArgumentValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for key, item := range v {
+			v[key] = sanitizeToolArgumentValue(item)
+		}
+		return v
+	case []interface{}:
+		for i, item := range v {
+			v[i] = sanitizeToolArgumentValue(item)
+		}
+		return v
+	case string:
+		return sanitizeToolArgumentString(v)
+	default:
+		return value
+	}
+}
+
+func sanitizeToolArgumentString(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+	if isHTTPURL(trimmed) {
+		return trimmed
+	}
+
+	for i := 0; i < 4; i++ {
+		extracted, ok := extractSingleMarkdownLinkURL(trimmed)
+		if !ok || extracted == trimmed {
+			break
+		}
+		trimmed = strings.TrimSpace(extracted)
+		if isHTTPURL(trimmed) {
+			return trimmed
+		}
+	}
+	return value
+}
+
+func extractSingleMarkdownLinkURL(value string) (string, bool) {
+	if !strings.HasPrefix(value, "[") {
+		return "", false
+	}
+	textEnd := matchingBracketIndex(value, 0, '[', ']')
+	if textEnd < 0 || textEnd+1 >= len(value) || value[textEnd+1] != '(' {
+		return "", false
+	}
+	urlEnd := matchingBracketIndex(value, textEnd+1, '(', ')')
+	if urlEnd < 0 || strings.TrimSpace(value[urlEnd+1:]) != "" {
+		return "", false
+	}
+	return value[textEnd+2 : urlEnd], true
+}
+
+func matchingBracketIndex(value string, start int, open, close byte) int {
+	if start < 0 || start >= len(value) || value[start] != open {
+		return -1
+	}
+	depth := 0
+	for i := start; i < len(value); i++ {
+		switch value[i] {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func isHTTPURL(value string) bool {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed == nil {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
 }

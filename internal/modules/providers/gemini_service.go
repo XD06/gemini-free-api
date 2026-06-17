@@ -2301,7 +2301,7 @@ func maybeDumpStreamRequest(url, formBody string, headers http.Header) {
 	payload := map[string]interface{}{
 		"url":       url,
 		"form_body": formBody,
-		"headers":   headers,
+		"headers":   redactDebugHeaders(headers),
 	}
 	body, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -2355,7 +2355,7 @@ func (d *streamDebugCapture) DumpRequest(url, formBody string, headers http.Head
 	payload := map[string]interface{}{
 		"url":          url,
 		"form_body":    formBody,
-		"headers":      headers,
+		"headers":      redactDebugHeaders(headers),
 		"raw_path":     filepath.Base(d.prefix + ".raw.txt"),
 		"chunks_path":  filepath.Base(d.prefix + ".chunks.jsonl"),
 		"entries_path": filepath.Base(d.prefix + ".entries.jsonl"),
@@ -2368,6 +2368,29 @@ func (d *streamDebugCapture) DumpRequest(url, formBody string, headers http.Head
 	if err := os.WriteFile(d.prefix+".request.json", body, 0600); err != nil {
 		d.log.Warn("failed to write stream request debug capture", zap.String("path", d.prefix+".request.json"), zap.Error(err))
 	}
+}
+
+func redactDebugHeaders(headers http.Header) http.Header {
+	redacted := make(http.Header, len(headers))
+	for key, values := range headers {
+		copied := make([]string, len(values))
+		copy(copied, values)
+		if isSensitiveDebugHeader(key) {
+			for i := range copied {
+				copied[i] = "[REDACTED]"
+			}
+		}
+		redacted[key] = copied
+	}
+	return redacted
+}
+
+func isSensitiveDebugHeader(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if normalized == "cookie" || normalized == "authorization" || normalized == "proxy-authorization" || normalized == "x-goog-authuser" {
+		return true
+	}
+	return strings.Contains(normalized, "token") || strings.Contains(normalized, "secret") || strings.Contains(normalized, "credential")
 }
 
 func (d *streamDebugCapture) WriteRaw(data []byte, elapsed time.Duration) {

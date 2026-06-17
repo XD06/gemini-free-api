@@ -131,6 +131,28 @@ func TestChatCompletionMessageKeepsToolCallFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeArgumentsUnwrapsMarkdownURLValues(t *testing.T) {
+	raw := json.RawMessage(`{"urls":["[[https://opencode.ai/docs/zh-cn/go](https://opencode.ai/docs/zh-cn/go)](https://opencode.ai/docs/zh-cn/go)"],"nested":{"url":"[OpenCode](https://opencode.ai/docs/zh-cn/go)"}}`)
+
+	got := normalizeArguments(raw)
+
+	expected := `{"nested":{"url":"https://opencode.ai/docs/zh-cn/go"},"urls":["https://opencode.ai/docs/zh-cn/go"]}`
+	if got != expected {
+		t.Fatalf("unexpected normalized arguments:\n got: %s\nwant: %s", got, expected)
+	}
+}
+
+func TestNormalizeArgumentsKeepsNonURLMarkdownText(t *testing.T) {
+	raw := json.RawMessage(`{"query":"read [OpenCode Go docs](https://opencode.ai/docs/zh-cn/go) and summarize","numResults":3}`)
+
+	got := normalizeArguments(raw)
+
+	expected := `{"numResults":3,"query":"read [OpenCode Go docs](https://opencode.ai/docs/zh-cn/go) and summarize"}`
+	if got != expected {
+		t.Fatalf("unexpected normalized arguments:\n got: %s\nwant: %s", got, expected)
+	}
+}
+
 func TestPlanRequestContextInfersOpenAIClientHistory(t *testing.T) {
 	service := NewOpenAIService(nil, nil)
 	firstReq := dto.ChatCompletionRequest{

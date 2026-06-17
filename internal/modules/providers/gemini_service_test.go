@@ -64,6 +64,32 @@ func TestParseResponseExtractsGeneratedImages(t *testing.T) {
 	}
 }
 
+func TestRedactDebugHeadersRemovesSensitiveValues(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Cookie", "SID=secret")
+	headers.Set("Authorization", "Bearer secret")
+	headers.Set("X-Sync-Token", "secret-token")
+	headers.Set("User-Agent", "test-agent")
+
+	redacted := redactDebugHeaders(headers)
+
+	if got := redacted.Get("Cookie"); got != "[REDACTED]" {
+		t.Fatalf("expected cookie to be redacted, got %q", got)
+	}
+	if got := redacted.Get("Authorization"); got != "[REDACTED]" {
+		t.Fatalf("expected authorization to be redacted, got %q", got)
+	}
+	if got := redacted.Get("X-Sync-Token"); got != "[REDACTED]" {
+		t.Fatalf("expected token header to be redacted, got %q", got)
+	}
+	if got := redacted.Get("User-Agent"); got != "test-agent" {
+		t.Fatalf("expected user agent to remain, got %q", got)
+	}
+	if got := headers.Get("Cookie"); got != "SID=secret" {
+		t.Fatalf("expected original headers to remain untouched, got %q", got)
+	}
+}
+
 func TestBuildGenerateInnerIncludesConversationMetadataAndContextToken(t *testing.T) {
 	metadata := []interface{}{"c_1", "r_1", "rc_1", nil, nil, nil, nil, nil, nil, ""}
 	inner := buildGenerateInner("hello", nil, "en", "request-id", metadata, "opaque-token")
