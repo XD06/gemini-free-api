@@ -496,11 +496,10 @@ for chunk in stream:
 go test ./...
 ```
 
-核心桥接流程文档：
+维护者入口：
 
-- [OpenAI to Gemini Web Stream Pipeline](docs/openai-gemini-stream-pipeline.md)
-
-这份文档按实际代码路径说明了 OpenAI 请求如何进入 controller、如何在 service 层转成 Gemini Web 请求、如何解析上游流、以及工具调用桥接和服务端多轮上下文各自的稳定性边界。
+- [Core Bridge Handoff](docs/core-bridge-handoff.md)：接手前先读，列出核心边界和改动入口。
+- [OpenAI to Gemini Web Stream Pipeline](docs/openai-gemini-stream-pipeline.md)：完整流程说明，覆盖 OpenAI SSE、Gemini Web 上游解析、工具桥接和多轮上下文回退。
 
 ## 说明
 
