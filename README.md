@@ -496,6 +496,12 @@ for chunk in stream:
 go test ./...
 ```
 
+核心桥接流程文档：
+
+- [OpenAI to Gemini Web Stream Pipeline](docs/openai-gemini-stream-pipeline.md)
+
+这份文档按实际代码路径说明了 OpenAI 请求如何进入 controller、如何在 service 层转成 Gemini Web 请求、如何解析上游流、以及工具调用桥接和服务端多轮上下文各自的稳定性边界。
+
 ## 说明
 
 本项目基于开源项目 [ntthanh2603/gemini-web-to-api: ✨Reverse-engineered API for Gemini web app. It can be used as a genuine API key from OpenAI, Gemini, and Claude.](https://github.com/ntthanh2603/gemini-web-to-api) 修改。由于 Gemini网页端结构也许会变化，任何涉及 `f.req`、`x-goog-ext-*`、`c/r/rc/context token` 的行为都应以抓包和回归测试为准。
