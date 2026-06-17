@@ -18,6 +18,8 @@ const headless = parseBool(process.env.COOKIE_WORKER_HEADLESS || 'false');
 const browserChannel = process.env.COOKIE_WORKER_BROWSER_CHANNEL ?? 'chrome';
 const once = parseBool(process.env.COOKIE_WORKER_ONCE || 'false');
 const openOnly = parseBool(process.env.COOKIE_WORKER_OPEN_ONLY || 'false');
+const postRetries = parseInt(process.env.COOKIE_WORKER_POST_RETRIES || '3', 10);
+const postRetryDelayMs = parseInt(process.env.COOKIE_WORKER_POST_RETRY_DELAY_MS || '2000', 10);
 
 if (!syncToken && !openOnly) {
   throw new Error('COOKIE_SYNC_TOKEN is required');
@@ -98,7 +100,7 @@ async function refreshAccount(account) {
       throw new Error('profile is not logged in or __Secure-1PSID is missing');
     }
 
-    await postCookies(account.id, psid, psidts);
+    await postCookiesWithRetry(account.id, psid, psidts);
     console.log(JSON.stringify({
       level: 'info',
       msg: 'account cookies synced',
@@ -110,6 +112,37 @@ async function refreshAccount(account) {
       await context.close();
     }
   }
+}
+
+async function postCookiesWithRetry(accountID, secure1PSID, secure1PSIDTS) {
+  const attempts = Number.isFinite(postRetries) && postRetries >= 0 ? postRetries + 1 : 4;
+  const delayMs = Number.isFinite(postRetryDelayMs) && postRetryDelayMs >= 0 ? postRetryDelayMs : 2000;
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await postCookies(accountID, secure1PSID, secure1PSIDTS);
+      if (attempt > 1) {
+        console.log(JSON.stringify({ level: 'info', msg: 'account cookie post retry succeeded', account: accountID, attempt }));
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= attempts) {
+        break;
+      }
+      console.error(JSON.stringify({
+        level: 'warn',
+        msg: 'account cookie post failed, retrying',
+        account: accountID,
+        attempt,
+        next_delay_ms: delayMs,
+        error: err.message,
+        cause: err.cause?.message,
+      }));
+      await sleep(delayMs);
+    }
+  }
+  throw lastErr;
 }
 
 async function postCookies(accountID, secure1PSID, secure1PSIDTS) {
