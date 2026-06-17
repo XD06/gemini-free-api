@@ -333,6 +333,8 @@ curl -X POST http://localhost:8787/admin/accounts/acc1/cookies \
 
 Playwright Worker 在 `tools/cookie-worker`，它是独立进程/容器，建议每个账号一个持久 profile 和固定代理：
 
+Worker 还可以单独放一份本地配置文件 `tools/cookie-worker/.env`，优先读取它，再回退到仓库根目录 `.env`。这样 worker 的账号、profile、代理和 token 就不用每次手工输入。
+
 ```bash
 cd tools/cookie-worker
 npm install
@@ -372,6 +374,7 @@ npm run sync
 ```
 
 Worker 会自动读取项目根目录 `.env`。命令行环境变量优先级更高，可临时覆盖 `.env`。
+如果存在 `tools/cookie-worker/.env`，worker 会先读取它，再读取项目根目录 `.env` 作为兜底。
 
 Worker 测试开关：
 

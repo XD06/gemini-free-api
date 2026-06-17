@@ -1,9 +1,12 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
-await loadDotEnv(path.resolve('..', '..', '.env'));
+const workerDir = path.dirname(fileURLToPath(import.meta.url));
+await loadDotEnv(path.resolve(workerDir, '..', '.env'));
+await loadDotEnv(path.resolve(workerDir, '..', '..', '.env'));
 applyLifecycleDefaults();
 
 const apiBase = trimTrailingSlash(process.env.API_BASE || 'http://127.0.0.1:8787');
