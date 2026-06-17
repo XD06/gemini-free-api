@@ -224,8 +224,8 @@ func TestGenerateContentWithConversationIDSendsGeminiWebContinuationRequest(t *t
 	if captured == nil {
 		t.Fatal("expected upstream request to be captured")
 	}
-	if got := captured.URL.Query().Get("source-path"); got != "/app/6a27075d298c2a1d" {
-		t.Fatalf("expected source-path continuation URL, got %q in %s", got, captured.URL.String())
+	if got := captured.URL.Query().Get("source-path"); got != "" {
+		t.Fatalf("source-path should be disabled by default, got %q in %s", got, captured.URL.String())
 	}
 
 	inner := decodeGenerateInnerFromForm(t, capturedBody)
@@ -242,6 +242,57 @@ func TestGenerateContentWithConversationIDSendsGeminiWebContinuationRequest(t *t
 	}
 	if inner[3] != "opaque-token" {
 		t.Fatalf("expected context token in inner[3], got %#v", inner[3])
+	}
+}
+
+func TestGenerateContentWithConversationIDCanSendSourcePathWhenEnabled(t *testing.T) {
+	var captured *http.Request
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(buildGenerateResponse(t, "松月", "c_6a27075d298c2a1d"))),
+				Request:    req,
+			}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+	}
+	client.updateConversation("client-thread", map[string]any{
+		"cid":  "c_6a27075d298c2a1d",
+		"rid":  "r_61dc3d479730df7f",
+		"rcid": "rc_34f69c60774c9654",
+	})
+
+	_, err := client.GenerateContent(context.Background(), "继续", WithModel("gemini-3.5-flash"), WithConversationID("client-thread"), WithSourcePath(true))
+	if err != nil {
+		t.Fatalf("GenerateContent returned error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("expected upstream request to be captured")
+	}
+	if got := captured.URL.Query().Get("source-path"); got != "/app/6a27075d298c2a1d" {
+		t.Fatalf("expected source-path continuation URL, got %q in %s", got, captured.URL.String())
+	}
+}
+
+func TestClientNextRequestIDIsMonotonic(t *testing.T) {
+	client := &Client{requestSeq: 100000}
+
+	first := client.nextRequestID()
+	second := client.nextRequestID()
+
+	if first != "200000" || second != "300000" {
+		t.Fatalf("expected monotonic request ids, got first=%q second=%q", first, second)
 	}
 }
 
@@ -648,6 +699,9 @@ func TestStreamFinishIdleTimeoutConfig(t *testing.T) {
 	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "")
 	if got := streamFinishIdleTimeout(); got != defaultStreamFinishIdleTimeout {
 		t.Fatalf("expected default idle timeout %v, got %v", defaultStreamFinishIdleTimeout, got)
+	}
+	if defaultStreamFinishIdleTimeout != 1500*time.Millisecond {
+		t.Fatalf("expected default idle timeout to be responsive, got %v", defaultStreamFinishIdleTimeout)
 	}
 
 	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "0")

@@ -1,0 +1,15 @@
+{
+  "name": "gemini-cookie-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/worker.mjs",
+    "login": "node src/worker.mjs",
+    "sync": "node src/worker.mjs",
+    "once": "node src/worker.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.61.0"
+  }
+}

@@ -22,15 +22,22 @@ type ImageURLPart struct {
 
 // ChatCompletionMessage supports both content string and content array.
 type ChatCompletionMessage struct {
-	Role        string              `json:"role"`
-	Content     string              `json:"content"`
+	Role       string                   `json:"role"`
+	Content    string                   `json:"content"`
+	ToolCalls  []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string                   `json:"tool_call_id,omitempty"`
+	Name       string                   `json:"name,omitempty"`
+
 	Attachments []models.Attachment `json:"attachments,omitempty"`
 }
 
 func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	type rawMessage struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role       string                   `json:"role"`
+		Content    json.RawMessage          `json:"content"`
+		ToolCalls  []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+		ToolCallID string                   `json:"tool_call_id,omitempty"`
+		Name       string                   `json:"name,omitempty"`
 	}
 
 	var raw rawMessage
@@ -40,6 +47,9 @@ func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 
 	m.Role = raw.Role
 	m.Content = ""
+	m.ToolCalls = raw.ToolCalls
+	m.ToolCallID = raw.ToolCallID
+	m.Name = raw.Name
 	m.Attachments = nil
 
 	if len(raw.Content) == 0 || string(raw.Content) == "null" {
@@ -80,9 +90,34 @@ func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 }
 
 func (m ChatCompletionMessage) ToModelMessage() models.Message {
+	content := m.Content
+	if strings.EqualFold(m.Role, "assistant") && strings.TrimSpace(content) == "" && len(m.ToolCalls) > 0 {
+		if body, err := json.Marshal(m.ToolCalls); err == nil {
+			content = "Assistant requested tool calls: " + string(body)
+		}
+	}
+	if strings.EqualFold(m.Role, "tool") {
+		var b strings.Builder
+		b.WriteString("Tool result")
+		if strings.TrimSpace(m.Name) != "" {
+			b.WriteString(" from ")
+			b.WriteString(strings.TrimSpace(m.Name))
+		}
+		if strings.TrimSpace(m.ToolCallID) != "" {
+			b.WriteString(" (")
+			b.WriteString(strings.TrimSpace(m.ToolCallID))
+			b.WriteString(")")
+		}
+		if strings.TrimSpace(content) != "" {
+			b.WriteString(": ")
+			b.WriteString(strings.TrimSpace(content))
+		}
+		content = b.String()
+	}
+
 	return models.Message{
 		Role:        m.Role,
-		Content:     m.Content,
+		Content:     content,
 		Attachments: m.Attachments,
 	}
 }

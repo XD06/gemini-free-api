@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -81,17 +82,28 @@ func (h *OpenAIController) HandleModels(c fiber.Ctx) error {
 // @Failure 500 {object} map[string]interface{}
 // @Router /openai/v1/chat/completions [post]
 func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
+	requestID := generateChatID()
 	rawBody := append([]byte(nil), c.Body()...)
+	bindBody := trimJSONBOM(rawBody)
+	if len(bindBody) != len(rawBody) {
+		c.Request().SetBody(bindBody)
+	}
 	var req dto.ChatCompletionRequest
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("invalid request body: %w", err), "invalid_request_error"))
 	}
-	dumpOpenAIRawRequest(rawBody, h.log)
+	dumpOpenAIRawRequest(requestID, bindBody, h.log)
 	if openAIRequestDebugEnabled() {
 		h.log.Info("OpenAI chat request received",
+			zap.String("request_id", requestID),
 			zap.String("model", req.Model),
 			zap.Bool("stream", req.Stream),
+			zap.Bool("tools_enabled", req.HasToolsEnabled()),
+			zap.Int("tool_count", len(req.Tools)),
+			zap.String("tool_choice_mode", req.ToolChoiceMode()),
+			zap.String("forced_tool_name", req.ForcedToolName()),
 			zap.Bool("has_conversation_id", strings.TrimSpace(req.ConversationID) != ""),
+			zap.String("conversation_id", strings.TrimSpace(req.ConversationID)),
 			zap.Int("message_count", len(req.Messages)),
 			zap.Any("messages", summarizeOpenAIMessages(req.Messages)),
 		)
@@ -106,6 +118,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
+			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
 			err := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
 				return utils.SendSSEEvent(w, h.log, chunk)
@@ -127,6 +140,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
 	response, err := h.service.CreateChatCompletion(ctx, req)
 	if err != nil {
@@ -176,11 +190,18 @@ func (c *OpenAIController) Register(group fiber.Router) {
 	group.Post("/images/generations", c.HandleImageGenerations)
 }
 
+func trimJSONBOM(body []byte) []byte {
+	return bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
+}
+
 type openAIMessageLogSummary struct {
 	Index           int    `json:"index"`
 	Role            string `json:"role"`
 	ContentLength   int    `json:"content_length"`
 	ContentPreview  string `json:"content_preview,omitempty"`
+	ToolCallCount   int    `json:"tool_call_count,omitempty"`
+	ToolCallID      string `json:"tool_call_id,omitempty"`
+	Name            string `json:"name,omitempty"`
 	AttachmentCount int    `json:"attachment_count,omitempty"`
 }
 
@@ -193,6 +214,9 @@ func summarizeOpenAIMessages(messages []dto.ChatCompletionMessage) []openAIMessa
 			Role:            msg.Role,
 			ContentLength:   len(content),
 			ContentPreview:  previewForLog(content, 160),
+			ToolCallCount:   len(msg.ToolCalls),
+			ToolCallID:      strings.TrimSpace(msg.ToolCallID),
+			Name:            strings.TrimSpace(msg.Name),
 			AttachmentCount: len(msg.Attachments),
 		})
 	}
@@ -208,7 +232,7 @@ func previewForLog(content string, limit int) string {
 	return content[:limit] + "..."
 }
 
-func dumpOpenAIRawRequest(rawBody []byte, log *zap.Logger) {
+func dumpOpenAIRawRequest(requestID string, rawBody []byte, log *zap.Logger) {
 	dir := strings.TrimSpace(os.Getenv("GEMINI_DEBUG_STREAM_DIR"))
 	if dir == "" || len(rawBody) == 0 {
 		return
@@ -217,13 +241,32 @@ func dumpOpenAIRawRequest(rawBody []byte, log *zap.Logger) {
 		log.Warn("failed to create OpenAI request debug directory", zap.String("dir", dir), zap.Error(err))
 		return
 	}
-	name := time.Now().Format("20060102_150405.000") + "_openai_chat_request.json"
+	shortID := requestID
+	if len(shortID) > 16 {
+		shortID = shortID[:16]
+	}
+	name := time.Now().Format("20060102_150405.000") + "_" + sanitizeOpenAIDebugFilename(shortID) + "_openai_chat_request.json"
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, rawBody, 0600); err != nil {
 		log.Warn("failed to write OpenAI request debug capture", zap.String("path", path), zap.Error(err))
 		return
 	}
 	log.Info("OpenAI raw request debug capture written", zap.String("path", path))
+}
+
+func sanitizeOpenAIDebugFilename(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	if b.Len() == 0 {
+		return "request"
+	}
+	return b.String()
 }
 
 func openAIRequestDebugEnabled() bool {

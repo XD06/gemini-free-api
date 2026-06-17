@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +11,51 @@ import (
 	"gemini-free-api/internal/modules/openai/dto"
 	"gemini-free-api/internal/modules/providers"
 )
+
+type fakeGeminiClient struct {
+	streamEvents []providers.StreamEvent
+	streamErrs   []error
+	prompts      []string
+	configs      []providers.GenerateConfig
+}
+
+func (f *fakeGeminiClient) Init(context.Context) error { return nil }
+
+func (f *fakeGeminiClient) GenerateContent(context.Context, string, ...providers.GenerateOption) (*providers.Response, error) {
+	return &providers.Response{}, nil
+}
+
+func (f *fakeGeminiClient) StartChat(...providers.ChatOption) providers.ChatSession { return nil }
+
+func (f *fakeGeminiClient) Close() error { return nil }
+
+func (f *fakeGeminiClient) GetName() string { return "fake" }
+
+func (f *fakeGeminiClient) IsHealthy() bool { return true }
+
+func (f *fakeGeminiClient) ListModels() []providers.ModelInfo { return nil }
+
+func (f *fakeGeminiClient) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event providers.StreamEvent) bool, options ...providers.GenerateOption) error {
+	f.prompts = append(f.prompts, prompt)
+	var cfg providers.GenerateConfig
+	for _, opt := range options {
+		opt(&cfg)
+	}
+	f.configs = append(f.configs, cfg)
+	for _, event := range f.streamEvents {
+		if !onEvent(event) {
+			return nil
+		}
+	}
+	if len(f.streamErrs) > 0 {
+		err := f.streamErrs[0]
+		f.streamErrs = f.streamErrs[1:]
+		return err
+	}
+	return nil
+}
+
+func (f *fakeGeminiClient) HasConversationState(string) bool { return true }
 
 func TestModelAndThinkingLevelUsesExplicitLevel(t *testing.T) {
 	model, level := modelAndThinkingLevel("gemini-3.5-flash:thinking=extended", "standard")
@@ -55,6 +103,31 @@ func TestRequestThinkingLevelReadsNestedReasoningEffort(t *testing.T) {
 
 	if level != "standard" {
 		t.Fatalf("expected low reasoning effort to map to standard, got %q", level)
+	}
+}
+
+func TestChatCompletionMessageKeepsToolCallFields(t *testing.T) {
+	var msg dto.ChatCompletionMessage
+	err := json.Unmarshal([]byte(`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"query\":\"GitHub trending\"}"}}]}`), &msg)
+	if err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Name != "search" {
+		t.Fatalf("expected tool call fields to be preserved, got %#v", msg.ToolCalls)
+	}
+	modelMsg := msg.ToModelMessage()
+	if !strings.Contains(modelMsg.Content, "Assistant requested tool calls") || !strings.Contains(modelMsg.Content, "GitHub trending") {
+		t.Fatalf("expected model message to describe tool call, got %q", modelMsg.Content)
+	}
+
+	var toolMsg dto.ChatCompletionMessage
+	err = json.Unmarshal([]byte(`{"role":"tool","tool_call_id":"call_1","content":"search result text"}`), &toolMsg)
+	if err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	modelToolMsg := toolMsg.ToModelMessage()
+	if !strings.Contains(modelToolMsg.Content, "Tool result (call_1): search result text") {
+		t.Fatalf("expected model message to describe tool result, got %q", modelToolMsg.Content)
 	}
 }
 
@@ -259,6 +332,44 @@ func TestPlanRequestContextRebuildsWhenClientRetriesFromEarlierPrefix(t *testing
 	}
 }
 
+func TestPlanRequestContextReusesProviderWhenClientDropsOldestTurns(t *testing.T) {
+	service := NewOpenAIService(nil, nil)
+	providerID := "provider-long-thread"
+	transcript := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "第一轮：记住词语松月"},
+		{Role: "assistant", Content: "已记住松月"},
+		{Role: "user", Content: "第二轮：解释连接池"},
+		{Role: "assistant", Content: "连接池用于复用连接"},
+		{Role: "user", Content: "第三轮：解释 keep-alive"},
+		{Role: "assistant", Content: "keep-alive 可以降低握手开销"},
+		{Role: "user", Content: "第四轮：解释超时"},
+		{Role: "assistant", Content: "超时会关闭闲置连接"},
+	}
+	service.rememberRequestContext(openAIContextPlan{
+		ProviderConversationID: providerID,
+		RequestMessages:        transcript[:len(transcript)-1],
+		ResponseText:           transcript[len(transcript)-1].Content,
+	})
+
+	req := dto.ChatCompletionRequest{
+		Messages: append(cloneChatMessages(transcript[2:]), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "第五轮：刚才第一轮让你记住的词是什么？",
+		}),
+	}
+	plan := service.planRequestContext(req)
+
+	if plan.ProviderConversationID != providerID {
+		t.Fatalf("expected truncated client history to reuse %q, got %q", providerID, plan.ProviderConversationID)
+	}
+	if !plan.AutoContext {
+		t.Fatal("expected truncated client history to use server-side context")
+	}
+	if plan.Prompt != "第五轮：刚才第一轮让你记住的词是什么？" {
+		t.Fatalf("expected only latest user prompt, got %q", plan.Prompt)
+	}
+}
+
 func TestPlanRequestContextFallsBackToRootWhenAssistantTextDiffers(t *testing.T) {
 	service := NewOpenAIService(nil, nil)
 	firstPlan := openAIContextPlan{
@@ -347,5 +458,339 @@ func TestRememberRequestContextSkipsMissingProviderConversationState(t *testing.
 
 	if len(service.transcriptContexts) != 0 {
 		t.Fatalf("expected missing provider state not to be remembered, got %#v", service.transcriptContexts)
+	}
+}
+
+func TestStreamSkipsSameContextRetryForGemini1097(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamErrs: []error{errors.New("gemini bard error 1097")},
+	}
+	service := NewOpenAIService(client, nil)
+
+	prefix := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好，有什么可以帮你？"},
+	}
+	key := transcriptFingerprint(prefix)
+	service.transcriptContexts[key] = "provider-1"
+	service.transcriptContextUpdated[key] = time.Now()
+	service.providerLatestTranscript["provider-1"] = key
+	service.providerLatestLength["provider-1"] = len(prefix)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: append(cloneChatMessages(prefix), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "继续",
+		}),
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(client.configs) != 2 {
+		t.Fatalf("expected context attempt plus stateless fallback only, got %d calls: %#v", len(client.configs), client.configs)
+	}
+	if client.configs[0].ConversationID != "provider-1" {
+		t.Fatalf("expected first call to use provider-1, got %q", client.configs[0].ConversationID)
+	}
+	if client.configs[1].ConversationID == "" || client.configs[1].ConversationID == "provider-1" {
+		t.Fatalf("expected fallback to use fresh provider conversation, got %q", client.configs[1].ConversationID)
+	}
+	if len(service.transcriptContexts) != 0 {
+		t.Fatalf("expected stale provider context to be forgotten, got %#v", service.transcriptContexts)
+	}
+}
+
+func TestCreateChatCompletionStreamEmitsToolCallsForToolBridgeJSON(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: `{"tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"trending repositories on GitHub today"}}]}`},
+		},
+	}, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "帮我搜索一下 GitHub 的热点"},
+		},
+		Tools: []dto.ToolDefinition{
+			{
+				Type: "function",
+				Function: dto.ToolFunctionDefinition{
+					Name:        "mcp__exa__web_search_exa",
+					Description: "Search the web",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+				},
+			},
+		},
+		Stream: true,
+	}
+
+	var chunks []dto.ChatCompletionChunk
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		chunks = append(chunks, chunk)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+
+	var gotToolCall *dto.ChatCompletionChunkDeltaToolCall
+	for _, chunk := range chunks {
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		if strings.Contains(choice.Delta.Content, `"tool_calls"`) {
+			t.Fatalf("tool bridge JSON leaked as content: %q", choice.Delta.Content)
+		}
+		if len(choice.Delta.ToolCalls) > 0 {
+			gotToolCall = &choice.Delta.ToolCalls[0]
+		}
+	}
+	if gotToolCall == nil {
+		t.Fatalf("expected streamed tool call chunk, got %#v", chunks)
+	}
+	if gotToolCall.Type != "function" || gotToolCall.Function.Name != "mcp__exa__web_search_exa" {
+		t.Fatalf("unexpected tool call: %#v", gotToolCall)
+	}
+	if gotToolCall.Function.Arguments != `{"query":"trending repositories on GitHub today"}` {
+		t.Fatalf("unexpected arguments: %q", gotToolCall.Function.Arguments)
+	}
+
+	lastChoice := chunks[len(chunks)-1].Choices[0]
+	if lastChoice.FinishReason != "tool_calls" {
+		t.Fatalf("expected finish_reason tool_calls, got %q", lastChoice.FinishReason)
+	}
+}
+
+func TestCreateChatCompletionStreamTreatsToolChoiceNoneAsNormalStreaming(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: "普通"},
+			{Kind: "content_delta", Delta: "回答"},
+		},
+	}, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+		},
+		Tools:         []dto.ToolDefinition{{Type: "function", Function: dto.ToolFunctionDefinition{Name: "noop"}}},
+		ToolChoiceRaw: json.RawMessage(`"none"`),
+		Stream:        true,
+	}
+
+	var content strings.Builder
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 {
+			content.WriteString(chunk.Choices[0].Delta.Content)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if content.String() != "普通回答" {
+		t.Fatalf("expected normal streaming content, got %q", content.String())
+	}
+}
+
+func TestCreateChatCompletionStreamWithoutToolsBypassesToolBridge(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: "真"},
+			{Kind: "content_delta", Delta: "流式"},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+		},
+		Stream: true,
+	}
+
+	var deltas []string
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			deltas = append(deltas, chunk.Choices[0].Delta.Content)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if strings.Join(deltas, "") != "真流式" || len(deltas) != 2 {
+		t.Fatalf("expected direct streaming without buffering, got %#v", deltas)
+	}
+	if len(client.prompts) != 1 || strings.Contains(client.prompts[0], "OpenAI-compatible assistant running behind a bridge") {
+		t.Fatalf("request without tools must bypass tool bridge, got prompts %#v", client.prompts)
+	}
+}
+
+func TestCreateChatCompletionStreamStreamsNormalAnswerWhenToolsAreAuto(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: "这是"},
+			{Kind: "content_delta", Delta: "普通回答"},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "解释一下递归是什么"},
+		},
+		Tools:  []dto.ToolDefinition{{Type: "function", Function: dto.ToolFunctionDefinition{Name: "mcp__exa__web_search_exa"}}},
+		Stream: true,
+	}
+
+	var deltas []string
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			deltas = append(deltas, chunk.Choices[0].Delta.Content)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("expected content to stream in two chunks, got %#v", deltas)
+	}
+	if strings.Join(deltas, "") != "这是普通回答" {
+		t.Fatalf("unexpected streamed content: %#v", deltas)
+	}
+	if len(client.prompts) != 1 || !strings.Contains(client.prompts[0], "OpenAI-compatible assistant running behind a bridge") {
+		t.Fatalf("expected auto tools request to use temporary tool planner, got prompts %#v", client.prompts)
+	}
+}
+
+func TestCreateChatCompletionStreamDoesNotUseToolBridgeAfterToolResult(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: "根据结果，"},
+			{Kind: "content_delta", Delta: "热门项目包括 Webwright。"},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "帮我搜索一下今天GitHub的热门项目。"},
+			{Role: "assistant", ToolCalls: []dto.ChatCompletionToolCall{{
+				ID:   "call_1",
+				Type: "function",
+				Function: dto.ChatCompletionToolCallFunction{
+					Name:      "mcp__exa__web_search_exa",
+					Arguments: `{"query":"GitHub trending today"}`,
+				},
+			}}},
+			{Role: "tool", ToolCallID: "call_1", Name: "mcp__exa__web_search_exa", Content: "Title: Microsoft/Webwright"},
+		},
+		Tools:  []dto.ToolDefinition{{Type: "function", Function: dto.ToolFunctionDefinition{Name: "mcp__exa__web_search_exa"}}},
+		Stream: true,
+	}
+
+	var deltas []string
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			deltas = append(deltas, chunk.Choices[0].Delta.Content)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("expected tool-result answer to stream in two chunks, got %#v", deltas)
+	}
+	if strings.Join(deltas, "") != "根据结果，热门项目包括 Webwright。" {
+		t.Fatalf("unexpected streamed content: %#v", deltas)
+	}
+	if len(client.prompts) != 1 || strings.Contains(client.prompts[0], "OpenAI-compatible assistant running behind a bridge") {
+		t.Fatalf("expected tool-result answer to skip tool bridge, got prompts %#v", client.prompts)
+	}
+	if len(client.configs) != 1 || client.configs[0].ConversationID == "" {
+		t.Fatalf("expected tool-result answer to use a provider conversation, got configs %#v", client.configs)
+	}
+}
+
+func TestCreateChatCompletionStreamUsesTemporaryToolBridgeForGreetingWithTools(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: "你好"},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+		},
+		Tools:  []dto.ToolDefinition{{Type: "function", Function: dto.ToolFunctionDefinition{Name: "mcp__exa__web_search_exa"}}},
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool { return true })
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(client.prompts) != 1 || !strings.Contains(client.prompts[0], "OpenAI-compatible assistant running behind a bridge") {
+		t.Fatalf("expected greeting to use tool bridge planner, got prompts %#v", client.prompts)
+	}
+	if len(client.configs) != 1 || client.configs[0].ConversationID != "" {
+		t.Fatalf("tool bridge planner must be temporary, got configs %#v", client.configs)
+	}
+}
+
+func TestCreateChatCompletionStreamDoesNotAppendToolBridgeToExistingConversation(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "content_delta", Delta: `{"tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"GitHub trending today"}}]}`},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+	firstPlan := openAIContextPlan{
+		ProviderConversationID: "provider-thread",
+		RequestMessages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+		},
+		ResponseText: "你好！",
+	}
+	service.rememberRequestContext(firstPlan)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+			{Role: "assistant", Content: "你好！"},
+			{Role: "user", Content: "今天 GitHub 的热点是什么？"},
+		},
+		Tools:  []dto.ToolDefinition{{Type: "function", Function: dto.ToolFunctionDefinition{Name: "mcp__exa__web_search_exa"}}},
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool { return true })
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(client.configs) != 1 {
+		t.Fatalf("expected one provider call, got %#v", client.configs)
+	}
+	if client.configs[0].ConversationID != "" {
+		t.Fatalf("tool bridge planning must not append to existing conversation, got %q", client.configs[0].ConversationID)
 	}
 }

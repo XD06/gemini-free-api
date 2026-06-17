@@ -96,6 +96,7 @@ type GenerateConfig struct {
 	MaxTokens      int
 	ThinkingLevel  string
 	ConversationID string
+	SourcePath     bool
 }
 
 // InputFile is an in-memory file to upload with a generation request.
@@ -148,6 +149,15 @@ func WithThinkingLevel(level string) GenerateOption {
 func WithConversationID(id string) GenerateOption {
 	return func(c *GenerateConfig) {
 		c.ConversationID = id
+	}
+}
+
+// WithSourcePath controls whether Gemini Web continuation requests include the
+// URL source-path=/app/<conversation> parameter. Conversation metadata is still
+// sent in the request body when this is false.
+func WithSourcePath(enabled bool) GenerateOption {
+	return func(c *GenerateConfig) {
+		c.SourcePath = enabled
 	}
 }
 

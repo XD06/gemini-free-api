@@ -19,6 +19,8 @@ profile.cov
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+node_modules/
+tools/cookie-worker/node_modules/
 
 # Go workspace file
 go.work
@@ -30,6 +32,9 @@ config.yml
 
 # cookies
 .cookies/
+data/cookies/
+data/state/
+tools/cookie-worker/profiles/
 
 # env file
 .env

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gemini-free-api/internal/commons/configs"
@@ -30,18 +31,23 @@ import (
 )
 
 type Client struct {
-	httpClient    *req.Client
-	rawHTTPClient *http.Client
-	cookies       *CookieStore
-	at            string
-	cookieHeader  string // full Cookie header string built by refreshSessionToken, used in GenerateContent
-	pushID        string
-	buildLabel    string
-	sessionID     string
-	language      string
-	mu            sync.RWMutex // protects: at, healthy, cookieHeader, pushID, buildLabel, sessionID, language
-	healthy       bool
-	log           *zap.Logger
+	accountID       string
+	proxyURL        string
+	cookieSource    string
+	cookieCache     bool
+	cookieCachePath string
+	httpClient      *req.Client
+	rawHTTPClient   *http.Client
+	cookies         *CookieStore
+	at              string
+	cookieHeader    string // full Cookie header string built by refreshSessionToken, used in GenerateContent
+	pushID          string
+	buildLabel      string
+	sessionID       string
+	language        string
+	mu              sync.RWMutex // protects: at, healthy, cookieHeader, pushID, buildLabel, sessionID, language
+	healthy         bool
+	log             *zap.Logger
 
 	autoRefresh      bool
 	refreshInterval  time.Duration
@@ -52,6 +58,12 @@ type Client struct {
 	conversations    map[string]*SessionMetadata
 	conversationSeen map[string]time.Time
 	conversationMu   sync.Mutex
+	statusMu         sync.RWMutex
+	healthState      string
+	lastError        string
+	lastValidated    time.Time
+	lastCookieSync   time.Time
+	requestSeq       uint64
 }
 
 type CookieStore struct {
@@ -65,6 +77,14 @@ const (
 	defaultRefreshIntervalMinutes = 2
 	maxConversationCacheEntries   = 1000
 	conversationCacheTTL          = 12 * time.Hour
+)
+
+const (
+	AccountStateHealthy          = "healthy"
+	AccountStateRefreshing       = "refreshing"
+	AccountStateExpired          = "expired"
+	AccountStateNeedsManualLogin = "needs_manual_login"
+	AccountStateUninitialized    = "uninitialized"
 )
 
 var (
@@ -81,18 +101,43 @@ var (
 )
 
 func NewClient(cfg *configs.Config, log *zap.Logger) *Client {
+	return NewClientForAccount(cfg, defaultGeminiAccountConfig(cfg), log)
+}
+
+func defaultGeminiAccountConfig(cfg *configs.Config) configs.GeminiAccountConfig {
+	if cfg != nil && len(cfg.Gemini.Accounts) > 0 {
+		return cfg.Gemini.Accounts[0]
+	}
+	return configs.GeminiAccountConfig{
+		ID:              "default",
+		Secure1PSID:     cfg.Gemini.Secure1PSID,
+		Secure1PSIDTS:   cfg.Gemini.Secure1PSIDTS,
+		ProxyURL:        cfg.Server.ProxyURL,
+		StayMinutes:     180,
+		RefreshInterval: cfg.Gemini.RefreshInterval,
+		MaxRetries:      cfg.Gemini.MaxRetries,
+	}
+}
+
+func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfig, log *zap.Logger) *Client {
+	if account.ID == "" {
+		account.ID = "default"
+	}
 	cookies := &CookieStore{
-		Secure1PSID:   cfg.Gemini.Secure1PSID,
-		Secure1PSIDTS: cfg.Gemini.Secure1PSIDTS,
+		Secure1PSID:   account.Secure1PSID,
+		Secure1PSIDTS: account.Secure1PSIDTS,
 		UpdatedAt:     time.Now(),
 	}
 
 	client := req.NewClient().
 		SetTimeout(10 * time.Minute).
 		SetCommonHeaders(DefaultHeaders)
+	if account.ProxyURL != "" {
+		client.SetProxyURL(account.ProxyURL)
+	}
 
 	rawTransport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxyFunc(account.ProxyURL),
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
@@ -107,25 +152,127 @@ func NewClient(cfg *configs.Config, log *zap.Logger) *Client {
 	}
 
 	refreshIntervalMinutes := cfg.Gemini.RefreshInterval
+	if account.RefreshInterval > 0 {
+		refreshIntervalMinutes = account.RefreshInterval
+	}
 	if refreshIntervalMinutes <= 0 {
 		refreshIntervalMinutes = defaultRefreshIntervalMinutes
 	}
+	maxRetries := account.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = cfg.Gemini.MaxRetries
+	}
 
 	return &Client{
+		accountID:        account.ID,
+		proxyURL:         account.ProxyURL,
+		cookieSource:     account.CookieSource,
+		cookieCache:      cfg.Gemini.CookieCache,
+		cookieCachePath:  cfg.Gemini.CookieCachePath,
 		httpClient:       client,
 		rawHTTPClient:    rawClient,
 		cookies:          cookies,
 		autoRefresh:      true,
 		refreshInterval:  time.Duration(refreshIntervalMinutes) * time.Minute,
 		stopRefresh:      make(chan struct{}),
-		maxRetries:       cfg.Gemini.MaxRetries,
+		maxRetries:       maxRetries,
 		log:              log,
 		conversations:    make(map[string]*SessionMetadata),
 		conversationSeen: make(map[string]time.Time),
+		healthState:      AccountStateUninitialized,
+		requestSeq:       uint64(time.Now().UnixNano()%900000) + 100000,
+	}
+}
+
+type AccountStatus struct {
+	ID             string    `json:"id"`
+	Healthy        bool      `json:"healthy"`
+	State          string    `json:"state"`
+	ProxyURL       string    `json:"proxy_url,omitempty"`
+	CookieSource   string    `json:"cookie_source,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
+	LastValidated  time.Time `json:"last_validated,omitempty"`
+	LastCookieSync time.Time `json:"last_cookie_sync,omitempty"`
+	Active         bool      `json:"active,omitempty"`
+	ActiveUntil    time.Time `json:"active_until,omitempty"`
+}
+
+func (c *Client) AccountStatus() AccountStatus {
+	c.mu.RLock()
+	healthy := c.healthy
+	c.mu.RUnlock()
+
+	c.statusMu.RLock()
+	state := c.healthState
+	lastError := c.lastError
+	lastValidated := c.lastValidated
+	lastCookieSync := c.lastCookieSync
+	c.statusMu.RUnlock()
+	if state == "" {
+		state = AccountStateUninitialized
+	}
+
+	return AccountStatus{
+		ID:             c.accountID,
+		Healthy:        healthy,
+		State:          state,
+		ProxyURL:       c.proxyURL,
+		CookieSource:   c.cookieSource,
+		LastError:      lastError,
+		LastValidated:  lastValidated,
+		LastCookieSync: lastCookieSync,
+	}
+}
+
+func (c *Client) setAccountState(state string, err error) {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	c.healthState = state
+	if err != nil {
+		c.lastError = err.Error()
+	} else {
+		c.lastError = ""
+	}
+	if state == AccountStateHealthy {
+		c.lastValidated = time.Now()
+	}
+}
+
+func proxyFunc(proxyURL string) func(*http.Request) (*url.URL, error) {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return func(*http.Request) (*url.URL, error) {
+			return nil, err
+		}
+	}
+	return http.ProxyURL(parsed)
+}
+
+func (c *Client) nextRequestID() string {
+	return strconv.FormatUint(atomic.AddUint64(&c.requestSeq, 100000), 10)
+}
+
+func (c *Client) newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 proxyFunc(c.proxyURL),
+			MaxIdleConns:          20,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       60 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+		Timeout: timeout,
 	}
 }
 
 func (c *Client) Init(ctx context.Context) error {
+	c.setAccountState(AccountStateRefreshing, nil)
 	// Clean cookies
 	c.cookies.Secure1PSID = cleanCookie(c.cookies.Secure1PSID)
 	configPSIDTS := cleanCookie(c.cookies.Secure1PSIDTS) // Save original config value
@@ -173,6 +320,7 @@ func (c *Client) Init(ctx context.Context) error {
 	}
 
 	if err != nil {
+		c.setAccountState(AccountStateNeedsManualLogin, err)
 		return err
 	}
 
@@ -180,6 +328,7 @@ func (c *Client) Init(ctx context.Context) error {
 	_ = c.SaveCachedCookies()
 
 	c.log.Info("✅ Gemini client initialized successfully")
+	c.setAccountState(AccountStateHealthy, nil)
 
 	// 5. Start auto-refresh in background
 	if c.autoRefresh {
@@ -194,6 +343,9 @@ func (c *Client) refreshSessionToken() error {
 	tmpClient := req.NewClient().
 		SetTimeout(30 * time.Second).
 		SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	if c.proxyURL != "" {
+		tmpClient.SetProxyURL(c.proxyURL)
+	}
 
 	resp1, err := tmpClient.R().Get("https://www.google.com/")
 	extraCookies := ""
@@ -230,11 +382,9 @@ func (c *Client) refreshSessionToken() error {
 		"User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 
-	hClient := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil // follow redirects
-		},
+	hClient := c.newHTTPClient(30 * time.Second)
+	hClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return nil // follow redirects
 	}
 
 	// Helper to merge cookies into a map to avoid duplicates
@@ -426,12 +576,10 @@ func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string) {
 
 // startAutoRefresh periodically refreshes the PSIDTS cookie
 func (c *Client) startAutoRefresh() {
-	ticker := time.NewTicker(c.refreshInterval)
-	defer ticker.Stop()
-
 	for {
+		timer := time.NewTimer(jitterDuration(c.refreshInterval))
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			c.log.Debug("Starting scheduled cookie refresh")
 			rotateErr := c.RotateCookies()
 			if rotateErr != nil {
@@ -447,6 +595,7 @@ func (c *Client) startAutoRefresh() {
 					c.mu.Lock()
 					c.healthy = false
 					c.mu.Unlock()
+					c.setAccountState(AccountStateNeedsManualLogin, rotateErr)
 					continue
 				}
 
@@ -462,25 +611,46 @@ func (c *Client) startAutoRefresh() {
 					c.mu.Lock()
 					c.healthy = false
 					c.mu.Unlock()
+					c.setAccountState(AccountStateExpired, sessionErr)
 				} else {
 					c.log.Info("Session token refreshed successfully after rotation failure")
 					// Ensure client is marked healthy since session token is valid
 					c.mu.Lock()
 					c.healthy = true
 					c.mu.Unlock()
+					c.setAccountState(AccountStateHealthy, nil)
 				}
 			} else {
 				// Rotation succeeded — also refresh session token to keep SNlM0e/at up to date
 				if sessionErr := c.refreshSessionToken(); sessionErr != nil {
 					c.log.Warn("Cookie rotated but session token refresh failed", zap.Error(sessionErr))
+					c.setAccountState(AccountStateExpired, sessionErr)
 				} else {
 					c.log.Info("Cookie and session token refreshed successfully")
+					c.setAccountState(AccountStateHealthy, nil)
 				}
 			}
 		case <-c.stopRefresh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
 		}
 	}
+}
+
+func jitterDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = time.Duration(defaultRefreshIntervalMinutes) * time.Minute
+	}
+	half := base / 2
+	if half <= 0 {
+		return base
+	}
+	return half + time.Duration(rand.Int63n(int64(base)))
 }
 
 func (c *Client) RotateCookies() error {
@@ -526,7 +696,7 @@ func (c *Client) rotateCookiesOnce() error {
 	req.Header.Set("Cookie", cookieStr)
 
 	c.log.Debug("Sending rotation request", zap.String("url", EndpointRotateCookies))
-	hClient := &http.Client{Timeout: 5 * time.Second}
+	hClient := c.newHTTPClient(5 * time.Second)
 	resp, err := hClient.Do(req)
 	if err != nil {
 		// Log as Info to avoid scary stacktraces in development mode for expected auth failures
@@ -577,6 +747,72 @@ func (c *Client) GetCookies() *CookieStore {
 	}
 }
 
+func (c *Client) UpdateCookies(ctx context.Context, secure1PSID, secure1PSIDTS string) error {
+	_ = ctx
+	secure1PSID = cleanCookie(secure1PSID)
+	secure1PSIDTS = cleanCookie(secure1PSIDTS)
+	if secure1PSID == "" {
+		return errors.New("secure_1psid is required")
+	}
+
+	c.statusMu.RLock()
+	oldHealthState := c.healthState
+	oldLastError := c.lastError
+	oldLastValidated := c.lastValidated
+	oldLastCookieSync := c.lastCookieSync
+	c.statusMu.RUnlock()
+
+	c.setAccountState(AccountStateRefreshing, nil)
+
+	c.cookies.mu.Lock()
+	oldPSID := c.cookies.Secure1PSID
+	oldPSIDTS := c.cookies.Secure1PSIDTS
+	oldUpdatedAt := c.cookies.UpdatedAt
+	c.cookies.Secure1PSID = secure1PSID
+	c.cookies.Secure1PSIDTS = secure1PSIDTS
+	c.cookies.UpdatedAt = time.Now()
+	c.cookies.mu.Unlock()
+
+	if err := c.refreshSessionToken(); err != nil {
+		c.cookies.mu.Lock()
+		c.cookies.Secure1PSID = oldPSID
+		c.cookies.Secure1PSIDTS = oldPSIDTS
+		c.cookies.UpdatedAt = oldUpdatedAt
+		c.cookies.mu.Unlock()
+		c.statusMu.Lock()
+		c.healthState = oldHealthState
+		c.lastError = oldLastError
+		c.lastValidated = oldLastValidated
+		c.lastCookieSync = oldLastCookieSync
+		c.statusMu.Unlock()
+		return fmt.Errorf("validate updated cookies: %w", err)
+	}
+
+	c.httpClient.SetCommonCookies(c.cookies.ToHTTPCookies()...)
+	if err := c.SaveCachedCookies(); err != nil && c.log != nil {
+		c.log.Warn("failed to save updated cookies", zap.String("account", c.accountID), zap.Error(err))
+	}
+	if c.cookieCache {
+		if err := saveAccountCookieCache(c.cookieCachePath, c.accountID, secure1PSID, secure1PSIDTS, "worker"); err != nil && c.log != nil {
+			c.log.Warn("failed to save account cookie cache", zap.String("account", c.accountID), zap.Error(err))
+		}
+	}
+	c.cookieSource = "worker"
+
+	c.statusMu.Lock()
+	c.healthState = AccountStateHealthy
+	c.lastError = ""
+	c.lastValidated = time.Now()
+	c.lastCookieSync = time.Now()
+	c.statusMu.Unlock()
+
+	c.mu.Lock()
+	c.healthy = true
+	c.mu.Unlock()
+
+	return nil
+}
+
 func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...GenerateOption) (*Response, error) {
 	config := &GenerateConfig{}
 	for _, opt := range options {
@@ -625,7 +861,10 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	requestID := strings.ToUpper(uuid.NewString())
 	resolvedModelID := config.Model
 	expectedConversationCID := c.conversationID(config.ConversationID)
-	sourcePath := c.conversationSourcePath(config.ConversationID)
+	sourcePath := ""
+	if config.SourcePath {
+		sourcePath = c.conversationSourcePath(config.ConversationID)
+	}
 	inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
 
 	innerJSON, _ := json.Marshal(inner)
@@ -641,7 +880,7 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	queryValues := url.Values{}
 	queryValues.Set("at", at)
 	queryValues.Set("hl", language)
-	queryValues.Set("_reqid", fmt.Sprintf("%d", rand.Intn(90000)+10000))
+	queryValues.Set("_reqid", c.nextRequestID())
 	queryValues.Set("rt", "c")
 	if sourcePath != "" {
 		queryValues.Set("source-path", sourcePath)
@@ -786,7 +1025,7 @@ type StreamState struct {
 }
 
 const maxStreamParseBufferBytes = 512 * 1024
-const defaultStreamFinishIdleTimeout = 15 * time.Second
+const defaultStreamFinishIdleTimeout = 1500 * time.Millisecond
 
 func (c *Client) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
 	state := &StreamState{}
@@ -892,7 +1131,10 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	requestID := strings.ToUpper(uuid.NewString())
 	resolvedModelID := config.Model
 	expectedConversationCID := c.conversationID(config.ConversationID)
-	sourcePath := c.conversationSourcePath(config.ConversationID)
+	sourcePath := ""
+	if config.SourcePath {
+		sourcePath = c.conversationSourcePath(config.ConversationID)
+	}
 	inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
 	innerJSON, _ := json.Marshal(inner)
 	outer := []interface{}{nil, string(innerJSON)}
@@ -906,7 +1148,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	queryValues := url.Values{}
 	queryValues.Set("at", at)
 	queryValues.Set("hl", language)
-	queryValues.Set("_reqid", fmt.Sprintf("%d", rand.Intn(90000)+10000))
+	queryValues.Set("_reqid", c.nextRequestID())
 	queryValues.Set("rt", "c")
 	if sourcePath != "" {
 		queryValues.Set("source-path", sourcePath)
@@ -1659,6 +1901,42 @@ func (c *Client) conversationID(id string) string {
 
 func (c *Client) HasConversationState(id string) bool {
 	return c.conversationID(id) != ""
+}
+
+func (c *Client) ListAccountStatuses() []AccountStatus {
+	status := c.AccountStatus()
+	status.Active = true
+	return []AccountStatus{status}
+}
+
+func (c *Client) UpdateAccountCookies(ctx context.Context, accountID, secure1PSID, secure1PSIDTS string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID != "" && accountID != c.accountID {
+		return fmt.Errorf("Gemini account %q not found", accountID)
+	}
+	return c.UpdateCookies(ctx, secure1PSID, secure1PSIDTS)
+}
+
+func (c *Client) RefreshAccount(ctx context.Context, accountID string) error {
+	_ = ctx
+	accountID = strings.TrimSpace(accountID)
+	if accountID != "" && accountID != c.accountID {
+		return fmt.Errorf("Gemini account %q not found", accountID)
+	}
+	c.setAccountState(AccountStateRefreshing, nil)
+	if err := c.RotateCookies(); err != nil {
+		c.setAccountState(AccountStateExpired, err)
+		return err
+	}
+	if err := c.refreshSessionToken(); err != nil {
+		c.setAccountState(AccountStateExpired, err)
+		return err
+	}
+	c.mu.Lock()
+	c.healthy = true
+	c.mu.Unlock()
+	c.setAccountState(AccountStateHealthy, nil)
+	return nil
 }
 
 func (c *Client) checkConversationContinuity(id, expectedCID string, metadata map[string]any, contentAlreadyEmitted bool) error {
@@ -2635,6 +2913,7 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	c.healthy = false
 	c.mu.Unlock()
+	c.setAccountState(AccountStateExpired, errors.New("client closed"))
 	return nil
 }
 

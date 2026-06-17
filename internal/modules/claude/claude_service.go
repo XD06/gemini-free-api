@@ -17,11 +17,11 @@ import (
 )
 
 type ClaudeService struct {
-	client *providers.Client
+	client providers.GeminiClient
 	log    *zap.Logger
 }
 
-func NewClaudeService(client *providers.Client, log *zap.Logger) *ClaudeService {
+func NewClaudeService(client providers.GeminiClient, log *zap.Logger) *ClaudeService {
 	return &ClaudeService{
 		client: client,
 		log:    log,
