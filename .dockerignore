@@ -2,8 +2,17 @@
 .cookies
 .env
 .env.example
+data
 Dockerfile
+docker-compose.yml
 README.md
+LICENSE
 vendor/
 bin/
 *.log
+*.zip
+scratch.zip
+examples/
+tools/
+**/node_modules/
+**/*_test.go

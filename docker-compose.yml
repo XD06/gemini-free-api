@@ -1,33 +1,45 @@
 services:
   app:
     build: .
-    container_name: app
+    container_name: gemini-free-api
     ports:
       - "8787:8787"
     env_file:
       - .env
     environment:
-      - PORT=8787
-      - APP_ENV=production
-      - GEMINI_1PSID=${GEMINI_1PSID}
-      - GEMINI_1PSIDTS=${GEMINI_1PSIDTS}
-      - GEMINI_REFRESH_INTERVAL=2
-      - GEMINI_MAX_RETRIES=3
+      # This single image does not ship Node/Chromium, so the cookie worker
+      # cannot run inside it. The app also auto-skips it when the worker dir is
+      # missing; set false explicitly to keep logs clean.
+      - GEMINI_COOKIE_WORKER_ENABLED=false
     restart: unless-stopped
-    tmpfs:
-      - /tmp
-      - /home/appuser/.cache
+    volumes:
+      # Persist cookie cache + account rotation state across restarts.
+      # App WORKDIR is /home/appuser. Written paths:
+      #   data/cookies/  <- GEMINI_COOKIE_CACHE_PATH
+      #   data/state/    <- GEMINI_ACCOUNT_STATE_PATH
+      - gemini-data:/home/appuser/data
+      # Hard-coded cookie jar dir (gemini_service.go).
+      - gemini-cookies:/home/appuser/.cookies
     healthcheck:
+      # NOTE: must be a real GET, not `wget --spider`. --spider issues a HEAD,
+      # but /health is GET-only (Fiber app.Get), so HEAD returns 404 and wget
+      # exits 8, falsely marking the container unhealthy.
       test:
         [
           "CMD",
           "wget",
           "--quiet",
           "--tries=1",
-          "--spider",
+          "--timeout=5",
+          "-O",
+          "/dev/null",
           "http://localhost:8787/health",
         ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  gemini-data:
+  gemini-cookies:
