@@ -143,22 +143,13 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 
 	useToolBridge := shouldUseToolBridge(req)
 	if useToolBridge {
-		plannerContext := s.toolPlannerConversationPlan(contextPlan, req)
-		if plannerContext.Reused {
-			prompt = s.buildToolBridgeContinuationPrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
-		} else {
-			prompt = s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
-		}
-		contextPlan.ToolPlannerConversationID = plannerContext.ConversationID
+		prompt = s.buildToolBridgePrompt(req, contextPlan.Prompt, toolBridgeRequiresToolCall(req))
 	}
 
 	providerModel, thinkingLevel := modelAndThinkingLevel(req.Model, requestThinkingLevel(req))
 	baseOpts := []providers.GenerateOption{}
-	plannerBaseOpts := []providers.GenerateOption{}
 	if providerModel != "" {
-		modelOpt := providers.WithModel(providerModel)
-		baseOpts = append(baseOpts, modelOpt)
-		plannerBaseOpts = append(plannerBaseOpts, modelOpt)
+		baseOpts = append(baseOpts, providers.WithModel(providerModel))
 	}
 	if thinkingLevel != "" {
 		baseOpts = append(baseOpts, providers.WithThinkingLevel(thinkingLevel))
@@ -166,14 +157,8 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	if geminiSourcePathEnabled() {
 		baseOpts = append(baseOpts, providers.WithSourcePath(true))
 	}
-	optsBase := baseOpts
-	if useToolBridge {
-		optsBase = plannerBaseOpts
-	}
-	opts := append([]providers.GenerateOption{}, optsBase...)
-	if useToolBridge {
-		opts = append(opts, providers.WithConversationID(contextPlan.ToolPlannerConversationID))
-	} else if contextPlan.ProviderConversationID != "" {
+	opts := append([]providers.GenerateOption{}, baseOpts...)
+	if contextPlan.ProviderConversationID != "" {
 		opts = append(opts, providers.WithConversationID(contextPlan.ProviderConversationID))
 	}
 	inputFiles, err := s.inputFilesFromModelMessages(ctx, modelMessages)
@@ -182,34 +167,13 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	}
 	if len(inputFiles) > 0 {
 		baseOpts = append(baseOpts, providers.WithInputFiles(inputFiles))
-		if !useToolBridge {
-			opts = append(opts, providers.WithInputFiles(inputFiles))
-		}
+		opts = append(opts, providers.WithInputFiles(inputFiles))
 	}
 	s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_initial", prompt, opts, inputFiles, useToolBridge, nil)
 
 	// Logic: Call Provider
 	response, err := s.client.GenerateContent(ctx, prompt, opts...)
-	if err != nil && useToolBridge {
-		s.forgetToolPlannerConversation(contextPlan.ToolPlannerConversationID)
-		if s.log != nil {
-			s.log.Warn("tool planner request failed, retrying with fresh Gemini conversation",
-				zap.String("request_id", requestID),
-				zap.String("stale_tool_planner_conversation_id", strings.TrimSpace(contextPlan.ToolPlannerConversationID)),
-				zap.Error(err),
-			)
-		}
-		plannerContext := s.toolPlannerConversationPlan(contextPlan, req)
-		contextPlan.ToolPlannerConversationID = plannerContext.ConversationID
-		fallbackPrompt := s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
-		fallbackOpts := append([]providers.GenerateOption{}, plannerBaseOpts...)
-		fallbackOpts = append(fallbackOpts, providers.WithConversationID(contextPlan.ToolPlannerConversationID))
-		s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_tool_planner_fallback", fallbackPrompt, fallbackOpts, inputFiles, true, err)
-		response, err = s.client.GenerateContent(ctx, fallbackPrompt, fallbackOpts...)
-		prompt = fallbackPrompt
-		opts = fallbackOpts
-	}
-	if err != nil && contextPlan.AutoContext && !useToolBridge {
+	if err != nil && contextPlan.AutoContext {
 		if s.log != nil {
 			s.log.Warn("server-side context request failed, retrying stateless OpenAI prompt",
 				zap.String("request_id", requestID),
@@ -219,7 +183,7 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 		}
 		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
 		if useToolBridge {
-			fallbackPrompt = s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
+			fallbackPrompt = s.buildToolBridgePrompt(req, fallbackPrompt, toolBridgeRequiresToolCall(req))
 		}
 		if fallbackPrompt != "" {
 			s.forgetProviderConversation(contextPlan.ProviderConversationID)
@@ -247,46 +211,14 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 			message.ToolCalls = plan.ToolCalls
 			finishReason = "tool_calls"
 		} else if plan.NoTool {
-			mainOpts := append([]providers.GenerateOption{}, baseOpts...)
-			if contextPlan.ProviderConversationID != "" {
-				mainOpts = append(mainOpts, providers.WithConversationID(contextPlan.ProviderConversationID))
-			}
-			s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_main_after_no_tool", contextPlan.Prompt, mainOpts, inputFiles, false, nil)
-			mainResp, err := s.client.GenerateContent(ctx, contextPlan.Prompt, mainOpts...)
-			if err != nil && strings.TrimSpace(contextPlan.ProviderConversationID) != "" {
-				s.forgetProviderConversation(contextPlan.ProviderConversationID)
-				if s.log != nil {
-					s.log.Warn("tool no-op main request failed, retrying with fresh Gemini conversation",
-						zap.String("request_id", requestID),
-						zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
-						zap.Error(err),
-					)
-				}
-				fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
-				if strings.TrimSpace(fallbackPrompt) == "" {
-					fallbackPrompt = contextPlan.Prompt
-				}
-				fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
-				s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_main_after_no_tool_fallback", fallbackPrompt, fallbackOpts, inputFiles, false, err)
-				mainResp, err = s.client.GenerateContent(ctx, fallbackPrompt, fallbackOpts...)
-				prompt = fallbackPrompt
-			}
-			if err != nil {
-				return nil, err
-			}
-			contextPlan.ResponseText = mainResp.Text
-			message.Content = mainResp.Text
-			response = mainResp
-			prompt = contextPlan.Prompt
+			message.Content = plan.Content
 		} else {
 			message.Content = plan.Content
 		}
 	} else {
 		message.Content = response.Text
 	}
-	if !useToolBridge || finishReason != "tool_calls" {
-		s.rememberRequestContext(contextPlan)
-	}
+	s.rememberRequestContext(contextPlan)
 
 	promptTokens := len(prompt) / 4
 	completionTokens := len(response.Text) / 4
@@ -484,13 +416,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	}
 	useToolBridge := shouldUseToolBridge(req)
 	if useToolBridge {
-		plannerContext := s.toolPlannerConversationPlan(contextPlan, req)
-		if plannerContext.Reused {
-			prompt = s.buildToolBridgeContinuationPrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
-		} else {
-			prompt = s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
-		}
-		contextPlan.ToolPlannerConversationID = plannerContext.ConversationID
+		prompt = s.buildToolBridgePrompt(req, contextPlan.Prompt, toolBridgeRequiresToolCall(req))
 	}
 	if openAIRequestDebugEnabled() && s.log != nil {
 		s.log.Info("OpenAI stream execution plan",
@@ -510,11 +436,8 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 
 	providerModel, thinkingLevel := modelAndThinkingLevel(req.Model, requestThinkingLevel(req))
 	baseOpts := []providers.GenerateOption{}
-	plannerBaseOpts := []providers.GenerateOption{}
 	if providerModel != "" {
-		modelOpt := providers.WithModel(providerModel)
-		baseOpts = append(baseOpts, modelOpt)
-		plannerBaseOpts = append(plannerBaseOpts, modelOpt)
+		baseOpts = append(baseOpts, providers.WithModel(providerModel))
 	}
 	if thinkingLevel != "" {
 		baseOpts = append(baseOpts, providers.WithThinkingLevel(thinkingLevel))
@@ -522,14 +445,8 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	if geminiSourcePathEnabled() {
 		baseOpts = append(baseOpts, providers.WithSourcePath(true))
 	}
-	optsBase := baseOpts
-	if useToolBridge {
-		optsBase = plannerBaseOpts
-	}
-	opts := append([]providers.GenerateOption{}, optsBase...)
-	if useToolBridge {
-		opts = append(opts, providers.WithConversationID(contextPlan.ToolPlannerConversationID))
-	} else if contextPlan.ProviderConversationID != "" {
+	opts := append([]providers.GenerateOption{}, baseOpts...)
+	if contextPlan.ProviderConversationID != "" {
 		opts = append(opts, providers.WithConversationID(contextPlan.ProviderConversationID))
 	}
 	inputFiles, err := s.inputFilesFromModelMessages(ctx, modelMessages)
@@ -538,9 +455,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	}
 	if len(inputFiles) > 0 {
 		baseOpts = append(baseOpts, providers.WithInputFiles(inputFiles))
-		if !useToolBridge {
-			opts = append(opts, providers.WithInputFiles(inputFiles))
-		}
+		opts = append(opts, providers.WithInputFiles(inputFiles))
 	}
 	s.dumpOpenAITrace(ctx, req, contextPlan, "stream_initial", prompt, opts, inputFiles, useToolBridge, nil)
 
@@ -551,12 +466,12 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 
 	var completionLen int
 	var completionText strings.Builder
-	toolBridgeUndecided := false
+	toolBridgeUndecided := useToolBridge && !mustBufferToolBridge(req)
 	toolBridgeStreamingContent := false
 	handleStreamEvent := func(event providers.StreamEvent) bool {
 		switch event.Kind {
 		case "thinking_text":
-			if useToolBridge {
+			if useToolBridge && !toolBridgeStreamingContent {
 				return true
 			}
 			return onEvent(dto.ChatCompletionChunk{
@@ -566,9 +481,6 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		case "content_delta":
 			completionLen += len(event.Delta)
 			completionText.WriteString(event.Delta)
-			if useToolBridge {
-				return true
-			}
 			if useToolBridge && mustBufferToolBridge(req) {
 				return true
 			}
@@ -602,31 +514,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	if err == nil && completionLen == 0 {
 		err = errEmptyProviderStream
 	}
-	if err != nil && useToolBridge && completionLen == 0 {
-		s.forgetToolPlannerConversation(contextPlan.ToolPlannerConversationID)
-		if s.log != nil {
-			s.log.Warn("tool planner stream failed before content, retrying with fresh Gemini conversation",
-				zap.String("request_id", requestID),
-				zap.String("stale_tool_planner_conversation_id", strings.TrimSpace(contextPlan.ToolPlannerConversationID)),
-				zap.Error(err),
-			)
-		}
-		plannerContext := s.toolPlannerConversationPlan(contextPlan, req)
-		contextPlan.ToolPlannerConversationID = plannerContext.ConversationID
-		fallbackPrompt := s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
-		fallbackOpts := append([]providers.GenerateOption{}, plannerBaseOpts...)
-		fallbackOpts = append(fallbackOpts, providers.WithConversationID(contextPlan.ToolPlannerConversationID))
-		s.dumpOpenAITrace(ctx, req, contextPlan, "stream_tool_planner_fallback", fallbackPrompt, fallbackOpts, inputFiles, true, err)
-		completionText.Reset()
-		completionLen = 0
-		prompt = fallbackPrompt
-		opts = fallbackOpts
-		err = s.client.GenerateContentStreamForOpenAI(ctx, fallbackPrompt, handleStreamEvent, fallbackOpts...)
-		if err == nil && completionLen == 0 {
-			err = errEmptyProviderStream
-		}
-	}
-	if err != nil && contextPlan.AutoContext && !useToolBridge && completionLen == 0 && shouldRetrySameProviderContext(err) {
+	if err != nil && contextPlan.AutoContext && completionLen == 0 && shouldRetrySameProviderContext(err) {
 		if s.log != nil {
 			s.log.Warn("server-side context stream failed before content, retrying same Gemini context once",
 				zap.String("request_id", requestID),
@@ -639,7 +527,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 			err = errEmptyProviderStream
 		}
 	}
-	if err != nil && contextPlan.AutoContext && !useToolBridge && completionLen == 0 {
+	if err != nil && contextPlan.AutoContext && completionLen == 0 {
 		s.forgetProviderConversation(contextPlan.ProviderConversationID)
 		if s.log != nil {
 			s.log.Warn("server-side context stream failed before content, retrying stateless OpenAI prompt",
@@ -650,7 +538,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		}
 		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
 		if useToolBridge {
-			fallbackPrompt = s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
+			fallbackPrompt = s.buildToolBridgePrompt(req, fallbackPrompt, toolBridgeRequiresToolCall(req))
 		}
 		if fallbackPrompt != "" {
 			prompt = fallbackPrompt
@@ -677,7 +565,6 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	contextPlan.ResponseText = completionText.String()
 
 	finishReason := "stop"
-	emittedToolCalls := false
 	if useToolBridge && !toolBridgeStreamingContent {
 		plan := s.resolveToolBridgeOutput(ctx, req, completionText.String(), opts, inputFiles, requestID)
 		if plan.Err != nil {
@@ -694,7 +581,6 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 
 		if len(plan.ToolCalls) > 0 {
 			finishReason = "tool_calls"
-			emittedToolCalls = true
 			onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 				Choices: []dto.ChunkChoice{{
@@ -703,68 +589,17 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 				}},
 			})
 		} else if plan.NoTool {
-			mainOpts := append([]providers.GenerateOption{}, baseOpts...)
-			if contextPlan.ProviderConversationID != "" {
-				mainOpts = append(mainOpts, providers.WithConversationID(contextPlan.ProviderConversationID))
+			if strings.TrimSpace(plan.Content) != "" && !toolBridgeStreamingContent {
+				onEvent(dto.ChatCompletionChunk{
+					ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
+					Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{Content: plan.Content}}},
+				})
+				completionLen = len(plan.Content)
+				contextPlan.ResponseText = plan.Content
 			}
-			s.dumpOpenAITrace(ctx, req, contextPlan, "stream_main_after_no_tool", contextPlan.Prompt, mainOpts, inputFiles, false, nil)
-			completionText.Reset()
-			completionLen = 0
-			handleMainStreamEvent := func(event providers.StreamEvent) bool {
-				switch event.Kind {
-				case "thinking_text":
-					return onEvent(dto.ChatCompletionChunk{
-						ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-						Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{ReasoningContent: event.Delta}}},
-					})
-				case "content_delta":
-					completionLen += len(event.Delta)
-					completionText.WriteString(event.Delta)
-					return onEvent(dto.ChatCompletionChunk{
-						ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-						Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{Content: event.Delta}}},
-					})
-				default:
-					return true
-				}
-			}
-			mainPrompt := contextPlan.Prompt
-			mainErr := s.client.GenerateContentStreamForOpenAI(ctx, mainPrompt, handleMainStreamEvent, mainOpts...)
-			if mainErr == nil && completionLen == 0 {
-				mainErr = errEmptyProviderStream
-			}
-			if mainErr != nil && strings.TrimSpace(contextPlan.ProviderConversationID) != "" {
-				s.forgetProviderConversation(contextPlan.ProviderConversationID)
-				if s.log != nil {
-					s.log.Warn("tool no-op main stream failed, retrying with fresh Gemini conversation",
-						zap.String("request_id", requestID),
-						zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
-						zap.Error(mainErr),
-					)
-				}
-				fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
-				if strings.TrimSpace(fallbackPrompt) == "" {
-					fallbackPrompt = contextPlan.Prompt
-				}
-				fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
-				s.dumpOpenAITrace(ctx, req, contextPlan, "stream_main_after_no_tool_fallback", fallbackPrompt, fallbackOpts, inputFiles, false, mainErr)
-				completionText.Reset()
-				completionLen = 0
-				mainPrompt = fallbackPrompt
-				mainErr = s.client.GenerateContentStreamForOpenAI(ctx, fallbackPrompt, handleMainStreamEvent, fallbackOpts...)
-				if mainErr == nil && completionLen == 0 {
-					mainErr = errEmptyProviderStream
-				}
-			}
-			if mainErr != nil {
-				return mainErr
-			}
-			contextPlan.ResponseText = completionText.String()
 		}
 	}
-	if !useToolBridge || !emittedToolCalls {
-		s.rememberRequestContext(contextPlan)
-	}
+	s.rememberRequestContext(contextPlan)
 
 	onEvent(dto.ChatCompletionChunk{
 		ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
@@ -945,6 +780,26 @@ func (s *OpenAIService) planToolResultContext(req dto.ChatCompletionRequest) (op
 		plan.AutoContext = true
 		return plan, true
 	}
+	if providerID := s.providerConversationForTranscriptAny(mainMessages); providerID != "" {
+		plan.ProviderConversationID = providerID
+		plan.AutoContext = true
+		return plan, true
+	}
+	if providerID := s.providerConversationForTranscriptSuffix(mainMessages); providerID != "" {
+		plan.ProviderConversationID = providerID
+		plan.AutoContext = true
+		return plan, true
+	}
+	if providerID := s.providerConversationForUserWindow(mainMessages); providerID != "" {
+		plan.ProviderConversationID = providerID
+		plan.AutoContext = true
+		return plan, true
+	}
+	if providerID := s.providerConversationForRoot(mainMessages); providerID != "" {
+		plan.ProviderConversationID = providerID
+		plan.AutoContext = true
+		return plan, true
+	}
 	return plan, true
 }
 
@@ -1061,6 +916,16 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	if plan.ClientConversationID != "" {
 		s.explicitProviderContexts[plan.ClientConversationID] = plan.ProviderConversationID
 		s.explicitProviderUpdated[plan.ClientConversationID] = now
+	}
+	if currentKey := transcriptFingerprint(plan.RequestMessages); currentKey != "" {
+		s.transcriptContexts[currentKey] = plan.ProviderConversationID
+		s.transcriptContextUpdated[currentKey] = now
+		s.rememberTranscriptSuffixesLocked(plan.RequestMessages, plan.ProviderConversationID, now)
+		s.rememberUserWindowsLocked(plan.RequestMessages, plan.ProviderConversationID, now)
+		if rootKey := conversationRootFingerprint(plan.RequestMessages); rootKey != "" {
+			s.rootContexts[rootKey] = plan.ProviderConversationID
+			s.rootContextUpdated[rootKey] = now
+		}
 	}
 	s.transcriptContexts[key] = plan.ProviderConversationID
 	s.transcriptContextUpdated[key] = now
@@ -1305,6 +1170,33 @@ func (s *OpenAIService) providerConversationForTranscript(messages []dto.ChatCom
 		}
 		s.transcriptContextUpdated[key] = time.Now()
 	}
+	return providerID
+}
+
+func (s *OpenAIService) providerConversationForTranscriptAny(messages []dto.ChatCompletionMessage) string {
+	key := transcriptFingerprint(messages)
+	if key == "" {
+		return ""
+	}
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	if s.transcriptContexts == nil {
+		return ""
+	}
+	updatedAt, hasUpdatedAt := s.transcriptContextUpdated[key]
+	if hasUpdatedAt && time.Since(updatedAt) > transcriptContextTTL {
+		delete(s.transcriptContexts, key)
+		delete(s.transcriptContextUpdated, key)
+		return ""
+	}
+	providerID := s.transcriptContexts[key]
+	if providerID == "" || !s.providerConversationReady(providerID) {
+		return ""
+	}
+	if s.transcriptContextUpdated == nil {
+		s.transcriptContextUpdated = make(map[string]time.Time)
+	}
+	s.transcriptContextUpdated[key] = time.Now()
 	return providerID
 }
 
@@ -1754,7 +1646,7 @@ func openAITracePhase(stage string, plan openAIContextPlan, useToolBridge bool) 
 		return "tool_planner_repair"
 	}
 	if useToolBridge {
-		return "tool_planner"
+		return "main_tool_decision"
 	}
 	if strings.TrimSpace(plan.Phase) != "" {
 		return strings.TrimSpace(plan.Phase)
@@ -2042,16 +1934,16 @@ func compactText(text string, limit int) string {
 
 func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
 	var b strings.Builder
-	b.WriteString("You are a tool-planning router for an OpenAI-compatible bridge to Gemini web.\n")
-	b.WriteString("You are NOT the final assistant. Decide whether the current request needs a tool.\n")
-	b.WriteString("Return exactly one JSON object and no surrounding text.\n")
-	b.WriteString("Output schema:\n")
-	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]} OR {\"status\":\"no_tool\"}\n")
+	b.WriteString("You are an OpenAI-compatible assistant running behind a bridge to Gemini web.\n")
+	b.WriteString("Use tools only when the current user request needs one of the available tools.\n")
+	b.WriteString("If a tool is needed, return exactly one JSON object and no surrounding text.\n")
+	b.WriteString("Tool-call JSON schema:\n")
+	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Use only tool names listed below.\n")
 	b.WriteString("- arguments must be a valid JSON object matching the tool's parameters schema.\n")
 	b.WriteString("- Do not put JSON in markdown code fences.\n")
-	b.WriteString("- If no tool is needed and tool_choice is auto, return {\"status\":\"no_tool\"}. Do not answer the user.\n")
+	b.WriteString("- If no tool is needed and tool_choice is auto, answer the user normally in Markdown. Do not wrap normal text in JSON.\n")
 	if requireToolCall {
 		b.WriteString("- The current user request requires external/web/tool data. You must return status=tool_calls with at least one valid tool call. Do not answer from memory.\n")
 	}

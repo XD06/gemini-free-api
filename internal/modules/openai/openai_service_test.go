@@ -997,7 +997,7 @@ func TestCreateChatCompletionRequiredToolReturnsErrorWhenRepairFails(t *testing.
 
 func TestCreateChatCompletionAutoToolsNormalMessageDoesNotRepair(t *testing.T) {
 	client := &fakeGeminiClient{
-		responses: []string{`{"status":"no_tool"}`, "这是普通回答，不需要工具。"},
+		responses: []string{"这是普通回答，不需要工具。"},
 	}
 	service := NewOpenAIService(client, nil)
 	req := dto.ChatCompletionRequest{
@@ -1018,58 +1018,11 @@ func TestCreateChatCompletionAutoToolsNormalMessageDoesNotRepair(t *testing.T) {
 	if got := resp.Choices[0].Message.Content; got != "这是普通回答，不需要工具。" {
 		t.Fatalf("unexpected content: %q", got)
 	}
-	if len(client.generatePrompts) != 2 {
-		t.Fatalf("auto normal message should route through planner then main topic, got %d prompts", len(client.generatePrompts))
+	if len(client.generatePrompts) != 1 {
+		t.Fatalf("auto normal message should complete in one main-topic request, got %d prompts", len(client.generatePrompts))
 	}
-	if !strings.Contains(client.generatePrompts[0], "tool-planning router") {
-		t.Fatalf("expected first prompt to be tool planner, got %q", client.generatePrompts[0])
-	}
-	if strings.Contains(client.generatePrompts[1], "tool-planning router") {
-		t.Fatalf("expected second prompt to be main answer prompt, got %q", client.generatePrompts[1])
-	}
-}
-
-func TestCreateChatCompletionRetriesToolPlannerWithFreshConversation(t *testing.T) {
-	client := &fakeGeminiClient{
-		generateErrs: []error{errors.New("gemini bard error 1097")},
-		responses:    []string{`{"status":"no_tool"}`, "恢复后的主话题回答。"},
-	}
-	service := NewOpenAIService(client, nil)
-	req := dto.ChatCompletionRequest{
-		Model: "gemini-3.5-flash",
-		Messages: []dto.ChatCompletionMessage{
-			{Role: "user", Content: "你好，请简单回答。"},
-		},
-		Tools: []dto.ToolDefinition{{
-			Type:     "function",
-			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
-		}},
-	}
-
-	resp, err := service.CreateChatCompletion(context.Background(), req)
-	if err != nil {
-		t.Fatalf("CreateChatCompletion returned error: %v", err)
-	}
-	if got := resp.Choices[0].Message.Content; got != "恢复后的主话题回答。" {
-		t.Fatalf("unexpected content: %q", got)
-	}
-	if len(client.configs) != 3 {
-		t.Fatalf("expected failed planner, retried planner, and main request; got %#v", client.configs)
-	}
-	stalePlanner := client.configs[0].ConversationID
-	freshPlanner := client.configs[1].ConversationID
-	mainID := client.configs[2].ConversationID
-	if stalePlanner == "" || freshPlanner == "" || stalePlanner == freshPlanner {
-		t.Fatalf("expected planner retry to use fresh conversation, got stale=%q fresh=%q", stalePlanner, freshPlanner)
-	}
-	if mainID == "" || mainID == stalePlanner || mainID == freshPlanner {
-		t.Fatalf("expected main answer to use separate main conversation, got main=%q stale=%q fresh=%q", mainID, stalePlanner, freshPlanner)
-	}
-	if len(client.generatePrompts) != 3 || !strings.Contains(client.generatePrompts[1], "tool-planning router") {
-		t.Fatalf("expected planner retry to use full planner prompt, got prompts %#v", client.generatePrompts)
-	}
-	if strings.Contains(client.generatePrompts[2], "tool-planning router") {
-		t.Fatalf("expected main request not to use planner prompt, got %q", client.generatePrompts[2])
+	if !strings.Contains(client.generatePrompts[0], "If a tool is needed") {
+		t.Fatalf("expected tools request to include tool-call protocol, got %q", client.generatePrompts[0])
 	}
 }
 
@@ -1159,7 +1112,6 @@ func TestCreateChatCompletionStreamWithoutToolsBypassesToolBridge(t *testing.T) 
 func TestCreateChatCompletionStreamStreamsNormalAnswerWhenToolsAreAuto(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamEventsByCall: [][]providers.StreamEvent{
-			{{Kind: "content_delta", Delta: `{"status":"no_tool"}`}},
 			{
 				{Kind: "content_delta", Delta: "这是"},
 				{Kind: "content_delta", Delta: "普通回答"},
@@ -1193,71 +1145,11 @@ func TestCreateChatCompletionStreamStreamsNormalAnswerWhenToolsAreAuto(t *testin
 	if strings.Join(deltas, "") != "这是普通回答" {
 		t.Fatalf("unexpected streamed content: %#v", deltas)
 	}
-	if len(client.prompts) != 2 {
-		t.Fatalf("expected planner and main stream prompts, got %#v", client.prompts)
+	if len(client.prompts) != 1 {
+		t.Fatalf("expected one main-topic stream prompt, got %#v", client.prompts)
 	}
-	if !strings.Contains(client.prompts[0], "tool-planning router") {
-		t.Fatalf("expected first stream prompt to use tool planner, got %#v", client.prompts)
-	}
-	if strings.Contains(client.prompts[1], "tool-planning router") {
-		t.Fatalf("expected second stream prompt to use main topic, got %#v", client.prompts)
-	}
-}
-
-func TestCreateChatCompletionStreamRetriesToolPlannerWithFreshConversation(t *testing.T) {
-	client := &fakeGeminiClient{
-		streamErrs: []error{errors.New("gemini bard error 1097"), nil, nil},
-		streamEventsByCall: [][]providers.StreamEvent{
-			nil,
-			{{Kind: "content_delta", Delta: `{"status":"no_tool"}`}},
-			{{Kind: "content_delta", Delta: "恢复后的"}, {Kind: "content_delta", Delta: "主话题回答"}},
-		},
-	}
-	service := NewOpenAIService(client, nil)
-	req := dto.ChatCompletionRequest{
-		Model:  "gemini-3.5-flash",
-		Stream: true,
-		Messages: []dto.ChatCompletionMessage{
-			{Role: "user", Content: "你好，请简单回答。"},
-		},
-		Tools: []dto.ToolDefinition{{
-			Type:     "function",
-			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
-		}},
-	}
-
-	var deltas []string
-	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
-		if len(chunk.Choices) > 0 {
-			if content := chunk.Choices[0].Delta.Content; content != "" {
-				deltas = append(deltas, content)
-			}
-		}
-		return true
-	})
-	if err != nil {
-		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
-	}
-	if strings.Join(deltas, "") != "恢复后的主话题回答" {
-		t.Fatalf("unexpected streamed content: %#v", deltas)
-	}
-	if len(client.configs) != 3 {
-		t.Fatalf("expected failed planner, retried planner, and main stream; got %#v", client.configs)
-	}
-	stalePlanner := client.configs[0].ConversationID
-	freshPlanner := client.configs[1].ConversationID
-	mainID := client.configs[2].ConversationID
-	if stalePlanner == "" || freshPlanner == "" || stalePlanner == freshPlanner {
-		t.Fatalf("expected planner retry to use fresh conversation, got stale=%q fresh=%q", stalePlanner, freshPlanner)
-	}
-	if mainID == "" || mainID == stalePlanner || mainID == freshPlanner {
-		t.Fatalf("expected main stream to use separate main conversation, got main=%q stale=%q fresh=%q", mainID, stalePlanner, freshPlanner)
-	}
-	if len(client.prompts) != 3 || !strings.Contains(client.prompts[1], "tool-planning router") {
-		t.Fatalf("expected planner retry to use full planner prompt, got prompts %#v", client.prompts)
-	}
-	if strings.Contains(client.prompts[2], "tool-planning router") {
-		t.Fatalf("expected main stream not to use planner prompt, got %q", client.prompts[2])
+	if !strings.Contains(client.prompts[0], "If a tool is needed") {
+		t.Fatalf("expected stream prompt to include tool-call protocol, got %#v", client.prompts)
 	}
 }
 
@@ -1383,7 +1275,68 @@ func TestCreateChatCompletionToolResultUsesMainConversationAndAggregatesTools(t 
 	}
 }
 
-func TestCreateChatCompletionStreamUsesTemporaryToolBridgeForGreetingWithTools(t *testing.T) {
+func TestToolCallThenToolResultStaysOnSameMainConversation(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{{
+			Kind:  "content_delta",
+			Delta: `{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"today news"}}]}`,
+		}},
+		responses: []string{"这是基于工具结果的回答。"},
+	}
+	service := NewOpenAIService(client, nil)
+	tools := []dto.ToolDefinition{{
+		Type:     "function",
+		Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+	}}
+
+	firstReq := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "查一下今天新闻"},
+		},
+		Tools:  tools,
+		Stream: true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), firstReq, func(chunk dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("first stream returned error: %v", err)
+	}
+	if len(client.configs) != 1 || client.configs[0].ConversationID == "" {
+		t.Fatalf("expected first tool decision to use main conversation, got %#v", client.configs)
+	}
+	mainConversationID := client.configs[0].ConversationID
+
+	secondReq := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "查一下今天新闻"},
+			{Role: "assistant", ToolCalls: []dto.ChatCompletionToolCall{{
+				ID:   "call_search",
+				Type: "function",
+				Function: dto.ChatCompletionToolCallFunction{
+					Name:      "search",
+					Arguments: `{"query":"today news"}`,
+				},
+			}}},
+			{Role: "tool", ToolCallID: "call_search", Name: "search", Content: "新闻结果"},
+		},
+		Tools: tools,
+	}
+	resp, err := service.CreateChatCompletion(context.Background(), secondReq)
+	if err != nil {
+		t.Fatalf("tool result completion returned error: %v", err)
+	}
+	if got := resp.Choices[0].Message.Content; got != "这是基于工具结果的回答。" {
+		t.Fatalf("unexpected tool result answer: %q", got)
+	}
+	if len(client.configs) != 2 {
+		t.Fatalf("expected second provider call, got %#v", client.configs)
+	}
+	if client.configs[1].ConversationID != mainConversationID {
+		t.Fatalf("tool result must reuse main conversation %q, got %q", mainConversationID, client.configs[1].ConversationID)
+	}
+}
+
+func TestCreateChatCompletionStreamUsesMainTopicForGreetingWithTools(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamEvents: []providers.StreamEvent{
 			{Kind: "content_delta", Delta: "你好"},
@@ -1404,89 +1357,15 @@ func TestCreateChatCompletionStreamUsesTemporaryToolBridgeForGreetingWithTools(t
 	if err != nil {
 		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
 	}
-	if len(client.prompts) != 2 || !strings.Contains(client.prompts[0], "tool-planning router") {
-		t.Fatalf("expected greeting to use tool bridge planner, got prompts %#v", client.prompts)
+	if len(client.prompts) != 1 || !strings.Contains(client.prompts[0], "If a tool is needed") {
+		t.Fatalf("expected greeting to use one main-topic tool prompt, got prompts %#v", client.prompts)
 	}
-	if strings.Contains(client.prompts[1], "tool-planning router") {
-		t.Fatalf("expected greeting answer to use main prompt, got prompts %#v", client.prompts)
-	}
-	if len(client.configs) != 2 || client.configs[0].ConversationID == "" || client.configs[1].ConversationID == "" {
-		t.Fatalf("tool bridge planner must use its own reusable conversation id, got configs %#v", client.configs)
-	}
-	if client.configs[0].ConversationID == client.configs[1].ConversationID {
-		t.Fatalf("planner and main answer must use different conversations, got %q", client.configs[0].ConversationID)
+	if len(client.configs) != 1 || client.configs[0].ConversationID == "" {
+		t.Fatalf("tool bridge must use a main conversation id, got configs %#v", client.configs)
 	}
 }
 
-func TestToolPlannerConversationReusesPlannerTopicForSameRoot(t *testing.T) {
-	client := &fakeGeminiClient{}
-	service := NewOpenAIService(client, nil)
-	tools := []dto.ToolDefinition{{
-		Type:     "function",
-		Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
-	}}
-
-	first := dto.ChatCompletionRequest{
-		Model: "gemini-3.5-flash",
-		Messages: []dto.ChatCompletionMessage{
-			{Role: "user", Content: "你好"},
-		},
-		Tools: tools,
-	}
-
-	second := dto.ChatCompletionRequest{
-		Model: "gemini-3.5-flash",
-		Messages: []dto.ChatCompletionMessage{
-			{Role: "user", Content: "你好"},
-			{Role: "assistant", Content: "你好"},
-			{Role: "user", Content: "继续"},
-		},
-		Tools: tools,
-	}
-
-	firstID := service.toolPlannerConversationID(openAIContextPlan{}, first)
-	secondID := service.toolPlannerConversationID(openAIContextPlan{}, second)
-	if firstID == "" {
-		t.Fatalf("expected first planner request to use a planner conversation id")
-	}
-	if secondID != firstID {
-		t.Fatalf("expected planner conversation to be reused, got first=%q second=%q", firstID, secondID)
-	}
-}
-
-func TestToolPlannerConversationPromotesRootBindingToMainProvider(t *testing.T) {
-	client := &fakeGeminiClient{}
-	service := NewOpenAIService(client, nil)
-	req := dto.ChatCompletionRequest{
-		Model: "gemini-3.5-flash",
-		Messages: []dto.ChatCompletionMessage{
-			{Role: "user", Content: "你好"},
-		},
-		Tools: []dto.ToolDefinition{{
-			Type:     "function",
-			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
-		}},
-	}
-
-	rootPlannerID := service.toolPlannerConversationID(openAIContextPlan{}, req)
-	service.rememberRequestContext(openAIContextPlan{
-		ProviderConversationID: "main-provider",
-		RequestMessages: []dto.ChatCompletionMessage{
-			{Role: "user", Content: "你好"},
-		},
-		ResponseText: "你好！",
-	})
-
-	providerPlannerID := service.toolPlannerConversationID(openAIContextPlan{
-		ProviderConversationID: "main-provider",
-		AutoContext:            true,
-	}, req)
-	if providerPlannerID != rootPlannerID {
-		t.Fatalf("expected provider planner binding to reuse root planner %q, got %q", rootPlannerID, providerPlannerID)
-	}
-}
-
-func TestCreateChatCompletionStreamDoesNotAppendToolBridgeToExistingConversation(t *testing.T) {
+func TestCreateChatCompletionStreamAppendsToolBridgeToExistingMainConversation(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamEvents: []providers.StreamEvent{
 			{Kind: "content_delta", Delta: `{"status":"tool_calls","tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"GitHub trending today"}}]}`},
@@ -1520,11 +1399,8 @@ func TestCreateChatCompletionStreamDoesNotAppendToolBridgeToExistingConversation
 	if len(client.configs) != 1 {
 		t.Fatalf("expected one provider call, got %#v", client.configs)
 	}
-	if client.configs[0].ConversationID == "" {
-		t.Fatalf("tool bridge planning must use a separate planner conversation")
-	}
-	if client.configs[0].ConversationID == "provider-thread" {
-		t.Fatalf("tool bridge planning must not append to main conversation, got %q", client.configs[0].ConversationID)
+	if client.configs[0].ConversationID != "provider-thread" {
+		t.Fatalf("tool bridge must append to main conversation, got %q", client.configs[0].ConversationID)
 	}
 }
 
