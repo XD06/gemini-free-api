@@ -197,19 +197,16 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	finishReason := "stop"
 
 	if useToolBridge {
-		toolCalls, content := s.parseToolBridgeOutput(req, response.Text)
-		if len(toolCalls) == 0 {
-			fallback := s.buildFallbackToolCalls(req)
-			if len(fallback) > 0 && toolBridgeRequiresToolCall(req) {
-				toolCalls = fallback
-			}
+		plan := s.resolveToolBridgeOutput(ctx, req, response.Text, opts, inputFiles, requestID)
+		if plan.Err != nil {
+			return nil, plan.Err
 		}
 
-		if len(toolCalls) > 0 {
-			message.ToolCalls = toolCalls
+		if len(plan.ToolCalls) > 0 {
+			message.ToolCalls = plan.ToolCalls
 			finishReason = "tool_calls"
 		} else {
-			message.Content = content
+			message.Content = plan.Content
 		}
 	} else {
 		message.Content = response.Text
@@ -565,36 +562,33 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	finishReason := "stop"
 	emittedToolCalls := false
 	if useToolBridge && !toolBridgeStreamingContent {
-		toolCalls, content := s.parseToolBridgeOutput(req, completionText.String())
+		plan := s.resolveToolBridgeOutput(ctx, req, completionText.String(), opts, inputFiles, requestID)
+		if plan.Err != nil {
+			return plan.Err
+		}
 		if openAIRequestDebugEnabled() && s.log != nil {
 			s.log.Info("OpenAI tool bridge parsed",
 				zap.String("request_id", requestID),
-				zap.Int("tool_call_count", len(toolCalls)),
+				zap.Int("tool_call_count", len(plan.ToolCalls)),
 				zap.Int("buffered_output_length", completionText.Len()),
-				zap.Int("content_length", len(strings.TrimSpace(content))),
+				zap.Int("content_length", len(strings.TrimSpace(plan.Content))),
 			)
 		}
-		if len(toolCalls) == 0 {
-			fallback := s.buildFallbackToolCalls(req)
-			if len(fallback) > 0 && (req.ToolChoiceMode() == "required" || req.ToolChoiceMode() == "function") {
-				toolCalls = fallback
-			}
-		}
 
-		if len(toolCalls) > 0 {
+		if len(plan.ToolCalls) > 0 {
 			finishReason = "tool_calls"
 			emittedToolCalls = true
 			onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 				Choices: []dto.ChunkChoice{{
 					Index: 0,
-					Delta: dto.ChatCompletionChunkDelta{ToolCalls: chunkToolCalls(toolCalls)},
+					Delta: dto.ChatCompletionChunkDelta{ToolCalls: chunkToolCalls(plan.ToolCalls)},
 				}},
 			})
-		} else if strings.TrimSpace(content) != "" {
+		} else if strings.TrimSpace(plan.Content) != "" {
 			onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-				Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{Content: content}}},
+				Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{Content: plan.Content}}},
 			})
 		}
 	}
@@ -1334,7 +1328,7 @@ func inlineCodeParts(parts []string) []string {
 }
 
 func newAutoProviderConversationID() string {
-	return fmt.Sprintf("openai-auto-%d-%06d", time.Now().UnixNano(), rand.Intn(1000000))
+	return fmt.Sprintf("c_%x%012x", time.Now().UnixNano(), rand.Int63()&0xffffffffffff)
 }
 
 func fallbackOptionsWithFreshConversation(plan *openAIContextPlan, baseOpts []providers.GenerateOption) []providers.GenerateOption {
@@ -1576,6 +1570,7 @@ func cloneChatMessages(messages []dto.ChatCompletionMessage) []dto.ChatCompletio
 }
 
 type toolBridgePayload struct {
+	Status    string           `json:"status"`
 	ToolCalls []toolBridgeCall `json:"tool_calls"`
 	Content   string           `json:"content"`
 }
@@ -1583,6 +1578,12 @@ type toolBridgePayload struct {
 type toolBridgeCall struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+}
+
+type toolBridgePlan struct {
+	ToolCalls []dto.ChatCompletionToolCall
+	Content   string
+	Err       error
 }
 
 func shouldUseToolBridge(req dto.ChatCompletionRequest) bool {
@@ -1707,29 +1708,29 @@ func compactText(text string, limit int) string {
 func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
 	var b strings.Builder
 	b.WriteString("You are an OpenAI-compatible assistant running behind a bridge to Gemini web.\n")
-	b.WriteString("When you need to call a tool, respond with JSON only and do not output markdown code fences.\n")
-	b.WriteString("Tool call schema:\n")
-	b.WriteString("{\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
+	b.WriteString("You are producing a structured tool-planning result. Return exactly one JSON object and no surrounding text.\n")
+	b.WriteString("Allowed output schemas:\n")
+	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
+	b.WriteString("{\"status\":\"message\",\"content\":\"<assistant_text>\"}\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Use only tool names listed below.\n")
-	b.WriteString("- arguments must be valid JSON object.\n")
-	b.WriteString("- If no tool is needed, answer the user normally instead of wrapping the answer in JSON.\n")
+	b.WriteString("- arguments must be a valid JSON object matching the tool's parameters schema.\n")
+	b.WriteString("- Do not put JSON in markdown code fences.\n")
+	b.WriteString("- If no tool is needed, use status=message with normal assistant text.\n")
 	if requireToolCall {
-		b.WriteString("- The current user request requires external/web/tool data. You must return at least one tool call as JSON only. Do not answer from memory.\n")
+		b.WriteString("- The current user request requires external/web/tool data. You must return status=tool_calls with at least one valid tool call. Do not answer from memory.\n")
 	}
 
 	toolChoiceMode := req.ToolChoiceMode()
 	if toolChoiceMode == "required" {
-		b.WriteString("- You must return at least one tool call.\n")
-		b.WriteString("- Because a tool call is required, return JSON only.\n")
+		b.WriteString("- tool_choice is required: return status=tool_calls with at least one tool call.\n")
 	}
 	if toolChoiceMode == "function" {
 		forced := req.ForcedToolName()
 		if forced != "" {
-			b.WriteString("- You must return exactly one tool call with name: ")
+			b.WriteString("- tool_choice selects one function. Return exactly one tool call with name: ")
 			b.WriteString(forced)
 			b.WriteString("\n")
-			b.WriteString("- Because a specific tool call is required, return JSON only.\n")
 		}
 	}
 	if toolChoiceMode == "none" {
@@ -1760,22 +1761,127 @@ func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, bas
 }
 
 func (s *OpenAIService) parseToolBridgeOutput(req dto.ChatCompletionRequest, text string) ([]dto.ChatCompletionToolCall, string) {
+	plan := s.parseToolBridgePlan(req, text)
+	return plan.ToolCalls, plan.Content
+}
+
+func (s *OpenAIService) resolveToolBridgeOutput(ctx context.Context, req dto.ChatCompletionRequest, text string, opts []providers.GenerateOption, inputFiles []providers.InputFile, requestID string) toolBridgePlan {
+	plan := s.parseToolBridgePlan(req, text)
+	if plan.Err == nil {
+		return plan
+	}
+	if !toolBridgeRequiresToolCall(req) && !looksLikeToolPlannerOutput(text) {
+		return toolBridgePlan{Content: strings.TrimSpace(text)}
+	}
+
+	if s.log != nil {
+		s.log.Warn("OpenAI tool bridge parse failed, attempting repair",
+			zap.String("request_id", requestID),
+			zap.String("tool_choice_mode", req.ToolChoiceMode()),
+			zap.Error(plan.Err),
+		)
+	}
+
+	repairPrompt := s.buildToolBridgeRepairPrompt(req, text, plan.Err)
+	repairOpts := append([]providers.GenerateOption{}, opts...)
+	s.dumpOpenAITrace(ctx, req, openAIContextPlan{}, "tool_repair", repairPrompt, repairOpts, inputFiles, true, plan.Err)
+	repairResp, err := s.client.GenerateContent(ctx, repairPrompt, repairOpts...)
+	if err == nil && repairResp != nil {
+		repaired := s.parseToolBridgePlan(req, repairResp.Text)
+		if repaired.Err == nil {
+			return repaired
+		}
+		plan.Err = fmt.Errorf("%w; repair failed: %v", plan.Err, repaired.Err)
+	} else if err != nil {
+		plan.Err = fmt.Errorf("%w; repair request failed: %v", plan.Err, err)
+	}
+
+	if toolBridgeRequiresToolCall(req) {
+		return toolBridgePlan{Err: plan.Err, Content: ""}
+	}
+	if strings.TrimSpace(plan.Content) != "" {
+		return toolBridgePlan{Content: plan.Content}
+	}
+	return toolBridgePlan{Content: "I could not form a valid tool call for this request."}
+}
+
+func looksLikeToolPlannerOutput(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "```") {
+		return true
+	}
+	return strings.Contains(trimmed, `"tool_calls"`) || strings.Contains(trimmed, `"status"`)
+}
+
+func (s *OpenAIService) buildToolBridgeRepairPrompt(req dto.ChatCompletionRequest, invalidOutput string, parseErr error) string {
+	var b strings.Builder
+	b.WriteString("Repair the previous tool-planning output. Return exactly one JSON object and no surrounding text.\n")
+	b.WriteString("Allowed output schemas:\n")
+	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
+	b.WriteString("{\"status\":\"message\",\"content\":\"<assistant_text>\"}\n")
+	b.WriteString("Validation error:\n")
+	b.WriteString(parseErr.Error())
+	b.WriteString("\nAvailable tools:\n")
+	for _, t := range req.Tools {
+		if !strings.EqualFold(t.Type, "function") || strings.TrimSpace(t.Function.Name) == "" {
+			continue
+		}
+		b.WriteString("- name: ")
+		b.WriteString(strings.TrimSpace(t.Function.Name))
+		if len(t.Function.Parameters) > 0 {
+			b.WriteString(" | parameters: ")
+			b.Write(t.Function.Parameters)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("Invalid output:\n")
+	b.WriteString(compactText(invalidOutput, 4000))
+	return b.String()
+}
+
+func (s *OpenAIService) parseToolBridgePlan(req dto.ChatCompletionRequest, text string) toolBridgePlan {
 	cleaned := utils.StripCodeFence(text)
 	if cleaned == "" {
-		return nil, ""
+		return toolBridgePlan{Err: fmt.Errorf("empty tool planner output")}
 	}
 
 	payload, ok := decodeToolBridgePayload(cleaned)
 	if !ok {
-		return nil, strings.TrimSpace(text)
+		return toolBridgePlan{Content: strings.TrimSpace(text), Err: fmt.Errorf("tool planner output is not valid JSON")}
+	}
+	return validateToolBridgePayload(req, payload, text)
+}
+
+func validateToolBridgePayload(req dto.ChatCompletionRequest, payload toolBridgePayload, originalText string) toolBridgePlan {
+	status := strings.ToLower(strings.TrimSpace(payload.Status))
+	if status == "" {
+		return toolBridgePlan{Content: strings.TrimSpace(originalText), Err: fmt.Errorf("tool planner output missing status")}
+	}
+	if status != "tool_calls" && status != "message" {
+		return toolBridgePlan{Content: strings.TrimSpace(originalText), Err: fmt.Errorf("unsupported tool planner status %q", payload.Status)}
+	}
+	if status == "message" {
+		content := strings.TrimSpace(payload.Content)
+		if toolBridgeRequiresToolCall(req) {
+			return toolBridgePlan{Content: content, Err: fmt.Errorf("tool_choice requires a tool call")}
+		}
+		return toolBridgePlan{Content: content}
 	}
 
+	if len(payload.ToolCalls) == 0 {
+		return toolBridgePlan{Err: fmt.Errorf("status tool_calls requires at least one tool call")}
+	}
 	allowed := make(map[string]struct{}, len(req.Tools))
+	schemas := make(map[string]json.RawMessage, len(req.Tools))
 	for _, t := range req.Tools {
 		if strings.EqualFold(t.Type, "function") {
 			name := strings.TrimSpace(t.Function.Name)
 			if name != "" {
 				allowed[name] = struct{}{}
+				schemas[name] = t.Function.Parameters
 			}
 		}
 	}
@@ -1785,15 +1891,19 @@ func (s *OpenAIService) parseToolBridgeOutput(req dto.ChatCompletionRequest, tex
 	for i, tc := range payload.ToolCalls {
 		name := strings.TrimSpace(tc.Name)
 		if name == "" {
-			continue
+			return toolBridgePlan{Err: fmt.Errorf("tool call %d missing name", i)}
 		}
 		if len(allowed) > 0 {
 			if _, ok := allowed[name]; !ok {
-				continue
+				return toolBridgePlan{Err: fmt.Errorf("tool call %d uses unknown tool %q", i, name)}
 			}
 		}
 		if forcedName != "" && name != forcedName {
-			continue
+			return toolBridgePlan{Err: fmt.Errorf("tool_choice requires %q, got %q", forcedName, name)}
+		}
+		normalizedArgs, err := validateAndNormalizeToolArguments(tc.Arguments, schemas[name])
+		if err != nil {
+			return toolBridgePlan{Err: fmt.Errorf("tool call %d arguments invalid: %w", i, err)}
 		}
 
 		calls = append(calls, dto.ChatCompletionToolCall{
@@ -1801,16 +1911,12 @@ func (s *OpenAIService) parseToolBridgeOutput(req dto.ChatCompletionRequest, tex
 			Type: "function",
 			Function: dto.ChatCompletionToolCallFunction{
 				Name:      name,
-				Arguments: normalizeArguments(tc.Arguments),
+				Arguments: normalizedArgs,
 			},
 		})
 	}
 
-	content := strings.TrimSpace(payload.Content)
-	if content == "" && len(calls) == 0 {
-		content = strings.TrimSpace(text)
-	}
-	return calls, content
+	return toolBridgePlan{ToolCalls: calls}
 }
 
 func (s *OpenAIService) buildFallbackToolCalls(req dto.ChatCompletionRequest) []dto.ChatCompletionToolCall {
@@ -1919,6 +2025,152 @@ func extractFirstJSONObject(text string) string {
 		}
 	}
 	return ""
+}
+
+func validateAndNormalizeToolArguments(raw json.RawMessage, schemaRaw json.RawMessage) (string, error) {
+	normalized := normalizeArguments(raw)
+	var args interface{}
+	if err := json.Unmarshal([]byte(normalized), &args); err != nil {
+		return "", fmt.Errorf("arguments are not valid JSON: %w", err)
+	}
+	obj, ok := args.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("arguments must be a JSON object")
+	}
+	if len(schemaRaw) > 0 {
+		var schema map[string]interface{}
+		if err := json.Unmarshal(schemaRaw, &schema); err == nil && len(schema) > 0 {
+			if err := validateJSONSchemaValue(obj, schema, "arguments", 0); err != nil {
+				return "", err
+			}
+		}
+	}
+	return normalized, nil
+}
+
+func validateJSONSchemaValue(value interface{}, schema map[string]interface{}, path string, depth int) error {
+	if depth > 4 || len(schema) == 0 {
+		return nil
+	}
+	if err := validateJSONSchemaType(value, schema, path); err != nil {
+		return err
+	}
+
+	obj, ok := value.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	required := schemaStringSlice(schema["required"])
+	for _, key := range required {
+		if _, ok := obj[key]; !ok {
+			return fmt.Errorf("%s.%s is required", path, key)
+		}
+	}
+
+	properties, _ := schema["properties"].(map[string]interface{})
+	propertySchemas := make(map[string]map[string]interface{}, len(properties))
+	for key, rawProp := range properties {
+		if propSchema, ok := rawProp.(map[string]interface{}); ok {
+			propertySchemas[key] = propSchema
+		}
+	}
+
+	if additional, ok := schema["additionalProperties"].(bool); ok && !additional && len(propertySchemas) > 0 {
+		for key := range obj {
+			if _, ok := propertySchemas[key]; !ok {
+				return fmt.Errorf("%s.%s is not allowed by schema", path, key)
+			}
+		}
+	}
+
+	for key, propSchema := range propertySchemas {
+		propValue, ok := obj[key]
+		if !ok {
+			continue
+		}
+		if err := validateJSONSchemaValue(propValue, propSchema, path+"."+key, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateJSONSchemaType(value interface{}, schema map[string]interface{}, path string) error {
+	types := schemaTypes(schema["type"])
+	if len(types) == 0 {
+		return nil
+	}
+	for _, typ := range types {
+		switch typ {
+		case "object":
+			if _, ok := value.(map[string]interface{}); ok {
+				return nil
+			}
+		case "array":
+			if _, ok := value.([]interface{}); ok {
+				return nil
+			}
+		case "string":
+			if _, ok := value.(string); ok {
+				return nil
+			}
+		case "number":
+			if _, ok := value.(float64); ok {
+				return nil
+			}
+		case "integer":
+			if n, ok := value.(float64); ok && n == float64(int64(n)) {
+				return nil
+			}
+		case "boolean":
+			if _, ok := value.(bool); ok {
+				return nil
+			}
+		case "null":
+			if value == nil {
+				return nil
+			}
+		default:
+			return nil
+		}
+	}
+	return fmt.Errorf("%s has wrong type, expected %s", path, strings.Join(types, " or "))
+}
+
+func schemaTypes(raw interface{}) []string {
+	switch v := raw.(type) {
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil
+		}
+		return []string{v}
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func schemaStringSlice(raw interface{}) []string {
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
 }
 
 func normalizeArguments(raw json.RawMessage) string {

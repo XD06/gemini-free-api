@@ -20,6 +20,9 @@ type fakeGeminiClient struct {
 	streamEvents       []providers.StreamEvent
 	streamEventsByCall [][]providers.StreamEvent
 	streamErrs         []error
+	responses          []string
+	generateErrs       []error
+	generatePrompts    []string
 	prompts            []string
 	configs            []providers.GenerateConfig
 	untrusted          bool
@@ -27,8 +30,20 @@ type fakeGeminiClient struct {
 
 func (f *fakeGeminiClient) Init(context.Context) error { return nil }
 
-func (f *fakeGeminiClient) GenerateContent(context.Context, string, ...providers.GenerateOption) (*providers.Response, error) {
-	return &providers.Response{}, nil
+func (f *fakeGeminiClient) GenerateContent(ctx context.Context, prompt string, options ...providers.GenerateOption) (*providers.Response, error) {
+	_ = ctx
+	f.generatePrompts = append(f.generatePrompts, prompt)
+	if len(f.generateErrs) > 0 {
+		err := f.generateErrs[0]
+		f.generateErrs = f.generateErrs[1:]
+		return nil, err
+	}
+	text := ""
+	if len(f.responses) > 0 {
+		text = f.responses[0]
+		f.responses = f.responses[1:]
+	}
+	return &providers.Response{Text: text}, nil
 }
 
 func (f *fakeGeminiClient) StartChat(...providers.ChatOption) providers.ChatSession { return nil }
@@ -802,7 +817,7 @@ func TestCreateChatCompletionStreamWithToolsDoesNotSilentlyStopWhenProviderEmits
 func TestCreateChatCompletionStreamEmitsToolCallsForToolBridgeJSON(t *testing.T) {
 	service := NewOpenAIService(&fakeGeminiClient{
 		streamEvents: []providers.StreamEvent{
-			{Kind: "content_delta", Delta: `{"tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"trending repositories on GitHub today"}}]}`},
+			{Kind: "content_delta", Delta: `{"status":"tool_calls","tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"trending repositories on GitHub today"}}]}`},
 		},
 	}, nil)
 
@@ -859,6 +874,157 @@ func TestCreateChatCompletionStreamEmitsToolCallsForToolBridgeJSON(t *testing.T)
 	lastChoice := chunks[len(chunks)-1].Choices[0]
 	if lastChoice.FinishReason != "tool_calls" {
 		t.Fatalf("expected finish_reason tool_calls, got %q", lastChoice.FinishReason)
+	}
+}
+
+func TestParseToolBridgePlanAcceptsFencedAndWrappedJSON(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	req := dto.ChatCompletionRequest{
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+	}
+
+	for _, text := range []string{
+		"```json\n{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"search\",\"arguments\":{\"query\":\"news\"}}]}\n```",
+		"Here is the plan: {\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"search\",\"arguments\":{\"query\":\"news\"}}]}",
+	} {
+		plan := service.parseToolBridgePlan(req, text)
+		if plan.Err != nil {
+			t.Fatalf("expected valid plan for %q, got %v", text, plan.Err)
+		}
+		if len(plan.ToolCalls) != 1 || plan.ToolCalls[0].Function.Name != "search" {
+			t.Fatalf("unexpected tool calls: %#v", plan.ToolCalls)
+		}
+	}
+}
+
+func TestParseToolBridgePlanValidatesDynamicArguments(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	req := dto.ChatCompletionRequest{
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}`),
+			},
+		}},
+	}
+
+	cases := []string{
+		`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"limit":3}}]}`,
+		`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":7}}]}`,
+		`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"news","extra":true}}]}`,
+		`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":[]}]}`,
+	}
+	for _, text := range cases {
+		if plan := service.parseToolBridgePlan(req, text); plan.Err == nil {
+			t.Fatalf("expected invalid plan for %s, got %#v", text, plan)
+		}
+	}
+}
+
+func TestCreateChatCompletionRepairsMalformedToolPlannerOutput(t *testing.T) {
+	client := &fakeGeminiClient{
+		responses: []string{
+			`{"tool_calls":[{"name":"search","arguments":{"query":"weather"}}]}`,
+			`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"weather"}}]}`,
+		},
+	}
+	service := NewOpenAIService(client, nil)
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "search weather"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+	}
+
+	resp, err := service.CreateChatCompletion(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateChatCompletion returned error: %v", err)
+	}
+	if len(resp.Choices) != 1 || resp.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("expected tool_calls response, got %#v", resp.Choices)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected one repaired tool call, got %#v", resp.Choices[0].Message.ToolCalls)
+	}
+	if len(client.generatePrompts) != 2 || !strings.Contains(client.generatePrompts[1], "Repair the previous tool-planning output") {
+		t.Fatalf("expected one repair request, got prompts %#v", client.generatePrompts)
+	}
+}
+
+func TestCreateChatCompletionRequiredToolReturnsErrorWhenRepairFails(t *testing.T) {
+	client := &fakeGeminiClient{
+		responses: []string{
+			`not json`,
+			`{"status":"message","content":"I cannot call a tool"}`,
+		},
+	}
+	service := NewOpenAIService(client, nil)
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "search weather"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type:     "function",
+			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+		}},
+		ToolChoiceRaw: json.RawMessage(`"required"`),
+	}
+
+	if _, err := service.CreateChatCompletion(context.Background(), req); err == nil {
+		t.Fatal("expected required tool failure to return an error")
+	}
+}
+
+func TestCreateChatCompletionAutoToolsNormalMessageDoesNotRepair(t *testing.T) {
+	client := &fakeGeminiClient{
+		responses: []string{"这是普通回答，不需要工具。"},
+	}
+	service := NewOpenAIService(client, nil)
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "解释递归"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type:     "function",
+			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+		}},
+	}
+
+	resp, err := service.CreateChatCompletion(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateChatCompletion returned error: %v", err)
+	}
+	if got := resp.Choices[0].Message.Content; got != "这是普通回答，不需要工具。" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+	if len(client.generatePrompts) != 1 {
+		t.Fatalf("auto normal message should not trigger repair, got %d prompts", len(client.generatePrompts))
+	}
+}
+
+func TestNewAutoProviderConversationIDUsesGeminiLikeLocalKey(t *testing.T) {
+	id := newAutoProviderConversationID()
+	if !strings.HasPrefix(id, "c_") {
+		t.Fatalf("expected c_ prefix, got %q", id)
+	}
+	if strings.Contains(id, "openai-auto") {
+		t.Fatalf("auto provider id still contains old marker: %q", id)
 	}
 }
 
@@ -1052,7 +1218,7 @@ func TestCreateChatCompletionStreamUsesTemporaryToolBridgeForGreetingWithTools(t
 func TestCreateChatCompletionStreamDoesNotAppendToolBridgeToExistingConversation(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamEvents: []providers.StreamEvent{
-			{Kind: "content_delta", Delta: `{"tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"GitHub trending today"}}]}`},
+			{Kind: "content_delta", Delta: `{"status":"tool_calls","tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"GitHub trending today"}}]}`},
 		},
 	}
 	service := NewOpenAIService(client, nil)

@@ -28,17 +28,41 @@ type chatRequest struct {
 	Messages       []chatMessage `json:"messages"`
 	ConversationID string        `json:"conversation_id,omitempty"`
 	StreamOptions  *streamOpts   `json:"stream_options,omitempty"`
+	Tools          []toolDef     `json:"tools,omitempty"`
+	ToolChoice     interface{}   `json:"tool_choice,omitempty"`
 }
 
 type streamOpts struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
+type toolDef struct {
+	Type     string       `json:"type"`
+	Function toolFunction `json:"function"`
+}
+
+type toolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type toolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content   string     `json:"content"`
+			ToolCalls []toolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
@@ -93,7 +117,7 @@ func main() {
 	flag.StringVar(&baseURL, "base-url", "http://127.0.0.1:8787", "API base URL")
 	flag.StringVar(&token, "admin-token", os.Getenv("COOKIE_SYNC_TOKEN"), "admin token for /admin/*")
 	flag.StringVar(&model, "model", "gemini-3.5-flash", "model name")
-	flag.StringVar(&scenariosCSV, "scenarios", "status,multiturn,stream,bom,negative-cookie", "comma-separated scenarios: status,multiturn,truncated-history,stream,bom,negative-cookie,rotation,audit-explicit")
+	flag.StringVar(&scenariosCSV, "scenarios", "status,multiturn,stream,tool,bom,negative-cookie", "comma-separated scenarios: status,multiturn,truncated-history,stream,tool,bom,negative-cookie,rotation,audit-explicit")
 	flag.StringVar(&reportDir, "report-dir", "scratch/e2e-reports", "directory for JSON reports")
 	flag.StringVar(&invalidAccount, "invalid-account", "acc2", "account used by negative-cookie scenario")
 	flag.DurationVar(&rotationWait, "rotation-wait", 75*time.Second, "wait duration for rotation scenario")
@@ -156,6 +180,8 @@ func runScenario(ctx context.Context, r *runner, name, invalidAccount string, ro
 		return r.scenarioTruncatedHistory(ctx, details)
 	case "stream":
 		return r.scenarioStream(ctx, details)
+	case "tool":
+		return r.scenarioToolCalling(ctx, details)
 	case "bom":
 		return r.scenarioBOM(ctx, details)
 	case "negative-cookie":
@@ -283,6 +309,54 @@ func (r *runner) scenarioStream(ctx context.Context, details map[string]interfac
 	details["sample"] = preview(text, 500)
 	if !strings.Contains(text, nonce) || !strings.Contains(strings.ToLower(text), "mermaid") {
 		return errors.New("stream response missing nonce or mermaid block")
+	}
+	return nil
+}
+
+func (r *runner) scenarioToolCalling(ctx context.Context, details map[string]interface{}) error {
+	tools := []toolDef{{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "lookup_weather",
+			Description: "Look up current weather for a city",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city"]}`),
+		},
+	}}
+	messages := []chatMessage{{
+		Role:    "user",
+		Content: "Use the lookup_weather tool for Shanghai. Return only the tool call.",
+	}}
+
+	calls, finishReason, err := r.chatToolCalls(ctx, messages, tools, "required")
+	if err != nil {
+		return err
+	}
+	details["non_stream_finish_reason"] = finishReason
+	details["non_stream_tool_calls"] = calls
+	if len(calls) == 0 {
+		return errors.New("non-stream tool scenario returned no tool calls")
+	}
+	if calls[0].Function.Name != "lookup_weather" {
+		return fmt.Errorf("non-stream tool scenario returned unexpected tool %q", calls[0].Function.Name)
+	}
+	if !strings.Contains(calls[0].Function.Arguments, "Shanghai") && !strings.Contains(calls[0].Function.Arguments, "上海") {
+		return fmt.Errorf("non-stream tool arguments do not mention Shanghai: %s", calls[0].Function.Arguments)
+	}
+
+	streamCalls, streamMeta, err := r.streamToolCalls(ctx, messages, tools, "required")
+	if err != nil {
+		return err
+	}
+	details["stream_meta"] = streamMeta
+	details["stream_tool_calls"] = streamCalls
+	if len(streamCalls) == 0 {
+		return errors.New("stream tool scenario returned no tool calls")
+	}
+	if streamCalls[0].Function.Name != "lookup_weather" {
+		return fmt.Errorf("stream tool scenario returned unexpected tool %q", streamCalls[0].Function.Name)
+	}
+	if streamMeta["finish_reason"] != "tool_calls" {
+		return fmt.Errorf("stream tool scenario expected finish_reason tool_calls, got %v", streamMeta["finish_reason"])
 	}
 	return nil
 }
@@ -433,6 +507,36 @@ func (r *runner) chat(ctx context.Context, messages []chatMessage, stream, bom b
 	return out.Choices[0].Message.Content, nil
 }
 
+func (r *runner) chatToolCalls(ctx context.Context, messages []chatMessage, tools []toolDef, toolChoice interface{}) ([]toolCall, string, error) {
+	req := chatRequest{Model: r.model, Messages: messages, Tools: tools, ToolChoice: toolChoice}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, "", err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.baseURL+"/openai/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := r.client.Do(httpReq)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("tool chat status %d: %s", resp.StatusCode, preview(string(respBody), 500))
+	}
+	var out chatResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, "", err
+	}
+	if len(out.Choices) == 0 {
+		return nil, "", errors.New("tool chat response has no choices")
+	}
+	return out.Choices[0].Message.ToolCalls, out.Choices[0].FinishReason, nil
+}
+
 func (r *runner) stream(ctx context.Context, messages []chatMessage, conversationID string) (string, map[string]interface{}, error) {
 	req := chatRequest{
 		Model:          r.model,
@@ -499,6 +603,74 @@ func (r *runner) stream(ctx context.Context, messages []chatMessage, conversatio
 		return "", nil, err
 	}
 	return text.String(), meta, nil
+}
+
+func (r *runner) streamToolCalls(ctx context.Context, messages []chatMessage, tools []toolDef, toolChoice interface{}) ([]toolCall, map[string]interface{}, error) {
+	req := chatRequest{
+		Model:         r.model,
+		Stream:        true,
+		Messages:      messages,
+		Tools:         tools,
+		ToolChoice:    toolChoice,
+		StreamOptions: &streamOpts{IncludeUsage: true},
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.baseURL+"/openai/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := r.client.Do(httpReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, nil, fmt.Errorf("tool stream status %d: %s", resp.StatusCode, preview(string(respBody), 500))
+	}
+	var calls []toolCall
+	meta := map[string]interface{}{"usage_seen": false, "finish_reason": ""}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []toolCall `json:"tool_calls,omitempty"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage interface{} `json:"usage,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage != nil {
+			meta["usage_seen"] = true
+		}
+		for _, choice := range chunk.Choices {
+			calls = append(calls, choice.Delta.ToolCalls...)
+			if choice.FinishReason != "" {
+				meta["finish_reason"] = choice.FinishReason
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, err
+	}
+	return calls, meta, nil
 }
 
 func (r *runner) listAccounts(ctx context.Context) ([]accountStatus, error) {
