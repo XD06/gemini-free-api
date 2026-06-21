@@ -1153,6 +1153,75 @@ func TestCreateChatCompletionStreamStreamsNormalAnswerWhenToolsAreAuto(t *testin
 	}
 }
 
+func TestCreateChatCompletionStreamRetriesInitialToolBridgeEmptyStreamWithFreshConversation(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEventsByCall: [][]providers.StreamEvent{
+			nil,
+			{{Kind: "content_delta", Delta: `{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"today news"}}]}`}},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "查一下今天新闻"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type:     "function",
+			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+		}},
+		Stream: true,
+	}
+
+	var toolCalls []dto.ChatCompletionChunkDeltaToolCall
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 {
+			toolCalls = append(toolCalls, chunk.Choices[0].Delta.ToolCalls...)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(toolCalls) != 1 || toolCalls[0].Function.Name != "search" {
+		t.Fatalf("expected retried tool call, got %#v", toolCalls)
+	}
+	if len(client.configs) != 2 {
+		t.Fatalf("expected initial failed stream and one fresh retry, got %#v", client.configs)
+	}
+	if client.configs[0].ConversationID == "" || client.configs[1].ConversationID == "" || client.configs[0].ConversationID == client.configs[1].ConversationID {
+		t.Fatalf("expected retry to use fresh conversation, got %#v", client.configs)
+	}
+}
+
+func TestCreateChatCompletionStreamDoesNotRetryInitialToolBridgeAuthError(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamErrs: []error{errors.New("authentication failed: cookies invalid")},
+	}
+	service := NewOpenAIService(client, nil)
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "查一下今天新闻"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type:     "function",
+			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+		}},
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		return true
+	})
+	if err == nil {
+		t.Fatal("expected auth error")
+	}
+	if len(client.configs) != 1 {
+		t.Fatalf("auth errors should not be retried by tool bridge fallback, got %#v", client.configs)
+	}
+}
+
 func TestCreateChatCompletionStreamDoesNotUseToolBridgeAfterToolResult(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamEvents: []providers.StreamEvent{

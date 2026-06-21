@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -513,6 +514,29 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	err = s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
 	if err == nil && completionLen == 0 {
 		err = errEmptyProviderStream
+	}
+	if err != nil && useToolBridge && !contextPlan.AutoContext && completionLen == 0 && shouldRetryFreshProviderContext(err) {
+		if s.log != nil {
+			s.log.Warn("tool bridge stream failed before content, retrying with fresh Gemini conversation",
+				zap.String("request_id", requestID),
+				zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
+				zap.Error(err),
+			)
+		}
+		fallbackPrompt := s.buildToolBridgePrompt(req, buildGeminiWebPromptFromOpenAIMessages(req.Messages), toolBridgeRequiresToolCall(req))
+		if fallbackPrompt != "" {
+			prompt = fallbackPrompt
+			fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
+			s.dumpOpenAITrace(ctx, req, contextPlan, "stream_tool_bridge_fallback", fallbackPrompt, fallbackOpts, inputFiles, useToolBridge, err)
+			completionText.Reset()
+			completionLen = 0
+			toolBridgeUndecided = useToolBridge && !mustBufferToolBridge(req)
+			toolBridgeStreamingContent = false
+			err = s.client.GenerateContentStreamForOpenAI(ctx, fallbackPrompt, handleStreamEvent, fallbackOpts...)
+			if err == nil && completionLen == 0 {
+				err = errEmptyProviderStream
+			}
+		}
 	}
 	if err != nil && contextPlan.AutoContext && completionLen == 0 && shouldRetrySameProviderContext(err) {
 		if s.log != nil {
@@ -1061,6 +1085,27 @@ func shouldRetrySameProviderContext(err error) bool {
 	for _, token := range []string{
 		"gemini bard error 1097",
 		"conversation continuity mismatch",
+		"authentication failed",
+		"cookies invalid",
+		"status 401",
+		"status 403",
+	} {
+		if strings.Contains(msg, token) {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldRetryFreshProviderContext(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, token := range []string{
 		"authentication failed",
 		"cookies invalid",
 		"status 401",
