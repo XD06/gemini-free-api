@@ -4,6 +4,10 @@ services:
     container_name: gemini-free-api
     ports:
       - "8787:8787"
+    extra_hosts:
+      # Lets Linux Docker containers reach services listening on the host.
+      # Use host.docker.internal in *_PROXY values when the proxy runs on the host.
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
