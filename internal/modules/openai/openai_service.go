@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -28,15 +29,20 @@ import (
 type OpenAIService struct {
 	client                   providers.GeminiClient
 	log                      *zap.Logger
+	fileStore                *openAIFileStore
 	contextMu                sync.Mutex
 	transcriptContexts       map[string]string
 	transcriptContextUpdated map[string]time.Time
 	transcriptSuffixContexts map[string]string
 	transcriptSuffixUpdated  map[string]time.Time
+	userWindowContexts       map[string]string
+	userWindowUpdated        map[string]time.Time
 	providerLatestTranscript map[string]string
 	providerLatestLength     map[string]int
 	rootContexts             map[string]string
 	rootContextUpdated       map[string]time.Time
+	explicitProviderContexts map[string]string
+	explicitProviderUpdated  map[string]time.Time
 }
 
 type openAIRequestIDContextKey struct{}
@@ -58,18 +64,37 @@ func geminiSourcePathEnabled() bool {
 	}
 }
 
+// openAILocalFallbackEnabled controls whether a provider conversation flagged
+// untrusted is treated as not-reusable, forcing the next turn to rebuild the
+// prompt from the locally retained full history. Defaults to enabled so the
+// "lost early turns" symptom is fixed out of the box; set
+// OPENAI_CONTEXT_LOCAL_FALLBACK=false to restore the legacy behavior for A/B.
+func openAILocalFallbackEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_CONTEXT_LOCAL_FALLBACK"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 func NewOpenAIService(client providers.GeminiClient, log *zap.Logger) *OpenAIService {
 	return &OpenAIService{
 		client:                   client,
 		log:                      log,
+		fileStore:                newOpenAIFileStore(""),
 		transcriptContexts:       make(map[string]string),
 		transcriptContextUpdated: make(map[string]time.Time),
 		transcriptSuffixContexts: make(map[string]string),
 		transcriptSuffixUpdated:  make(map[string]time.Time),
+		userWindowContexts:       make(map[string]string),
+		userWindowUpdated:        make(map[string]time.Time),
 		providerLatestTranscript: make(map[string]string),
 		providerLatestLength:     make(map[string]int),
 		rootContexts:             make(map[string]string),
 		rootContextUpdated:       make(map[string]time.Time),
+		explicitProviderContexts: make(map[string]string),
+		explicitProviderUpdated:  make(map[string]time.Time),
 	}
 }
 
@@ -77,6 +102,8 @@ const (
 	maxTranscriptContextEntries = 1000
 	transcriptContextTTL        = 12 * time.Hour
 )
+
+var errEmptyProviderStream = fmt.Errorf("provider stream completed without content")
 
 func generateChatID() string {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -88,6 +115,7 @@ func (s *OpenAIService) ListModels() []providers.ModelInfo {
 }
 
 func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCompletionRequest) (*dto.ChatCompletionResponse, error) {
+	requestID := openAIRequestIDFromContext(ctx)
 	modelMessages := req.ToModelMessages()
 
 	// Logic: Validate messages
@@ -128,7 +156,7 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	if contextPlan.ProviderConversationID != "" && !useToolBridge {
 		opts = append(opts, providers.WithConversationID(contextPlan.ProviderConversationID))
 	}
-	inputFiles, err := providers.InputFilesFromAttachments(modelMessages)
+	inputFiles, err := s.inputFilesFromModelMessages(ctx, modelMessages)
 	if err != nil {
 		return nil, err
 	}
@@ -136,19 +164,26 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 		baseOpts = append(baseOpts, providers.WithInputFiles(inputFiles))
 		opts = append(opts, providers.WithInputFiles(inputFiles))
 	}
+	s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_initial", prompt, opts, inputFiles, useToolBridge, nil)
 
 	// Logic: Call Provider
 	response, err := s.client.GenerateContent(ctx, prompt, opts...)
 	if err != nil && contextPlan.AutoContext && !useToolBridge {
 		if s.log != nil {
-			s.log.Warn("server-side context request failed, retrying stateless OpenAI prompt", zap.Error(err))
+			s.log.Warn("server-side context request failed, retrying stateless OpenAI prompt",
+				zap.String("request_id", requestID),
+				zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
+				zap.Error(err),
+			)
 		}
 		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
 		if useToolBridge {
 			fallbackPrompt = s.buildToolBridgePrompt(req, buildToolPlanningPrompt(req), toolBridgeRequiresToolCall(req))
 		}
 		if fallbackPrompt != "" {
+			s.forgetProviderConversation(contextPlan.ProviderConversationID)
 			fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
+			s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_fallback", fallbackPrompt, fallbackOpts, inputFiles, useToolBridge, err)
 			response, err = s.client.GenerateContent(ctx, fallbackPrompt, fallbackOpts...)
 			prompt = fallbackPrompt
 		}
@@ -412,7 +447,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	if contextPlan.ProviderConversationID != "" && !useToolBridge {
 		opts = append(opts, providers.WithConversationID(contextPlan.ProviderConversationID))
 	}
-	inputFiles, err := providers.InputFilesFromAttachments(modelMessages)
+	inputFiles, err := s.inputFilesFromModelMessages(ctx, modelMessages)
 	if err != nil {
 		return err
 	}
@@ -420,6 +455,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		baseOpts = append(baseOpts, providers.WithInputFiles(inputFiles))
 		opts = append(opts, providers.WithInputFiles(inputFiles))
 	}
+	s.dumpOpenAITrace(ctx, req, contextPlan, "stream_initial", prompt, opts, inputFiles, useToolBridge, nil)
 
 	onEvent(dto.ChatCompletionChunk{
 		ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
@@ -473,6 +509,9 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		}
 	}
 	err = s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
+	if err == nil && completionLen == 0 {
+		err = errEmptyProviderStream
+	}
 	if err != nil && contextPlan.AutoContext && !useToolBridge && completionLen == 0 && shouldRetrySameProviderContext(err) {
 		if s.log != nil {
 			s.log.Warn("server-side context stream failed before content, retrying same Gemini context once",
@@ -482,6 +521,9 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 			)
 		}
 		err = s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
+		if err == nil && completionLen == 0 {
+			err = errEmptyProviderStream
+		}
 	}
 	if err != nil && contextPlan.AutoContext && !useToolBridge && completionLen == 0 {
 		s.forgetProviderConversation(contextPlan.ProviderConversationID)
@@ -499,6 +541,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		if fallbackPrompt != "" {
 			prompt = fallbackPrompt
 			fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
+			s.dumpOpenAITrace(ctx, req, contextPlan, "stream_fallback", fallbackPrompt, fallbackOpts, inputFiles, useToolBridge, err)
 			if openAIRequestDebugEnabled() && s.log != nil {
 				s.log.Info("OpenAI stream fallback plan",
 					zap.String("request_id", requestID),
@@ -509,6 +552,9 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 				)
 			}
 			err = s.client.GenerateContentStreamForOpenAI(ctx, fallbackPrompt, handleStreamEvent, fallbackOpts...)
+			if err == nil && completionLen == 0 {
+				err = errEmptyProviderStream
+			}
 		}
 	}
 	if err != nil {
@@ -584,6 +630,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 type openAIContextPlan struct {
 	Prompt                 string
 	ProviderConversationID string
+	ClientConversationID   string
 	AutoContext            bool
 	RequestMessages        []dto.ChatCompletionMessage
 	ResponseText           string
@@ -600,6 +647,7 @@ func (s *OpenAIService) planRequestContext(req dto.ChatCompletionRequest) openAI
 	}
 
 	if explicitID := strings.TrimSpace(req.ConversationID); explicitID != "" {
+		plan.ClientConversationID = explicitID
 		plan.ProviderConversationID = explicitID
 		if prefix, latest, ok := splitOpenAIHistoryPrefix(req.Messages); ok {
 			if providerID := s.providerConversationForTranscript(prefix); providerID != "" {
@@ -609,6 +657,12 @@ func (s *OpenAIService) planRequestContext(req dto.ChatCompletionRequest) openAI
 				return plan
 			}
 			if providerID := s.providerConversationForTranscriptSuffix(prefix); providerID != "" {
+				plan.ProviderConversationID = providerID
+				plan.Prompt = rawUserPrompt(latest)
+				plan.AutoContext = true
+				return plan
+			}
+			if providerID := s.providerConversationForUserWindow(prefix); providerID != "" {
 				plan.ProviderConversationID = providerID
 				plan.Prompt = rawUserPrompt(latest)
 				plan.AutoContext = true
@@ -624,6 +678,11 @@ func (s *OpenAIService) planRequestContext(req dto.ChatCompletionRequest) openAI
 			return plan
 		}
 		if latest, ok := latestUserMessage(req.Messages); ok {
+			if providerID := s.providerConversationForExplicitID(explicitID); providerID != "" {
+				plan.ProviderConversationID = providerID
+			} else if !s.providerConversationReady(explicitID) {
+				plan.ProviderConversationID = newAutoProviderConversationID()
+			}
 			plan.Prompt = rawUserPrompt(latest)
 			plan.AutoContext = true
 		}
@@ -643,6 +702,12 @@ func (s *OpenAIService) planRequestContext(req dto.ChatCompletionRequest) openAI
 		return plan
 	}
 	if providerID := s.providerConversationForTranscriptSuffix(prefix); providerID != "" {
+		plan.ProviderConversationID = providerID
+		plan.Prompt = rawUserPrompt(latest)
+		plan.AutoContext = true
+		return plan
+	}
+	if providerID := s.providerConversationForUserWindow(prefix); providerID != "" {
 		plan.ProviderConversationID = providerID
 		plan.Prompt = rawUserPrompt(latest)
 		plan.AutoContext = true
@@ -700,6 +765,11 @@ func (s *OpenAIService) planToolResultContext(req dto.ChatCompletionRequest) (op
 		plan.AutoContext = true
 		return plan, true
 	}
+	if providerID := s.providerConversationForUserWindow(basePrefix); providerID != "" {
+		plan.ProviderConversationID = providerID
+		plan.AutoContext = true
+		return plan, true
+	}
 	if providerID := s.providerConversationForRoot(basePrefix); providerID != "" {
 		plan.ProviderConversationID = providerID
 		plan.AutoContext = true
@@ -727,7 +797,11 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	if plan.ProviderConversationID == "" || strings.TrimSpace(plan.ResponseText) == "" {
 		return
 	}
-	if !s.providerConversationReady(plan.ProviderConversationID) {
+	// remember only checks that the provider holds state for this id. It must
+	// NOT be gated by the untrusted flag: even if a conversation was flagged
+	// untrusted mid-stream, we still want to record its transcript so a later
+	// rebuilt turn can reuse the locally retained full history.
+	if s.client != nil && !s.client.HasConversationState(plan.ProviderConversationID) {
 		if s.log != nil {
 			s.log.Warn("skip OpenAI transcript context because provider conversation state is missing",
 				zap.String("provider_conversation_id", plan.ProviderConversationID),
@@ -759,6 +833,12 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	if s.transcriptSuffixUpdated == nil {
 		s.transcriptSuffixUpdated = make(map[string]time.Time)
 	}
+	if s.userWindowContexts == nil {
+		s.userWindowContexts = make(map[string]string)
+	}
+	if s.userWindowUpdated == nil {
+		s.userWindowUpdated = make(map[string]time.Time)
+	}
 	if s.providerLatestTranscript == nil {
 		s.providerLatestTranscript = make(map[string]string)
 	}
@@ -771,11 +851,22 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	if s.rootContextUpdated == nil {
 		s.rootContextUpdated = make(map[string]time.Time)
 	}
+	if s.explicitProviderContexts == nil {
+		s.explicitProviderContexts = make(map[string]string)
+	}
+	if s.explicitProviderUpdated == nil {
+		s.explicitProviderUpdated = make(map[string]time.Time)
+	}
 	now := time.Now()
 	s.pruneTranscriptContextsLocked(time.Now())
+	if plan.ClientConversationID != "" {
+		s.explicitProviderContexts[plan.ClientConversationID] = plan.ProviderConversationID
+		s.explicitProviderUpdated[plan.ClientConversationID] = now
+	}
 	s.transcriptContexts[key] = plan.ProviderConversationID
 	s.transcriptContextUpdated[key] = now
 	s.rememberTranscriptSuffixesLocked(next, plan.ProviderConversationID, now)
+	s.rememberUserWindowsLocked(next, plan.ProviderConversationID, now)
 	s.providerLatestTranscript[plan.ProviderConversationID] = key
 	s.providerLatestLength[plan.ProviderConversationID] = len(next)
 	if rootKey := conversationRootFingerprint(next); rootKey != "" {
@@ -788,7 +879,18 @@ func (s *OpenAIService) providerConversationReady(id string) bool {
 	if s.client == nil {
 		return true
 	}
-	return s.client.HasConversationState(id)
+	if !s.client.HasConversationState(id) {
+		return false
+	}
+	// A provider conversation flagged untrusted (continuity mismatch or bard
+	// error) must not be reused for server-side context. This forces the next
+	// turn to rebuild from the locally retained full history instead of
+	// trusting a broken Gemini-side record. Guarded by an env switch so the
+	// behavior can be disabled for diagnosis.
+	if openAILocalFallbackEnabled() && s.client.IsConversationUntrusted(id) {
+		return false
+	}
+	return true
 }
 
 func shouldRetrySameProviderContext(err error) bool {
@@ -830,14 +932,53 @@ func (s *OpenAIService) forgetProviderConversation(providerID string) {
 			delete(s.transcriptSuffixUpdated, key)
 		}
 	}
+	for key, id := range s.userWindowContexts {
+		if id == providerID {
+			delete(s.userWindowContexts, key)
+			delete(s.userWindowUpdated, key)
+		}
+	}
 	for key, id := range s.rootContexts {
 		if id == providerID {
 			delete(s.rootContexts, key)
 			delete(s.rootContextUpdated, key)
 		}
 	}
+	for key, id := range s.explicitProviderContexts {
+		if id == providerID {
+			delete(s.explicitProviderContexts, key)
+			delete(s.explicitProviderUpdated, key)
+		}
+	}
 	delete(s.providerLatestTranscript, providerID)
 	delete(s.providerLatestLength, providerID)
+}
+
+func (s *OpenAIService) providerConversationForExplicitID(clientID string) string {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		return ""
+	}
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	if s.explicitProviderContexts == nil {
+		return ""
+	}
+	updatedAt, hasUpdatedAt := s.explicitProviderUpdated[clientID]
+	if hasUpdatedAt && time.Since(updatedAt) > transcriptContextTTL {
+		delete(s.explicitProviderContexts, clientID)
+		delete(s.explicitProviderUpdated, clientID)
+		return ""
+	}
+	providerID := s.explicitProviderContexts[clientID]
+	if providerID == "" || !s.providerConversationReady(providerID) {
+		return ""
+	}
+	if s.explicitProviderUpdated == nil {
+		s.explicitProviderUpdated = make(map[string]time.Time)
+	}
+	s.explicitProviderUpdated[clientID] = time.Now()
+	return providerID
 }
 
 func (s *OpenAIService) providerConversationForTranscript(messages []dto.ChatCompletionMessage) string {
@@ -858,6 +999,9 @@ func (s *OpenAIService) providerConversationForTranscript(messages []dto.ChatCom
 	}
 	providerID := s.transcriptContexts[key]
 	if providerID != "" && s.providerLatestTranscript != nil && s.providerLatestTranscript[providerID] != "" && s.providerLatestTranscript[providerID] != key {
+		return ""
+	}
+	if providerID != "" && !s.providerConversationReady(providerID) {
 		return ""
 	}
 	if providerID != "" {
@@ -903,6 +1047,33 @@ func (s *OpenAIService) providerConversationForTranscriptSuffix(messages []dto.C
 		s.transcriptSuffixUpdated = make(map[string]time.Time)
 	}
 	s.transcriptSuffixUpdated[key] = time.Now()
+	return providerID
+}
+
+func (s *OpenAIService) providerConversationForUserWindow(messages []dto.ChatCompletionMessage) string {
+	key := userWindowFingerprint(messages, 2, 4)
+	if key == "" {
+		return ""
+	}
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	if s.userWindowContexts == nil {
+		return ""
+	}
+	updatedAt, hasUpdatedAt := s.userWindowUpdated[key]
+	if hasUpdatedAt && time.Since(updatedAt) > transcriptContextTTL {
+		delete(s.userWindowContexts, key)
+		delete(s.userWindowUpdated, key)
+		return ""
+	}
+	providerID := s.userWindowContexts[key]
+	if providerID == "" || !s.providerConversationReady(providerID) {
+		return ""
+	}
+	if s.userWindowUpdated == nil {
+		s.userWindowUpdated = make(map[string]time.Time)
+	}
+	s.userWindowUpdated[key] = time.Now()
 	return providerID
 }
 
@@ -954,6 +1125,20 @@ func (s *OpenAIService) rememberTranscriptSuffixesLocked(messages []dto.ChatComp
 	}
 }
 
+func (s *OpenAIService) rememberUserWindowsLocked(messages []dto.ChatCompletionMessage, providerID string, now time.Time) {
+	if providerID == "" {
+		return
+	}
+	for size := 2; size <= 4; size++ {
+		key := userWindowFingerprint(messages, size, size)
+		if key == "" {
+			continue
+		}
+		s.userWindowContexts[key] = providerID
+		s.userWindowUpdated[key] = now
+	}
+}
+
 func (s *OpenAIService) pruneTranscriptContextsLocked(now time.Time) {
 	for key, updatedAt := range s.transcriptContextUpdated {
 		if now.Sub(updatedAt) > transcriptContextTTL {
@@ -976,6 +1161,12 @@ func (s *OpenAIService) pruneTranscriptContextsLocked(now time.Time) {
 		if now.Sub(updatedAt) > transcriptContextTTL {
 			delete(s.transcriptSuffixContexts, key)
 			delete(s.transcriptSuffixUpdated, key)
+		}
+	}
+	for key, updatedAt := range s.userWindowUpdated {
+		if now.Sub(updatedAt) > transcriptContextTTL {
+			delete(s.userWindowContexts, key)
+			delete(s.userWindowUpdated, key)
 		}
 	}
 	for len(s.transcriptContexts) > maxTranscriptContextEntries {
@@ -1030,6 +1221,22 @@ func (s *OpenAIService) pruneTranscriptContextsLocked(now time.Time) {
 		}
 		delete(s.transcriptSuffixContexts, oldestKey)
 		delete(s.transcriptSuffixUpdated, oldestKey)
+	}
+	for len(s.userWindowContexts) > maxTranscriptContextEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		for key := range s.userWindowContexts {
+			updatedAt := s.userWindowUpdated[key]
+			if oldestKey == "" || updatedAt.Before(oldestTime) {
+				oldestKey = key
+				oldestTime = updatedAt
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(s.userWindowContexts, oldestKey)
+		delete(s.userWindowUpdated, oldestKey)
 	}
 }
 
@@ -1139,6 +1346,138 @@ func fallbackOptionsWithFreshConversation(plan *openAIContextPlan, baseOpts []pr
 	return append(opts, providers.WithConversationID(fallbackID))
 }
 
+type openAIUpstreamTrace struct {
+	RequestID              string                    `json:"request_id"`
+	Stage                  string                    `json:"stage"`
+	CreatedAt              string                    `json:"created_at"`
+	ClientConversationID   string                    `json:"client_conversation_id,omitempty"`
+	ProviderConversationID string                    `json:"provider_conversation_id,omitempty"`
+	AutoContext            bool                      `json:"auto_context"`
+	UseToolBridge          bool                      `json:"use_tool_bridge"`
+	Model                  string                    `json:"model,omitempty"`
+	Stream                 bool                      `json:"stream"`
+	MessageCount           int                       `json:"message_count"`
+	Messages               []openAIMessageLogSummary `json:"messages"`
+	PromptLength           int                       `json:"prompt_length"`
+	PromptSHA256           string                    `json:"prompt_sha256,omitempty"`
+	PromptPreview          string                    `json:"prompt_preview,omitempty"`
+	ProviderConfig         openAIProviderTraceConfig `json:"provider_config"`
+	InputFiles             []openAITraceInputFile    `json:"input_files,omitempty"`
+	PreviousError          string                    `json:"previous_error,omitempty"`
+}
+
+type openAIProviderTraceConfig struct {
+	Model          string `json:"model,omitempty"`
+	ThinkingLevel  string `json:"thinking_level,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	SourcePath     bool   `json:"source_path,omitempty"`
+	InputFileCount int    `json:"input_file_count,omitempty"`
+	PathFileCount  int    `json:"path_file_count,omitempty"`
+}
+
+type openAITraceInputFile struct {
+	Name     string `json:"name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Bytes    int    `json:"bytes"`
+	SHA256   string `json:"sha256,omitempty"`
+}
+
+func (s *OpenAIService) dumpOpenAITrace(ctx context.Context, req dto.ChatCompletionRequest, plan openAIContextPlan, stage, prompt string, opts []providers.GenerateOption, inputFiles []providers.InputFile, useToolBridge bool, previousErr error) {
+	dir := strings.TrimSpace(os.Getenv("GEMINI_DEBUG_STREAM_DIR"))
+	if dir == "" || !openAIRequestDebugEnabled() {
+		return
+	}
+	requestID := openAIRequestIDFromContext(ctx)
+	if requestID == "" {
+		requestID = generateChatID()
+	}
+	var cfg providers.GenerateConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	trace := openAIUpstreamTrace{
+		RequestID:              requestID,
+		Stage:                  stage,
+		CreatedAt:              time.Now().Format(time.RFC3339Nano),
+		ClientConversationID:   strings.TrimSpace(req.ConversationID),
+		ProviderConversationID: strings.TrimSpace(plan.ProviderConversationID),
+		AutoContext:            plan.AutoContext,
+		UseToolBridge:          useToolBridge,
+		Model:                  req.Model,
+		Stream:                 req.Stream,
+		MessageCount:           len(req.Messages),
+		Messages:               summarizeOpenAIMessages(req.Messages),
+		PromptLength:           len(prompt),
+		PromptSHA256:           sha256Hex(prompt),
+		PromptPreview:          previewForLog(prompt, 4000),
+		ProviderConfig: openAIProviderTraceConfig{
+			Model:          cfg.Model,
+			ThinkingLevel:  cfg.ThinkingLevel,
+			ConversationID: strings.TrimSpace(cfg.ConversationID),
+			SourcePath:     cfg.SourcePath,
+			InputFileCount: len(cfg.InputFiles),
+			PathFileCount:  len(cfg.Files),
+		},
+		InputFiles: summarizeTraceInputFiles(inputFiles),
+	}
+	if previousErr != nil {
+		trace.PreviousError = previousErr.Error()
+	}
+	body, err := json.MarshalIndent(trace, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		if s.log != nil {
+			s.log.Warn("failed to create OpenAI upstream trace directory", zap.String("dir", dir), zap.Error(err))
+		}
+		return
+	}
+	shortID := requestID
+	if len(shortID) > 16 {
+		shortID = shortID[:16]
+	}
+	name := fmt.Sprintf("%s_%s_%s_openai_upstream_trace.json", time.Now().Format("20060102_150405.000"), sanitizeOpenAIDebugFilename(shortID), sanitizeOpenAIDebugFilename(stage))
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		if s.log != nil {
+			s.log.Warn("failed to write OpenAI upstream trace", zap.String("path", path), zap.Error(err))
+		}
+		return
+	}
+	if s.log != nil {
+		s.log.Info("OpenAI upstream trace written", zap.String("path", path), zap.String("stage", stage), zap.String("request_id", requestID))
+	}
+}
+
+func summarizeTraceInputFiles(files []providers.InputFile) []openAITraceInputFile {
+	out := make([]openAITraceInputFile, 0, len(files))
+	for _, file := range files {
+		out = append(out, openAITraceInputFile{
+			Name:     strings.TrimSpace(file.Name),
+			MimeType: strings.TrimSpace(file.MimeType),
+			Bytes:    len(file.Data),
+			SHA256:   sha256BytesHex(file.Data),
+		})
+	}
+	return out
+}
+
+func sha256Hex(value string) string {
+	if value == "" {
+		return ""
+	}
+	return sha256BytesHex([]byte(value))
+}
+
+func sha256BytesHex(value []byte) string {
+	if len(value) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
 func transcriptFingerprint(messages []dto.ChatCompletionMessage) string {
 	type normalizedMessage struct {
 		Role        string                       `json:"role"`
@@ -1188,6 +1527,43 @@ func conversationRootFingerprint(messages []dto.ChatCompletionMessage) string {
 		}
 	}
 	return ""
+}
+
+func userWindowFingerprint(messages []dto.ChatCompletionMessage, minUsers, maxUsers int) string {
+	if minUsers <= 0 || maxUsers < minUsers {
+		return ""
+	}
+	type normalizedUserMessage struct {
+		Content     string              `json:"content"`
+		Attachments []models.Attachment `json:"attachments,omitempty"`
+	}
+	users := make([]normalizedUserMessage, 0, maxUsers)
+	for i := len(messages) - 1; i >= 0 && len(users) < maxUsers; i-- {
+		msg := messages[i]
+		if !strings.EqualFold(strings.TrimSpace(msg.Role), "user") {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" && len(msg.Attachments) == 0 {
+			continue
+		}
+		users = append(users, normalizedUserMessage{
+			Content:     content,
+			Attachments: msg.Attachments,
+		})
+	}
+	if len(users) < minUsers {
+		return ""
+	}
+	for i, j := 0, len(users)-1; i < j; i, j = i+1, j-1 {
+		users[i], users[j] = users[j], users[i]
+	}
+	body, err := json.Marshal(users)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])[:32]
 }
 
 func cloneChatMessages(messages []dto.ChatCompletionMessage) []dto.ChatCompletionMessage {

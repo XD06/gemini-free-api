@@ -33,8 +33,10 @@ config.yml
 # cookies
 .cookies/
 data/cookies/
+data/openai-files/
 data/state/
 tools/cookie-worker/profiles/
+tools/cookie-worker/.env.*
 
 # env file
 .env
@@ -43,6 +45,7 @@ tools/cookie-worker/profiles/
 *.log
 
 # local stream/debug captures
+.codegraph/
 scratch/
 pro_entry_trace.json
 pro_request_dump.json

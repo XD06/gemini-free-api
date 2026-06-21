@@ -2,21 +2,27 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"gemini-free-api/internal/commons/models"
 	"gemini-free-api/internal/modules/openai/dto"
 	"gemini-free-api/internal/modules/providers"
 )
 
 type fakeGeminiClient struct {
-	streamEvents []providers.StreamEvent
-	streamErrs   []error
-	prompts      []string
-	configs      []providers.GenerateConfig
+	streamEvents       []providers.StreamEvent
+	streamEventsByCall [][]providers.StreamEvent
+	streamErrs         []error
+	prompts            []string
+	configs            []providers.GenerateConfig
+	untrusted          bool
 }
 
 func (f *fakeGeminiClient) Init(context.Context) error { return nil }
@@ -42,7 +48,12 @@ func (f *fakeGeminiClient) GenerateContentStreamForOpenAI(ctx context.Context, p
 		opt(&cfg)
 	}
 	f.configs = append(f.configs, cfg)
-	for _, event := range f.streamEvents {
+	events := f.streamEvents
+	if len(f.streamEventsByCall) > 0 {
+		events = f.streamEventsByCall[0]
+		f.streamEventsByCall = f.streamEventsByCall[1:]
+	}
+	for _, event := range events {
 		if !onEvent(event) {
 			return nil
 		}
@@ -55,7 +66,8 @@ func (f *fakeGeminiClient) GenerateContentStreamForOpenAI(ctx context.Context, p
 	return nil
 }
 
-func (f *fakeGeminiClient) HasConversationState(string) bool { return true }
+func (f *fakeGeminiClient) HasConversationState(string) bool    { return true }
+func (f *fakeGeminiClient) IsConversationUntrusted(string) bool { return f.untrusted }
 
 func TestModelAndThinkingLevelUsesExplicitLevel(t *testing.T) {
 	model, level := modelAndThinkingLevel("gemini-3.5-flash:thinking=extended", "standard")
@@ -421,6 +433,53 @@ func TestPlanRequestContextFallsBackToRootWhenAssistantTextDiffers(t *testing.T)
 	}
 }
 
+func TestPlanRequestContextReusesProviderWhenAssistantWindowDiffers(t *testing.T) {
+	service := NewOpenAIService(nil, nil)
+	providerID := "provider-window"
+	transcript := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "第一轮：记住词语松月"},
+		{Role: "assistant", Content: "已记住松月"},
+		{Role: "user", Content: "第二轮：解释连接池"},
+		{Role: "assistant", Content: "连接池用于复用连接。"},
+		{Role: "user", Content: "第三轮：解释 keep-alive"},
+		{Role: "assistant", Content: "keep-alive 可以降低握手开销。"},
+	}
+	service.rememberRequestContext(openAIContextPlan{
+		ProviderConversationID: providerID,
+		RequestMessages:        transcript[:len(transcript)-1],
+		ResponseText:           transcript[len(transcript)-1].Content,
+	})
+
+	req := dto.ChatCompletionRequest{
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "第一轮：记住词语松月"},
+			{Role: "assistant", Content: "好的，已经记住。"},
+			{Role: "user", Content: "第二轮：解释连接池"},
+			{Role: "assistant", Content: "连接池会复用连接"},
+			{Role: "user", Content: "第三轮：解释 keep-alive"},
+			{Role: "assistant", Content: "keep-alive 能减少握手"},
+			{Role: "user", Content: "继续说说这些概念的关系"},
+		},
+	}
+	plan := service.planRequestContext(req)
+	if plan.ProviderConversationID != providerID || !plan.AutoContext {
+		t.Fatalf("expected relaxed user-window match to reuse %q, got id=%q auto=%v", providerID, plan.ProviderConversationID, plan.AutoContext)
+	}
+	if plan.Prompt != "继续说说这些概念的关系" {
+		t.Fatalf("expected only latest user prompt, got %q", plan.Prompt)
+	}
+}
+
+func TestUserWindowFingerprintRequiresAtLeastTwoUserMessages(t *testing.T) {
+	key := userWindowFingerprint([]dto.ChatCompletionMessage{
+		{Role: "user", Content: "介绍一下 Mermaid"},
+		{Role: "assistant", Content: "Mermaid 是图表语法。"},
+	}, 2, 4)
+	if key != "" {
+		t.Fatalf("single user message must not produce relaxed user-window key, got %q", key)
+	}
+}
+
 func TestPruneTranscriptContextsRemovesExpiredEntries(t *testing.T) {
 	service := NewOpenAIService(nil, nil)
 	service.transcriptContexts["old"] = "provider-old"
@@ -486,6 +545,10 @@ func TestRememberRequestContextSkipsMissingProviderConversationState(t *testing.
 func TestStreamSkipsSameContextRetryForGemini1097(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamErrs: []error{errors.New("gemini bard error 1097")},
+		streamEventsByCall: [][]providers.StreamEvent{
+			nil,
+			{{Kind: "content_delta", Delta: "fallback answer"}},
+		},
 	}
 	service := NewOpenAIService(client, nil)
 
@@ -523,8 +586,216 @@ func TestStreamSkipsSameContextRetryForGemini1097(t *testing.T) {
 	if client.configs[1].ConversationID == "" || client.configs[1].ConversationID == "provider-1" {
 		t.Fatalf("expected fallback to use fresh provider conversation, got %q", client.configs[1].ConversationID)
 	}
-	if len(service.transcriptContexts) != 0 {
-		t.Fatalf("expected stale provider context to be forgotten, got %#v", service.transcriptContexts)
+	for _, providerID := range service.transcriptContexts {
+		if providerID == "provider-1" {
+			t.Fatalf("expected stale provider context to be forgotten, got %#v", service.transcriptContexts)
+		}
+	}
+}
+
+func TestStreamRebindsExplicitConversationIDAfterFallback(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamErrs: []error{nil, errors.New("gemini bard error 1097"), nil, nil},
+		streamEventsByCall: [][]providers.StreamEvent{
+			{{Kind: "content_delta", Delta: "已记住松月"}},
+			nil,
+			{{Kind: "content_delta", Delta: "松月"}},
+			{{Kind: "content_delta", Delta: "还是松月"}},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	firstReq := dto.ChatCompletionRequest{
+		Model:          "gemini-3.5-flash",
+		ConversationID: "cherry-thread",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "记住一个词：松月"},
+		},
+		Stream: true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), firstReq, func(chunk dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("first stream returned error: %v", err)
+	}
+
+	secondReq := dto.ChatCompletionRequest{
+		Model:          "gemini-3.5-flash",
+		ConversationID: "cherry-thread",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "刚才让你记住的词是什么？"},
+		},
+		Stream: true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), secondReq, func(chunk dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("second stream returned error: %v", err)
+	}
+
+	if len(client.configs) != 3 {
+		t.Fatalf("expected first call, failed continuation, and fallback; got %#v", client.configs)
+	}
+	if client.configs[1].ConversationID != "cherry-thread" {
+		t.Fatalf("expected failed second call to use original explicit id, got %q", client.configs[1].ConversationID)
+	}
+	fallbackID := client.configs[2].ConversationID
+	if fallbackID == "" || fallbackID == "cherry-thread" {
+		t.Fatalf("expected fallback to allocate repaired provider id, got %q", fallbackID)
+	}
+
+	thirdReq := dto.ChatCompletionRequest{
+		Model:          "gemini-3.5-flash",
+		ConversationID: "cherry-thread",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "再说一遍刚才的词"},
+		},
+		Stream: true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), thirdReq, func(chunk dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("third stream returned error: %v", err)
+	}
+	if len(client.configs) != 4 {
+		t.Fatalf("expected third request to make one provider call, got %#v", client.configs)
+	}
+	if client.configs[3].ConversationID != fallbackID {
+		t.Fatalf("expected third request to reuse repaired provider id %q, got %q", fallbackID, client.configs[3].ConversationID)
+	}
+}
+
+func TestChatCompletionMessageParsesOpenAIFileContentParts(t *testing.T) {
+	body := `{
+		"role":"user",
+		"content":[
+			{"type":"input_text","text":"请总结附件"},
+			{"type":"input_file","filename":"note.txt","file_data":"data:text/plain;base64,SGVsbG8="},
+			{"type":"file","file":{"file_id":"file_abc","filename":"stored.pdf","mime_type":"application/pdf"}},
+			{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}
+		]
+	}`
+	var msg dto.ChatCompletionMessage
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if msg.Content != "请总结附件" {
+		t.Fatalf("expected text content, got %q", msg.Content)
+	}
+	if len(msg.Attachments) != 3 {
+		t.Fatalf("expected 3 attachments, got %#v", msg.Attachments)
+	}
+	if msg.Attachments[0].Name != "note.txt" || msg.Attachments[0].MimeType != "text/plain" || msg.Attachments[0].Data != "SGVsbG8=" {
+		t.Fatalf("unexpected inline file attachment: %#v", msg.Attachments[0])
+	}
+	if msg.Attachments[1].FileID != "file_abc" || msg.Attachments[1].Name != "stored.pdf" || msg.Attachments[1].MimeType != "application/pdf" {
+		t.Fatalf("unexpected file_id attachment: %#v", msg.Attachments[1])
+	}
+	if msg.Attachments[2].URL != "https://example.com/image.png" {
+		t.Fatalf("unexpected remote image attachment: %#v", msg.Attachments[2])
+	}
+}
+
+func TestOpenAIServiceInputFilesResolveStoredFileID(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	service.fileStore = newOpenAIFileStore(t.TempDir())
+	fileID := "file-test"
+	path := filepath.Join(service.fileStore.dir, fileID+"_note.txt")
+	if err := os.WriteFile(path, []byte("stored content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := openAIFileMetadata{
+		openAIFileObject: openAIFileObject{
+			ID:        fileID,
+			Object:    "file",
+			Bytes:     int64(len("stored content")),
+			CreatedAt: time.Now().Unix(),
+			Filename:  "note.txt",
+			Purpose:   "assistants",
+		},
+		Path:     path,
+		MimeType: "text/plain",
+	}
+	if err := service.fileStore.writeMetadata(meta); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := service.inputFilesFromModelMessages(context.Background(), []models.Message{{
+		Role: "user",
+		Attachments: []models.Attachment{{
+			FileID: fileID,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("inputFilesFromModelMessages returned error: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "note.txt" || files[0].MimeType != "text/plain" || string(files[0].Data) != "stored content" {
+		t.Fatalf("unexpected resolved file: %#v", files)
+	}
+}
+
+func TestOpenAIServiceInputFilesResolveInlineData(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	files, err := service.inputFilesFromModelMessages(context.Background(), []models.Message{{
+		Role: "user",
+		Attachments: []models.Attachment{{
+			Name:     "note.txt",
+			MimeType: "text/plain",
+			Data:     base64.StdEncoding.EncodeToString([]byte("inline content")),
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("inputFilesFromModelMessages returned error: %v", err)
+	}
+	if len(files) != 1 || string(files[0].Data) != "inline content" {
+		t.Fatalf("unexpected inline file: %#v", files)
+	}
+}
+
+func TestCreateChatCompletionStreamDoesNotSilentlyStopWhenProviderEmitsNoContent(t *testing.T) {
+	client := &fakeGeminiClient{}
+	service := NewOpenAIService(client, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+		},
+		Stream: true,
+	}
+
+	var content strings.Builder
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 {
+			content.WriteString(chunk.Choices[0].Delta.Content)
+		}
+		return true
+	})
+
+	if err == nil {
+		t.Fatalf("expected empty provider stream to return an error instead of silent stop; content=%q", content.String())
+	}
+}
+
+func TestCreateChatCompletionStreamWithToolsDoesNotSilentlyStopWhenProviderEmitsNoContent(t *testing.T) {
+	client := &fakeGeminiClient{}
+	service := NewOpenAIService(client, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "帮我搜索一下"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object"}`),
+			},
+		}},
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		return true
+	})
+
+	if err == nil {
+		t.Fatal("expected empty tool-bridge provider stream to return an error instead of silent stop")
 	}
 }
 
@@ -814,5 +1085,79 @@ func TestCreateChatCompletionStreamDoesNotAppendToolBridgeToExistingConversation
 	}
 	if client.configs[0].ConversationID != "" {
 		t.Fatalf("tool bridge planning must not append to existing conversation, got %q", client.configs[0].ConversationID)
+	}
+}
+
+// TestPlanRequestContextSkipsUntrustedProviderConversation reproduces the
+// "lost early turns" root cause: a provider conversation flagged untrusted
+// must not be reused for server-side context, forcing the next turn to
+// rebuild from the full OpenAI history with a fresh provider id.
+func TestPlanRequestContextSkipsUntrustedProviderConversation(t *testing.T) {
+	client := &fakeGeminiClient{untrusted: true}
+	service := NewOpenAIService(client, nil)
+
+	first := openAIContextPlan{
+		ProviderConversationID: "provider-thread",
+		RequestMessages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "记住第一个词：海棠"},
+		},
+		ResponseText: "已记住海棠",
+	}
+	service.rememberRequestContext(first)
+
+	// Second turn whose prefix matches the remembered transcript. With
+	// OPENAI_CONTEXT_LOCAL_FALLBACK on (default), the untrusted provider
+	// conversation must NOT be reused.
+	t.Setenv("OPENAI_CONTEXT_LOCAL_FALLBACK", "true")
+	req := dto.ChatCompletionRequest{
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "记住第一个词：海棠"},
+			{Role: "assistant", Content: "已记住海棠"},
+			{Role: "user", Content: "第一个词是什么？"},
+		},
+	}
+	plan := service.planRequestContext(req)
+	if plan.AutoContext {
+		t.Fatalf("expected untrusted provider to NOT be reused for auto context, got provider_id=%q", plan.ProviderConversationID)
+	}
+	if plan.ProviderConversationID == "provider-thread" {
+		t.Fatal("expected a fresh provider conversation id, not the untrusted one")
+	}
+	// Rebuilt prompt must carry the full history, not just the latest user turn.
+	if !strings.Contains(plan.Prompt, "海棠") {
+		t.Fatalf("expected rebuilt prompt to include full history, got %q", plan.Prompt)
+	}
+}
+
+// TestPlanRequestContextReusesUntrustedWhenDisabled verifies the env switch
+// restores legacy behavior (untrusted conversations are still reused) so the
+// fix can be A/B tested or rolled back without a redeploy.
+func TestPlanRequestContextReusesUntrustedWhenDisabled(t *testing.T) {
+	client := &fakeGeminiClient{untrusted: true}
+	service := NewOpenAIService(client, nil)
+
+	first := openAIContextPlan{
+		ProviderConversationID: "provider-thread-2",
+		RequestMessages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "记住第一个词：芭蕉"},
+		},
+		ResponseText: "已记住芭蕉",
+	}
+	service.rememberRequestContext(first)
+
+	t.Setenv("OPENAI_CONTEXT_LOCAL_FALLBACK", "false")
+	req := dto.ChatCompletionRequest{
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "记住第一个词：芭蕉"},
+			{Role: "assistant", Content: "已记住芭蕉"},
+			{Role: "user", Content: "第一个词是什么？"},
+		},
+	}
+	plan := service.planRequestContext(req)
+	if !plan.AutoContext || plan.ProviderConversationID != "provider-thread-2" {
+		t.Fatalf("expected legacy behavior to reuse untrusted provider thread-2, got id=%q auto=%v", plan.ProviderConversationID, plan.AutoContext)
+	}
+	if plan.Prompt != "第一个词是什么？" {
+		t.Fatalf("expected only latest user prompt under legacy mode, got %q", plan.Prompt)
 	}
 }

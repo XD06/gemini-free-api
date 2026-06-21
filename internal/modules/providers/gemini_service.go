@@ -49,21 +49,22 @@ type Client struct {
 	healthy         bool
 	log             *zap.Logger
 
-	autoRefresh      bool
-	refreshInterval  time.Duration
-	stopRefresh      chan struct{}
-	maxRetries       int
-	cachedModels     []ModelInfo
-	cachedAliases    map[string]string
-	conversations    map[string]*SessionMetadata
-	conversationSeen map[string]time.Time
-	conversationMu   sync.Mutex
-	statusMu         sync.RWMutex
-	healthState      string
-	lastError        string
-	lastValidated    time.Time
-	lastCookieSync   time.Time
-	requestSeq       uint64
+	autoRefresh           bool
+	refreshInterval       time.Duration
+	stopRefresh           chan struct{}
+	maxRetries            int
+	cachedModels          []ModelInfo
+	cachedAliases         map[string]string
+	conversations         map[string]*SessionMetadata
+	conversationSeen      map[string]time.Time
+	conversationUntrusted map[string]bool
+	conversationMu        sync.Mutex
+	statusMu              sync.RWMutex
+	healthState           string
+	lastError             string
+	lastValidated         time.Time
+	lastCookieSync        time.Time
+	requestSeq            uint64
 }
 
 type CookieStore struct {
@@ -164,23 +165,24 @@ func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfi
 	}
 
 	return &Client{
-		accountID:        account.ID,
-		proxyURL:         account.ProxyURL,
-		cookieSource:     account.CookieSource,
-		cookieCache:      cfg.Gemini.CookieCache,
-		cookieCachePath:  cfg.Gemini.CookieCachePath,
-		httpClient:       client,
-		rawHTTPClient:    rawClient,
-		cookies:          cookies,
-		autoRefresh:      true,
-		refreshInterval:  time.Duration(refreshIntervalMinutes) * time.Minute,
-		stopRefresh:      make(chan struct{}),
-		maxRetries:       maxRetries,
-		log:              log,
-		conversations:    make(map[string]*SessionMetadata),
-		conversationSeen: make(map[string]time.Time),
-		healthState:      AccountStateUninitialized,
-		requestSeq:       uint64(time.Now().UnixNano()%900000) + 100000,
+		accountID:             account.ID,
+		proxyURL:              account.ProxyURL,
+		cookieSource:          account.CookieSource,
+		cookieCache:           cfg.Gemini.CookieCache,
+		cookieCachePath:       cfg.Gemini.CookieCachePath,
+		httpClient:            client,
+		rawHTTPClient:         rawClient,
+		cookies:               cookies,
+		autoRefresh:           true,
+		refreshInterval:       time.Duration(refreshIntervalMinutes) * time.Minute,
+		stopRefresh:           make(chan struct{}),
+		maxRetries:            maxRetries,
+		log:                   log,
+		conversations:         make(map[string]*SessionMetadata),
+		conversationSeen:      make(map[string]time.Time),
+		conversationUntrusted: make(map[string]bool),
+		healthState:           AccountStateUninitialized,
+		requestSeq:            uint64(time.Now().UnixNano()%900000) + 100000,
 	}
 }
 
@@ -1026,6 +1028,7 @@ type StreamState struct {
 
 const maxStreamParseBufferBytes = 512 * 1024
 const defaultStreamFinishIdleTimeout = 1500 * time.Millisecond
+const defaultStreamFirstContentTimeout = 45 * time.Second
 
 func (c *Client) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
 	state := &StreamState{}
@@ -1225,6 +1228,8 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		return nil
 	}
 	finishIdleTimeout := streamFinishIdleTimeout()
+	firstContentTimeout := streamFirstContentTimeout()
+	firstContentDeadline := time.Now().Add(firstContentTimeout)
 	firstByteLogged := false
 	firstTextLogged := false
 	entryTrace := newStreamEntryTrace(20)
@@ -1254,6 +1259,8 @@ readLoop:
 	for {
 		var idleTimer *time.Timer
 		var idleCh <-chan time.Time
+		var firstContentTimer *time.Timer
+		var firstContentCh <-chan time.Time
 		if timeout, ok := streamFinishIdleRemaining(lastText, lastContentAt, finishIdleTimeout); ok {
 			if timeout <= 0 {
 				logTrace("gemini stream finish idle timeout reached",
@@ -1270,6 +1277,20 @@ readLoop:
 			idleTimer = time.NewTimer(timeout)
 			idleCh = idleTimer.C
 		}
+		if lastText == "" && firstContentTimeout > 0 {
+			remaining := time.Until(firstContentDeadline)
+			if remaining <= 0 {
+				logTrace("gemini stream first content timeout reached",
+					zap.Duration("first_content_timeout", firstContentTimeout),
+					zap.Int("response_bytes", buf.Len()),
+				)
+				stopReader()
+				_ = httpResp.Body.Close()
+				return fmt.Errorf("gemini stream first content timeout after %s", firstContentTimeout)
+			}
+			firstContentTimer = time.NewTimer(remaining)
+			firstContentCh = firstContentTimer.C
+		}
 
 		var result streamReadResult
 		select {
@@ -1278,13 +1299,22 @@ readLoop:
 				if idleTimer != nil {
 					idleTimer.Stop()
 				}
+				if firstContentTimer != nil {
+					firstContentTimer.Stop()
+				}
 				break readLoop
 			}
 			if idleTimer != nil {
 				idleTimer.Stop()
 			}
+			if firstContentTimer != nil {
+				firstContentTimer.Stop()
+			}
 			result = readResult
 		case <-idleCh:
+			if firstContentTimer != nil {
+				firstContentTimer.Stop()
+			}
 			logTrace("gemini stream finish idle timeout reached",
 				zap.Duration("idle_timeout", finishIdleTimeout),
 				zap.Int("final_text_len", len(lastText)),
@@ -1295,9 +1325,23 @@ readLoop:
 			stopReader()
 			_ = httpResp.Body.Close()
 			return nil
+		case <-firstContentCh:
+			if idleTimer != nil {
+				idleTimer.Stop()
+			}
+			logTrace("gemini stream first content timeout reached",
+				zap.Duration("first_content_timeout", firstContentTimeout),
+				zap.Int("response_bytes", buf.Len()),
+			)
+			stopReader()
+			_ = httpResp.Body.Close()
+			return fmt.Errorf("gemini stream first content timeout after %s", firstContentTimeout)
 		case <-ctx.Done():
 			if idleTimer != nil {
 				idleTimer.Stop()
+			}
+			if firstContentTimer != nil {
+				firstContentTimer.Stop()
 			}
 			stopReader()
 			_ = httpResp.Body.Close()
@@ -1378,8 +1422,10 @@ readLoop:
 	)
 	if lastText == "" {
 		if code := extractBardErrorCode(buf.Bytes()); code != "" {
+			c.markConversationUntrusted(config.ConversationID)
 			return fmt.Errorf("gemini bard error %s", code)
 		}
+		return fmt.Errorf("gemini stream completed without parsed content")
 	}
 	return finalizeStreamConversation()
 }
@@ -1425,6 +1471,21 @@ func streamFinishIdleTimeout() time.Duration {
 	ms, err := strconv.Atoi(value)
 	if err != nil || ms < 0 {
 		return defaultStreamFinishIdleTimeout
+	}
+	if ms == 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func streamFirstContentTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS"))
+	if value == "" {
+		return defaultStreamFirstContentTimeout
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms < 0 {
+		return defaultStreamFirstContentTimeout
 	}
 	if ms == 0 {
 		return 0
@@ -1959,6 +2020,11 @@ func (c *Client) checkConversationContinuity(id, expectedCID string, metadata ma
 			zap.Bool("content_already_emitted", contentAlreadyEmitted),
 		)
 	}
+	// Mark this provider conversation as untrusted so the OpenAI layer can fall
+	// back to a locally reconstructed full-history prompt. Even when content has
+	// already been emitted (silent mismatch), we flag the provider conversation
+	// so subsequent turns do not keep trusting a broken Gemini-side record.
+	c.markConversationUntrusted(id)
 	if contentAlreadyEmitted {
 		return nil
 	}
@@ -2016,6 +2082,7 @@ func (c *Client) pruneConversationsLocked(now time.Time) {
 		if now.Sub(updatedAt) > conversationCacheTTL {
 			delete(c.conversations, id)
 			delete(c.conversationSeen, id)
+			delete(c.conversationUntrusted, id)
 		}
 	}
 	for len(c.conversations) > maxConversationCacheEntries {
@@ -2033,7 +2100,38 @@ func (c *Client) pruneConversationsLocked(now time.Time) {
 		}
 		delete(c.conversations, oldestID)
 		delete(c.conversationSeen, oldestID)
+		delete(c.conversationUntrusted, oldestID)
 	}
+}
+
+// markConversationUntrusted flags a provider conversation id as having a
+// potentially broken Gemini-side record (continuity mismatch or bard error).
+// The OpenAI layer can consult IsConversationUntrusted to decide whether to
+// reconstruct the prompt from the locally retained full history instead of
+// continuing to trust the server-side context.
+func (c *Client) markConversationUntrusted(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	c.conversationMu.Lock()
+	defer c.conversationMu.Unlock()
+	if c.conversationUntrusted == nil {
+		c.conversationUntrusted = make(map[string]bool)
+	}
+	c.conversationUntrusted[id] = true
+}
+
+// IsConversationUntrusted reports whether the provider conversation id has been
+// flagged as untrusted. Safe to call on a Client that has no state for the id.
+func (c *Client) IsConversationUntrusted(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	c.conversationMu.Lock()
+	defer c.conversationMu.Unlock()
+	return c.conversationUntrusted[id]
 }
 
 func extractConversationMetadataFromBuffer(data []byte) map[string]any {

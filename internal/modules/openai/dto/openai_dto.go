@@ -13,11 +13,26 @@ type ChatCompletionMessageContentPart struct {
 	Type     string        `json:"type"`
 	Text     string        `json:"text,omitempty"`
 	ImageURL *ImageURLPart `json:"image_url,omitempty"`
+	File     *FilePart     `json:"file,omitempty"`
+	FileID   string        `json:"file_id,omitempty"`
+	FileData string        `json:"file_data,omitempty"`
+	Filename string        `json:"filename,omitempty"`
+	MimeType string        `json:"mime_type,omitempty"`
 }
 
 // ImageURLPart represents OpenAI-compatible image_url content.
 type ImageURLPart struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// FilePart represents OpenAI-compatible file content parts used by several
+// clients for file_id or inline base64 data.
+type FilePart struct {
+	FileID   string `json:"file_id,omitempty"`
+	FileData string `json:"file_data,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
 // ChatCompletionMessage supports both content string and content array.
@@ -71,7 +86,7 @@ func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	attachments := make([]models.Attachment, 0)
 	for _, p := range parts {
 		switch strings.ToLower(strings.TrimSpace(p.Type)) {
-		case "text":
+		case "text", "input_text":
 			if p.Text != "" {
 				textParts = append(textParts, p.Text)
 			}
@@ -79,7 +94,11 @@ func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 			if p.ImageURL == nil {
 				continue
 			}
-			if attachment, ok := attachmentFromDataURL(p.ImageURL.URL, len(attachments)+1); ok {
+			if attachment, ok := attachmentFromImageURL(p.ImageURL.URL, len(attachments)+1); ok {
+				attachments = append(attachments, attachment)
+			}
+		case "file", "input_file":
+			if attachment, ok := attachmentFromFilePart(p, len(attachments)+1); ok {
 				attachments = append(attachments, attachment)
 			}
 		}
@@ -122,7 +141,56 @@ func (m ChatCompletionMessage) ToModelMessage() models.Message {
 	}
 }
 
-func attachmentFromDataURL(value string, index int) (models.Attachment, bool) {
+func attachmentFromImageURL(value string, index int) (models.Attachment, bool) {
+	if attachment, ok := attachmentFromDataURL(value, "", index); ok {
+		return attachment, true
+	}
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "http://") || strings.HasPrefix(strings.ToLower(value), "https://") {
+		return models.Attachment{
+			Name: fmt.Sprintf("image_%d", index),
+			URL:  value,
+		}, true
+	}
+	return models.Attachment{}, false
+}
+
+func attachmentFromFilePart(part ChatCompletionMessageContentPart, index int) (models.Attachment, bool) {
+	fileID := strings.TrimSpace(part.FileID)
+	fileData := strings.TrimSpace(part.FileData)
+	filename := strings.TrimSpace(part.Filename)
+	mimeType := strings.TrimSpace(part.MimeType)
+	if part.File != nil {
+		if fileID == "" {
+			fileID = strings.TrimSpace(part.File.FileID)
+		}
+		if fileData == "" {
+			fileData = strings.TrimSpace(part.File.FileData)
+		}
+		if filename == "" {
+			filename = strings.TrimSpace(part.File.Filename)
+		}
+		if mimeType == "" {
+			mimeType = strings.TrimSpace(part.File.MimeType)
+		}
+	}
+	if fileID != "" {
+		return models.Attachment{
+			Name:     defaultFilename(filename, mimeType, index),
+			MimeType: mimeType,
+			FileID:   fileID,
+		}, true
+	}
+	if attachment, ok := attachmentFromDataURL(fileData, filename, index); ok {
+		if mimeType != "" {
+			attachment.MimeType = mimeType
+		}
+		return attachment, true
+	}
+	return models.Attachment{}, false
+}
+
+func attachmentFromDataURL(value, filename string, index int) (models.Attachment, bool) {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "data:") {
 		return models.Attachment{}, false
@@ -142,10 +210,18 @@ func attachmentFromDataURL(value string, index int) (models.Attachment, bool) {
 		mimeType = "application/octet-stream"
 	}
 	return models.Attachment{
-		Name:     fmt.Sprintf("image_%d%s", index, extensionFromMimeType(mimeType)),
+		Name:     defaultFilename(filename, mimeType, index),
 		MimeType: mimeType,
 		Data:     metaAndData[1],
 	}, true
+}
+
+func defaultFilename(filename, mimeType string, index int) string {
+	filename = strings.TrimSpace(filename)
+	if filename != "" {
+		return filename
+	}
+	return fmt.Sprintf("input_%d%s", index, extensionFromMimeType(mimeType))
 }
 
 func extensionFromMimeType(mimeType string) string {

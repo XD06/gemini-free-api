@@ -440,6 +440,36 @@ func TestGenerateContentStreamForOpenAIStoresConversationStateBeforeStreamError(
 	}
 }
 
+func TestGenerateContentStreamForOpenAIReturnsErrorForEmptyParsedStream(t *testing.T) {
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(")]}'\n\n")),
+				Request:    req,
+			}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+	}
+
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(event StreamEvent) bool {
+		t.Fatalf("expected no stream events, got %#v", event)
+		return false
+	}, WithModel("gemini-3.5-flash"))
+	if err == nil || !strings.Contains(err.Error(), "completed without parsed content") {
+		t.Fatalf("expected empty parsed stream error, got %v", err)
+	}
+}
+
 func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 	_, aliases := resolveModels([]ModelInfo{
 		{ID: "cf41b0e0dd7d53e5", Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
@@ -741,6 +771,56 @@ func TestStreamFinishIdleTimeoutConfig(t *testing.T) {
 	}
 }
 
+func TestStreamFirstContentTimeoutConfig(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "")
+	if got := streamFirstContentTimeout(); got != defaultStreamFirstContentTimeout {
+		t.Fatalf("expected default first content timeout %v, got %v", defaultStreamFirstContentTimeout, got)
+	}
+	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "0")
+	if got := streamFirstContentTimeout(); got != 0 {
+		t.Fatalf("expected disabled first content timeout, got %v", got)
+	}
+	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "2500")
+	if got := streamFirstContentTimeout(); got != 2500*time.Millisecond {
+		t.Fatalf("expected configured first content timeout, got %v", got)
+	}
+}
+
+func TestGenerateContentStreamForOpenAITimesOutBeforeFirstContent(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "1")
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(&slowEOFReader{delay: 50 * time.Millisecond}),
+				Request:    req,
+			}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+	}
+
+	start := time.Now()
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(event StreamEvent) bool {
+		t.Fatalf("expected no stream events, got %#v", event)
+		return false
+	}, WithModel("gemini-3.5-flash"))
+	if err == nil || !strings.Contains(err.Error(), "first content timeout") {
+		t.Fatalf("expected first content timeout error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected fast timeout, took %v", elapsed)
+	}
+}
+
 func TestStreamFinishIdleRemainingRequiresContent(t *testing.T) {
 	if _, ok := streamFinishIdleRemaining("", time.Now(), time.Second); ok {
 		t.Fatal("expected empty content to disable finish idle timeout")
@@ -922,6 +1002,20 @@ func (r *errAfterReader) Read(p []byte) (int, error) {
 	return copy(p, r.data), r.err
 }
 
+type slowEOFReader struct {
+	delay time.Duration
+	done  bool
+}
+
+func (r *slowEOFReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	time.Sleep(r.delay)
+	return 0, io.EOF
+}
+
 func buildGenerateResponse(t *testing.T, text, cid string) string {
 	t.Helper()
 	if cid == "" {
@@ -985,5 +1079,53 @@ func TestNormalizeImageURLHandlesGoogleusercontentReferences(t *testing.T) {
 		if got := normalizeImageURL(input); got != want {
 			t.Fatalf("normalizeImageURL(%q): expected %q, got %q", input, want, got)
 		}
+	}
+}
+
+func TestCheckConversationContinuityMarksUntrustedOnMismatch(t *testing.T) {
+	client := &Client{
+		log:                   zap.NewNop(),
+		conversations:         make(map[string]*SessionMetadata),
+		conversationSeen:      make(map[string]time.Time),
+		conversationUntrusted: make(map[string]bool),
+	}
+	metadata := map[string]any{"cid": "c_actual_different"}
+
+	// contentAlreadyEmitted == true is the dangerous "silent mismatch" path:
+	// content was already streamed to the client, but the Gemini-side record
+	// diverged. The call returns nil (cannot undo emitted bytes) but must still
+	// flag the conversation as untrusted so the next turn does not trust it.
+	err := client.checkConversationContinuity("thread-x", "c_expected", metadata, true)
+	if err != nil {
+		t.Fatalf("expected nil error when content already emitted, got %v", err)
+	}
+	if !client.IsConversationUntrusted("thread-x") {
+		t.Fatal("expected conversation flagged untrusted after silent continuity mismatch")
+	}
+
+	// When content was NOT emitted, the error is returned AND it is flagged.
+	other := map[string]any{"cid": "c_other"}
+	err = client.checkConversationContinuity("thread-y", "c_expected_y", other, false)
+	if err == nil {
+		t.Fatal("expected continuity mismatch error when content not yet emitted")
+	}
+	if !client.IsConversationUntrusted("thread-y") {
+		t.Fatal("expected thread-y flagged untrusted after mismatch")
+	}
+}
+
+func TestCheckConversationContinuityDoesNotFlagMatchingCid(t *testing.T) {
+	client := &Client{
+		log:                   zap.NewNop(),
+		conversations:         make(map[string]*SessionMetadata),
+		conversationSeen:      make(map[string]time.Time),
+		conversationUntrusted: make(map[string]bool),
+	}
+	metadata := map[string]any{"cid": "c_same"}
+	if err := client.checkConversationContinuity("thread-z", "c_same", metadata, false); err != nil {
+		t.Fatalf("expected nil error for matching cid, got %v", err)
+	}
+	if client.IsConversationUntrusted("thread-z") {
+		t.Fatal("expected conversation NOT flagged untrusted when cid matches")
 	}
 }

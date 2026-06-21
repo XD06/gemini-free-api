@@ -183,11 +183,70 @@ func (h *OpenAIController) HandleImageGenerations(c fiber.Ctx) error {
 	return c.JSON(response)
 }
 
+func (h *OpenAIController) HandleUploadFile(c fiber.Ctx) error {
+	file, err := c.FormFile("file")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("file is required"), "invalid_request_error"))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	obj, err := h.service.fileStore.saveUploadedFile(ctx, file, c.FormValue("purpose"))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(utils.ErrorToResponse(err, "api_error"))
+	}
+	return c.JSON(obj)
+}
+
+func (h *OpenAIController) HandleListFiles(c fiber.Ctx) error {
+	files, err := h.service.fileStore.listFiles()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(utils.ErrorToResponse(err, "api_error"))
+	}
+	return c.JSON(fiber.Map{
+		"object": "list",
+		"data":   files,
+	})
+}
+
+func (h *OpenAIController) HandleGetFile(c fiber.Ctx) error {
+	obj, err := h.service.fileStore.getFile(c.Params("file_id"))
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(utils.ErrorToResponse(err, "not_found_error"))
+	}
+	return c.JSON(obj)
+}
+
+func (h *OpenAIController) HandleDeleteFile(c fiber.Ctx) error {
+	result, err := h.service.fileStore.deleteFile(c.Params("file_id"))
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(utils.ErrorToResponse(err, "not_found_error"))
+	}
+	return c.JSON(result)
+}
+
+func (h *OpenAIController) HandleFileContent(c fiber.Ctx) error {
+	data, filename, mimeType, err := h.service.fileStore.readFileContent(c.Params("file_id"))
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(utils.ErrorToResponse(err, "not_found_error"))
+	}
+	if strings.TrimSpace(mimeType) == "" {
+		mimeType = "application/octet-stream"
+	}
+	c.Set("Content-Type", mimeType)
+	c.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeStoredFilename(filename)))
+	return c.Send(data)
+}
+
 // Register registers the OpenAI routes onto the provided group
 func (c *OpenAIController) Register(group fiber.Router) {
 	group.Get("/models", c.HandleModels)
 	group.Post("/chat/completions", c.HandleChatCompletions)
 	group.Post("/images/generations", c.HandleImageGenerations)
+	group.Post("/files", c.HandleUploadFile)
+	group.Get("/files", c.HandleListFiles)
+	group.Get("/files/:file_id", c.HandleGetFile)
+	group.Delete("/files/:file_id", c.HandleDeleteFile)
+	group.Get("/files/:file_id/content", c.HandleFileContent)
 }
 
 func trimJSONBOM(body []byte) []byte {

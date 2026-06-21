@@ -23,6 +23,7 @@ type GeminiClient interface {
 	Provider
 	GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error
 	HasConversationState(id string) bool
+	IsConversationUntrusted(id string) bool
 }
 
 type AccountManager interface {
@@ -290,6 +291,32 @@ func (p *ClientPool) HasConversationState(id string) bool {
 		if client.HasConversationState(id) {
 			p.bindConversation(id, client.accountID)
 			return true
+		}
+	}
+	return false
+}
+
+// IsConversationUntrusted delegates to the account client that owns the
+// conversation id. It mirrors HasConversationState's account lookup so the
+// OpenAI layer gets the untrusted flag for the bound account.
+func (p *ClientPool) IsConversationUntrusted(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	p.mu.Lock()
+	accountID := p.conversationTo[id]
+	p.mu.Unlock()
+	if accountID != "" {
+		if client := p.clientsByID[accountID]; client != nil {
+			return client.IsConversationUntrusted(id)
+		}
+		return false
+	}
+	for _, client := range p.clients {
+		if client.HasConversationState(id) {
+			p.bindConversation(id, client.accountID)
+			return client.IsConversationUntrusted(id)
 		}
 	}
 	return false

@@ -18,6 +18,8 @@ type Attachment struct {
 	Name     string `json:"name,omitempty"`
 	MimeType string `json:"mime_type,omitempty"`
 	Data     string `json:"data,omitempty"`
+	URL      string `json:"url,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
 }
 
 func (m *Message) UnmarshalJSON(data []byte) error {
