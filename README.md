@@ -413,6 +413,8 @@ Playwright Worker 在 `tools/cookie-worker`，它是独立进程/容器，建议
 
 Worker 还可以单独放一份本地配置文件 `tools/cookie-worker/.env`，优先读取它，再回退到仓库根目录 `.env`。这样 worker 的账号、profile、代理和 token 就不用每次手工输入。
 
+普通 `sync` 模式下，Worker 会先请求 `API_BASE/admin/accounts`，以主服务返回的账号状态为准。远端返回 `healthy` 或 `refreshing` 的账号会跳过，不会打开本地浏览器 profile；只有远端状态缺失、过期或未初始化的账号才会打开 profile 抓取 Cookie。`API_BASE` 指向 VPS 时，VPS 是状态权威，本地状态文件不会参与判断。远端状态接口不可达时，Worker 默认失败退出，避免网络短暂异常导致本地批量打开所有 profile；需要手动强制刷新时设置 `COOKIE_WORKER_FORCE=true`。
+
 ```bash
 cd tools/cookie-worker
 npm install
@@ -461,6 +463,7 @@ Worker 测试开关：
 | `COOKIE_WORKER_ACCOUNT` | 只处理指定账号，如 `acc1` |
 | `COOKIE_WORKER_OPEN_ONLY` | 只打开浏览器 profile 供人工登录，不同步 Cookie |
 | `COOKIE_WORKER_ONCE` | 同步一轮后退出 |
+| `COOKIE_WORKER_FORCE` | 强制打开并同步目标账号；忽略远端 `/admin/accounts` 的 healthy 状态 |
 | `COOKIE_WORKER_HEADLESS` | 是否无头运行；第一次登录建议 `false` |
 | `COOKIE_WORKER_MIN_INTERVAL_MINUTES` / `COOKIE_WORKER_MAX_INTERVAL_MINUTES` | 常驻模式下随机同步间隔 |
 

@@ -18,6 +18,7 @@ const headless = parseBool(process.env.COOKIE_WORKER_HEADLESS || 'false');
 const browserChannel = process.env.COOKIE_WORKER_BROWSER_CHANNEL ?? 'chrome';
 const once = parseBool(process.env.COOKIE_WORKER_ONCE || 'false');
 const openOnly = parseBool(process.env.COOKIE_WORKER_OPEN_ONLY || 'false');
+const force = parseBool(process.env.COOKIE_WORKER_FORCE || 'false');
 const postRetries = parseInt(process.env.COOKIE_WORKER_POST_RETRIES || '3', 10);
 const postRetryDelayMs = parseInt(process.env.COOKIE_WORKER_POST_RETRY_DELAY_MS || '2000', 10);
 
@@ -29,7 +30,11 @@ if (accounts.length === 0) {
 }
 
 for (let iteration = 0; ; iteration++) {
+  const statusByAccount = openOnly || force ? new Map() : await loadRemoteAccountStatuses();
   for (const account of accounts) {
+    if (!openOnly && !force && shouldSkipAccountRefresh(account, statusByAccount)) {
+      continue;
+    }
     await refreshAccount(account).catch((err) => {
       console.error(JSON.stringify({
         level: 'warn',
@@ -47,6 +52,66 @@ for (let iteration = 0; ; iteration++) {
   const delayMs = randomBetween(minMinutes, maxMinutes) * 60_000;
   console.log(JSON.stringify({ level: 'info', msg: 'sleep', delay_ms: delayMs }));
   await sleep(delayMs);
+}
+
+async function loadRemoteAccountStatuses() {
+  const url = `${apiBase}/admin/accounts`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'authorization': `Bearer ${syncToken}`,
+      },
+    });
+  } catch (err) {
+    throw withStage(new Error(`GET ${url} failed`, { cause: err }), 'load_remote_status');
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw withStage(new Error(`account status failed with status ${res.status}: ${text.slice(0, 500)}`), 'load_remote_status');
+  }
+  const body = await res.json();
+  const statuses = new Map();
+  for (const status of body.accounts || []) {
+    if (!status || !status.id) {
+      continue;
+    }
+    statuses.set(String(status.id), status);
+  }
+  return statuses;
+}
+
+function shouldSkipAccountRefresh(account, statusByAccount) {
+  const status = statusByAccount.get(account.id);
+  if (!status) {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'remote account status missing, refreshing',
+      account: account.id,
+    }));
+    return false;
+  }
+  const state = String(status.state || '').trim().toLowerCase();
+  if (state === 'healthy' || state === 'refreshing') {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'remote account healthy, skip browser sync',
+      account: account.id,
+      state,
+      last_validated: status.last_validated || '',
+      last_cookie_sync: status.last_cookie_sync || '',
+    }));
+    return true;
+  }
+  console.log(JSON.stringify({
+    level: 'info',
+    msg: 'remote account needs cookie sync',
+    account: account.id,
+    state: state || 'unknown',
+    last_error: status.last_error || '',
+  }));
+  return false;
 }
 
 async function refreshAccount(account) {
