@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -205,4 +206,35 @@ func TestClientPoolRecoversNoHealthyAccountWithExternalRefresh(t *testing.T) {
 	if selected.accountID != "main" {
 		t.Fatalf("expected recovered main account, got %q", selected.accountID)
 	}
+}
+
+func TestBackgroundRefreshDoesNotMarkExpiredAccountHealthyWithoutExternalCookies(t *testing.T) {
+	main := &Client{accountID: "main", healthy: false}
+	main.setAccountState(AccountStateExpired, errors.New("BardErrorInfo [1060]"))
+	pool := &ClientPool{
+		clients:        []*Client{main},
+		clientsByID:    map[string]*Client{"main": main},
+		stayByID:       map[string]time.Duration{"main": time.Hour},
+		conversationTo: make(map[string]string),
+		refreshing:     make(map[string]bool),
+		activeIndex:    -1,
+		internalRefresh: func(client *Client) error {
+			return nil
+		},
+	}
+
+	pool.refreshClientAsync(main)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status := main.AccountStatus()
+		if status.State == AccountStateNeedsManualLogin {
+			if main.IsHealthy() {
+				t.Fatal("expired account must not become healthy after internal refresh without external cookies")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected account to require external cookies, got %#v", main.AccountStatus())
 }

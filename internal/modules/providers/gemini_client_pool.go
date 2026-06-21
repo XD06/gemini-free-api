@@ -40,6 +40,7 @@ type ClientPool struct {
 	conversationTo  map[string]string
 	refreshing      map[string]bool
 	externalRefresh cookieRefreshFunc
+	internalRefresh func(*Client) error
 	activeIndex     int
 	activeUntil     time.Time
 	statePath       string
@@ -75,6 +76,7 @@ func NewClientPool(cfg *configs.Config, log *zap.Logger) *ClientPool {
 		conversationTo:  make(map[string]string),
 		refreshing:      make(map[string]bool),
 		externalRefresh: newExternalCookieRefresher(cfg, log),
+		internalRefresh: refreshClientSessionInPlace,
 		activeIndex:     -1,
 		statePath:       cfg.Gemini.AccountStatePath,
 		log:             log,
@@ -357,6 +359,7 @@ func (p *ClientPool) refreshClientAsync(client *Client) {
 	if client == nil {
 		return
 	}
+	requiresExternalCookies := clientRequiresExternalCookieRefresh(client)
 	p.mu.Lock()
 	if p.refreshing == nil {
 		p.refreshing = make(map[string]bool)
@@ -379,25 +382,31 @@ func (p *ClientPool) refreshClientAsync(client *Client) {
 		if p.log != nil {
 			p.logAccountAudit("background_refresh_started", client, "", "request_error_recovery")
 		}
-		if err := client.RotateCookies(); err != nil {
-			client.setAccountState(AccountStateExpired, err)
-			if p.log != nil {
-				p.log.Warn("background Gemini account cookie rotation failed",
-					zap.String("account", client.accountID),
-					zap.Error(err),
-				)
-				p.logAccountAudit("background_refresh_failed", client, "", "rotate_cookies_failed")
-			}
-			return
+		refresh := p.internalRefresh
+		if refresh == nil {
+			refresh = refreshClientSessionInPlace
 		}
-		if err := client.refreshSessionToken(); err != nil {
+		if err := refresh(client); err != nil {
 			client.setAccountState(AccountStateExpired, err)
 			if p.log != nil {
-				p.log.Warn("background Gemini account session refresh failed",
+				p.log.Warn("background Gemini account refresh failed",
 					zap.String("account", client.accountID),
 					zap.Error(err),
 				)
 				p.logAccountAudit("background_refresh_failed", client, "", "session_refresh_failed")
+			}
+			return
+		}
+		if requiresExternalCookies {
+			client.mu.Lock()
+			client.healthy = false
+			client.mu.Unlock()
+			client.setAccountState(AccountStateNeedsManualLogin, fmt.Errorf("external cookie sync required after auth/session error"))
+			if p.log != nil {
+				p.log.Warn("background Gemini account refresh did not mark account healthy; waiting for external cookie sync",
+					zap.String("account", client.accountID),
+				)
+				p.logAccountAudit("background_refresh_external_required", client, "", "request_error_recovery")
 			}
 			return
 		}
@@ -410,6 +419,24 @@ func (p *ClientPool) refreshClientAsync(client *Client) {
 			p.logAccountAudit("background_refresh_succeeded", client, "", "request_error_recovery")
 		}
 	}()
+}
+
+func refreshClientSessionInPlace(client *Client) error {
+	if client == nil {
+		return fmt.Errorf("nil Gemini account")
+	}
+	if err := client.RotateCookies(); err != nil {
+		return err
+	}
+	return client.refreshSessionToken()
+}
+
+func clientRequiresExternalCookieRefresh(client *Client) bool {
+	if client == nil {
+		return false
+	}
+	status := client.AccountStatus()
+	return status.State == AccountStateExpired || status.State == AccountStateNeedsManualLogin
 }
 
 func isAuthOrSessionError(err error) bool {

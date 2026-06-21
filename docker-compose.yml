@@ -17,9 +17,9 @@ services:
       # App WORKDIR is /home/appuser. Written paths:
       #   data/cookies/  <- GEMINI_COOKIE_CACHE_PATH
       #   data/state/    <- GEMINI_ACCOUNT_STATE_PATH
-      - gemini-data:/home/appuser/data
+      - ./data:/home/appuser/data
       # Hard-coded cookie jar dir (gemini_service.go).
-      - gemini-cookies:/home/appuser/.cookies
+      - ./.cookies:/home/appuser/.cookies
     healthcheck:
       # NOTE: must be a real GET, not `wget --spider`. --spider issues a HEAD,
       # but /health is GET-only (Fiber app.Get), so HEAD returns 404 and wget
@@ -40,6 +40,3 @@ services:
       retries: 3
       start_period: 10s
 
-volumes:
-  gemini-data:
-  gemini-cookies:
