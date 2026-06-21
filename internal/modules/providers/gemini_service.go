@@ -136,6 +136,13 @@ func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfi
 	if account.ProxyURL != "" {
 		client.SetProxyURL(account.ProxyURL)
 	}
+	if log != nil {
+		log.Info("Gemini account proxy configured",
+			zap.String("account", account.ID),
+			zap.Bool("proxy_enabled", strings.TrimSpace(account.ProxyURL) != ""),
+			zap.String("proxy", redactProxyURL(account.ProxyURL)),
+		)
+	}
 
 	rawTransport := &http.Transport{
 		Proxy:                 proxyFunc(account.ProxyURL),
@@ -254,6 +261,25 @@ func proxyFunc(proxyURL string) func(*http.Request) (*url.URL, error) {
 	return http.ProxyURL(parsed)
 }
 
+func redactProxyURL(proxyURL string) string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return "[invalid]"
+	}
+	if parsed.User != nil {
+		prefix := ""
+		if parsed.Scheme != "" {
+			prefix = parsed.Scheme + "://"
+		}
+		return prefix + "***@" + parsed.Host
+	}
+	return parsed.String()
+}
+
 func (c *Client) nextRequestID() string {
 	return strconv.FormatUint(atomic.AddUint64(&c.requestSeq, 100000), 10)
 }
@@ -275,6 +301,11 @@ func (c *Client) newHTTPClient(timeout time.Duration) *http.Client {
 
 func (c *Client) Init(ctx context.Context) error {
 	c.setAccountState(AccountStateRefreshing, nil)
+	c.log.Info("Gemini account initialization started",
+		zap.String("account", c.accountID),
+		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+		zap.String("proxy", redactProxyURL(c.proxyURL)),
+	)
 	// Clean cookies
 	c.cookies.Secure1PSID = cleanCookie(c.cookies.Secure1PSID)
 	configPSIDTS := cleanCookie(c.cookies.Secure1PSIDTS) // Save original config value
@@ -329,7 +360,11 @@ func (c *Client) Init(ctx context.Context) error {
 	// Save the valid cookies to cache immediately after successful init
 	_ = c.SaveCachedCookies()
 
-	c.log.Info("✅ Gemini client initialized successfully")
+	c.log.Info("✅ Gemini client initialized successfully",
+		zap.String("account", c.accountID),
+		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+		zap.String("proxy", redactProxyURL(c.proxyURL)),
+	)
 	c.setAccountState(AccountStateHealthy, nil)
 
 	// 5. Start auto-refresh in background
@@ -341,6 +376,11 @@ func (c *Client) Init(ctx context.Context) error {
 }
 
 func (c *Client) refreshSessionToken() error {
+	c.log.Info("Gemini session token refresh started",
+		zap.String("account", c.accountID),
+		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+		zap.String("proxy", redactProxyURL(c.proxyURL)),
+	)
 	// 1. Initial hit to google.com to get extra cookies (NID, etc)
 	tmpClient := req.NewClient().
 		SetTimeout(30 * time.Second).
@@ -656,6 +696,11 @@ func jitterDuration(base time.Duration) time.Duration {
 }
 
 func (c *Client) RotateCookies() error {
+	c.log.Info("Gemini cookie rotation started",
+		zap.String("account", c.accountID),
+		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+		zap.String("proxy", redactProxyURL(c.proxyURL)),
+	)
 	var lastErr error
 	backoffs := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
@@ -939,6 +984,15 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
+		c.log.Info("Gemini generate request prepared",
+			zap.String("account", c.accountID),
+			zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+			zap.String("proxy", redactProxyURL(c.proxyURL)),
+			zap.String("model", resolvedModelID),
+			zap.String("request_id", requestID),
+			zap.Int("attempt", attempt),
+			zap.Bool("has_conversation_id", strings.TrimSpace(config.ConversationID) != ""),
+		)
 
 		httpResp, err := plainClient.Do(httpReq)
 		httpDuration := time.Since(httpStart)
@@ -1186,6 +1240,9 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	logTrace("gemini stream request prepared",
 		zap.String("request_id", requestID),
 		zap.String("url", generateURL),
+		zap.String("account", c.accountID),
+		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+		zap.String("proxy", redactProxyURL(c.proxyURL)),
 		zap.Int("prompt_len", len(prompt)),
 		zap.Int("uploaded_files", len(uploadedFiles)),
 	)

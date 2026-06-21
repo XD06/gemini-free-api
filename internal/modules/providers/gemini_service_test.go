@@ -658,6 +658,19 @@ func TestExtractBardErrorCode(t *testing.T) {
 	}
 }
 
+func TestRedactProxyURL(t *testing.T) {
+	got := redactProxyURL("http://user:pass@127.0.0.1:8038")
+	if got != "http://***@127.0.0.1:8038" {
+		t.Fatalf("unexpected redacted proxy: %q", got)
+	}
+	if got := redactProxyURL("http://127.0.0.1:8038"); got != "http://127.0.0.1:8038" {
+		t.Fatalf("unexpected plain proxy: %q", got)
+	}
+	if got := redactProxyURL(""); got != "" {
+		t.Fatalf("expected empty proxy, got %q", got)
+	}
+}
+
 func TestExtractStreamStateIncludesAllStructuredThinkingSignals(t *testing.T) {
 	summary := "**Defining the Scope**\n\nI've clarified the project goal."
 	line := buildStreamLine(t,

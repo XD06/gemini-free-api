@@ -853,6 +853,12 @@ func (p *ClientPool) logAccountAudit(event string, client *Client, conversationI
 		zap.String("state", state),
 		zap.String("reason", reason),
 	}
+	if client != nil {
+		fields = append(fields,
+			zap.Bool("proxy_enabled", strings.TrimSpace(client.proxyURL) != ""),
+			zap.String("proxy", redactProxyURL(client.proxyURL)),
+		)
+	}
 	if conversationID != "" {
 		fields = append(fields, zap.String("conversation_id", conversationID))
 	}

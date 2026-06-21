@@ -132,6 +132,14 @@ async function refreshAccount(account) {
   if (account.proxy) {
     launchOptions.proxy = { server: normalizeProxy(account.proxy) };
   }
+  console.log(JSON.stringify({
+    level: 'info',
+    msg: 'cookie worker browser launch',
+    account: account.id,
+    proxy_enabled: Boolean(account.proxy),
+    proxy: redactProxy(account.proxy),
+    headless,
+  }));
 
   let context;
   try {
@@ -330,6 +338,23 @@ function chromeProxyArg(proxy) {
 
 function normalizeProxy(proxy) {
   return String(proxy || '').trim().replace(/\/+$/, '');
+}
+
+function redactProxy(proxy) {
+  const value = normalizeProxy(proxy);
+  if (!value) {
+    return '';
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.username || parsed.password) {
+      parsed.username = '***';
+      parsed.password = '';
+    }
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return '[invalid]';
+  }
 }
 
 async function waitForManualClose(context) {
