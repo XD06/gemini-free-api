@@ -1328,7 +1328,7 @@ func inlineCodeParts(parts []string) []string {
 }
 
 func newAutoProviderConversationID() string {
-	return fmt.Sprintf("c_%x%012x", time.Now().UnixNano(), rand.Int63()&0xffffffffffff)
+	return fmt.Sprintf("%016x", uint64(time.Now().UnixNano())^uint64(rand.Int63()))[:16]
 }
 
 func fallbackOptionsWithFreshConversation(plan *openAIContextPlan, baseOpts []providers.GenerateOption) []providers.GenerateOption {
@@ -1708,15 +1708,14 @@ func compactText(text string, limit int) string {
 func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
 	var b strings.Builder
 	b.WriteString("You are an OpenAI-compatible assistant running behind a bridge to Gemini web.\n")
-	b.WriteString("You are producing a structured tool-planning result. Return exactly one JSON object and no surrounding text.\n")
-	b.WriteString("Allowed output schemas:\n")
+	b.WriteString("When a tool is needed, return exactly one JSON object and no surrounding text.\n")
+	b.WriteString("Tool-call JSON schema:\n")
 	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
-	b.WriteString("{\"status\":\"message\",\"content\":\"<assistant_text>\"}\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Use only tool names listed below.\n")
 	b.WriteString("- arguments must be a valid JSON object matching the tool's parameters schema.\n")
 	b.WriteString("- Do not put JSON in markdown code fences.\n")
-	b.WriteString("- If no tool is needed, use status=message with normal assistant text.\n")
+	b.WriteString("- If no tool is needed and tool_choice is auto, answer the user normally in plain text. Do not wrap normal text in JSON.\n")
 	if requireToolCall {
 		b.WriteString("- The current user request requires external/web/tool data. You must return status=tool_calls with at least one valid tool call. Do not answer from memory.\n")
 	}

@@ -1018,10 +1018,15 @@ func TestCreateChatCompletionAutoToolsNormalMessageDoesNotRepair(t *testing.T) {
 	}
 }
 
-func TestNewAutoProviderConversationIDUsesGeminiLikeLocalKey(t *testing.T) {
+func TestNewAutoProviderConversationIDUsesGeminiWebLikePathID(t *testing.T) {
 	id := newAutoProviderConversationID()
-	if !strings.HasPrefix(id, "c_") {
-		t.Fatalf("expected c_ prefix, got %q", id)
+	if len(id) != 16 {
+		t.Fatalf("expected 16 hex characters, got %q", id)
+	}
+	for _, r := range id {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			t.Fatalf("expected lowercase hex id, got %q", id)
+		}
 	}
 	if strings.Contains(id, "openai-auto") {
 		t.Fatalf("auto provider id still contains old marker: %q", id)

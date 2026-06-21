@@ -82,11 +82,13 @@ const (
 )
 
 func New() (*Config, error) {
+	runtimeOverrides := preserveRuntimeEnv("OPENAI_DEBUG_REQUEST_LOG", "GEMINI_DEBUG_STREAM_DIR", "GEMINI_TRACE_STREAM")
 	// Load .env file if it exists. Use Overload so .env values take precedence
 	// over any stale system/shell environment variables (e.g. an old
 	// GEMINI_1PSIDTS exported in the user's shell that would otherwise shadow
 	// the freshly rotated value written to .env).
 	_ = godotenv.Overload()
+	restoreRuntimeEnv(runtimeOverrides)
 
 	var cfg Config
 
@@ -124,6 +126,22 @@ func New() (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func preserveRuntimeEnv(keys ...string) map[string]string {
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func restoreRuntimeEnv(values map[string]string) {
+	for key, value := range values {
+		_ = os.Setenv(key, value)
+	}
 }
 
 // Validate checks if the configuration has required values
