@@ -472,9 +472,6 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	handleStreamEvent := func(event providers.StreamEvent) bool {
 		switch event.Kind {
 		case "thinking_text":
-			if useToolBridge && !toolBridgeStreamingContent {
-				return true
-			}
 			return onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 				Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{ReasoningContent: event.Delta}}},

@@ -882,6 +882,60 @@ func TestCreateChatCompletionStreamEmitsToolCallsForToolBridgeJSON(t *testing.T)
 	}
 }
 
+func TestCreateChatCompletionStreamEmitsReasoningBeforeToolBridgeJSON(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{
+		streamEvents: []providers.StreamEvent{
+			{Kind: "thinking_text", Delta: "需要先查询外部信息。"},
+			{Kind: "content_delta", Delta: `{"status":"tool_calls","tool_calls":[{"name":"mcp__exa__web_search_exa","arguments":{"query":"Gemini tool bridge"}}]}`},
+		},
+	}, nil)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash:thinking=extended",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "帮我搜索 Gemini tool bridge"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "mcp__exa__web_search_exa",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+		Stream: true,
+	}
+
+	var reasoning []string
+	var content []string
+	var toolCalls []dto.ChatCompletionChunkDeltaToolCall
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) == 0 {
+			return true
+		}
+		delta := chunk.Choices[0].Delta
+		if delta.ReasoningContent != "" {
+			reasoning = append(reasoning, delta.ReasoningContent)
+		}
+		if delta.Content != "" {
+			content = append(content, delta.Content)
+		}
+		toolCalls = append(toolCalls, delta.ToolCalls...)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if strings.Join(reasoning, "") != "需要先查询外部信息。" {
+		t.Fatalf("expected reasoning_content before tool call, got %#v", reasoning)
+	}
+	if strings.Contains(strings.Join(content, ""), `"tool_calls"`) {
+		t.Fatalf("tool bridge JSON leaked as content: %#v", content)
+	}
+	if len(toolCalls) != 1 || toolCalls[0].Function.Name != "mcp__exa__web_search_exa" {
+		t.Fatalf("expected parsed tool call after reasoning, got %#v", toolCalls)
+	}
+}
+
 func TestParseToolBridgePlanAcceptsFencedAndWrappedJSON(t *testing.T) {
 	service := NewOpenAIService(&fakeGeminiClient{}, nil)
 	req := dto.ChatCompletionRequest{
