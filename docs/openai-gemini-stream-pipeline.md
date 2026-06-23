@@ -99,7 +99,7 @@ Current event kinds:
 | `content_delta` | Newly parsed assistant text | `choices[0].delta.content` |
 | `thinking_text` | Newly parsed pre-answer thinking text | `choices[0].delta.reasoning_content` |
 
-If tool bridge is active, `thinking_text` is suppressed because the planner prompt should only return tool JSON or normal text, not reasoning content.
+When tool bridge is active, `thinking_text` is still forwarded as OpenAI `delta.reasoning_content`. Tool JSON candidates remain buffered until the complete planner output can be parsed into OpenAI `tool_calls`.
 
 ## Gemini Web Provider Layer
 

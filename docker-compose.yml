@@ -15,6 +15,9 @@ services:
       # cannot run inside it. The app also auto-skips it when the worker dir is
       # missing; set false explicitly to keep logs clean.
       - GEMINI_COOKIE_WORKER_ENABLED=false
+      # Avoid slow sequential RotateCookies calls for every account on container
+      # start. Keep ./data mounted and sync cookies from the host worker instead.
+      - GEMINI_STARTUP_COOKIE_ROTATE=false
     restart: unless-stopped
     volumes:
       # Persist cookie cache + account rotation state across restarts.

@@ -70,3 +70,17 @@ func TestValidateAllowsNamedAccountsWithoutInitialCookies(t *testing.T) {
 		t.Fatalf("expected named accounts without cookies to validate, got %v", err)
 	}
 }
+
+func TestNewLoadsStartupCookieRotateFlag(t *testing.T) {
+	t.Setenv("PORT", "8787")
+	t.Setenv("GEMINI_ACCOUNTS", "acc1")
+	t.Setenv("GEMINI_STARTUP_COOKIE_ROTATE", "false")
+
+	cfg, err := New()
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if cfg.Gemini.StartupCookieRotate {
+		t.Fatal("expected startup cookie rotation to be disabled")
+	}
+}

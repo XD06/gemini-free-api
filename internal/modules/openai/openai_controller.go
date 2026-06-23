@@ -120,8 +120,23 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
+			traceForward := openAIStreamForwardTraceEnabled()
 			err := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
-				return utils.SendSSEEvent(w, h.log, chunk)
+				flushStart := time.Now()
+				ok := utils.SendSSEEvent(w, h.log, chunk)
+				if traceForward {
+					contentLen, reasoningLen, toolCallCount, finishReason := summarizeStreamChunkForTrace(chunk)
+					h.log.Info("OpenAI SSE flush trace",
+						zap.String("request_id", requestID),
+						zap.Bool("ok", ok),
+						zap.Duration("flush_elapsed", time.Since(flushStart)),
+						zap.Int("content_len", contentLen),
+						zap.Int("reasoning_len", reasoningLen),
+						zap.Int("tool_call_count", toolCallCount),
+						zap.String("finish_reason", finishReason),
+					)
+				}
+				return ok
 			})
 			if err != nil {
 				h.log.Error("CreateChatCompletionStream failed", zap.Error(err), zap.String("model", req.Model))
@@ -338,4 +353,16 @@ func openAIRequestDebugEnabled() bool {
 	default:
 		return false
 	}
+}
+
+func summarizeStreamChunkForTrace(chunk dto.ChatCompletionChunk) (contentLen, reasoningLen, toolCallCount int, finishReason string) {
+	for _, choice := range chunk.Choices {
+		contentLen += len(choice.Delta.Content)
+		reasoningLen += len(choice.Delta.ReasoningContent)
+		toolCallCount += len(choice.Delta.ToolCalls)
+		if choice.FinishReason != "" {
+			finishReason = choice.FinishReason
+		}
+	}
+	return contentLen, reasoningLen, toolCallCount, finishReason
 }

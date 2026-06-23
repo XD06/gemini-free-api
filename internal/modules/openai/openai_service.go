@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,8 @@ type OpenAIService struct {
 	explicitProviderUpdated  map[string]time.Time
 	toolPlannerContexts      map[string]string
 	toolPlannerUpdated       map[string]time.Time
+	toolBridgeContexts       map[string]string
+	toolBridgeUpdated        map[string]time.Time
 }
 
 type openAIRequestIDContextKey struct{}
@@ -57,6 +60,15 @@ func openAIRequestIDFromContext(ctx context.Context) string {
 	}
 	id, _ := ctx.Value(openAIRequestIDContextKey{}).(string)
 	return strings.TrimSpace(id)
+}
+
+func openAIStreamForwardTraceEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_TRACE_STREAM_FORWARD"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func geminiSourcePathEnabled() bool {
@@ -101,6 +113,8 @@ func NewOpenAIService(client providers.GeminiClient, log *zap.Logger) *OpenAISer
 		explicitProviderUpdated:  make(map[string]time.Time),
 		toolPlannerContexts:      make(map[string]string),
 		toolPlannerUpdated:       make(map[string]time.Time),
+		toolBridgeContexts:       make(map[string]string),
+		toolBridgeUpdated:        make(map[string]time.Time),
 	}
 }
 
@@ -143,8 +157,9 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	}
 
 	useToolBridge := shouldUseToolBridge(req)
+	toolBridgeSignature := ""
 	if useToolBridge {
-		prompt = s.buildToolBridgePrompt(req, contextPlan.Prompt, toolBridgeRequiresToolCall(req))
+		prompt, toolBridgeSignature, _ = s.buildToolBridgePromptForPlan(req, contextPlan)
 	}
 
 	providerModel, thinkingLevel := modelAndThinkingLevel(req.Model, requestThinkingLevel(req))
@@ -196,6 +211,9 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	}
 	if err != nil {
 		return nil, err
+	}
+	if useToolBridge && toolBridgeSignature != "" {
+		s.rememberToolBridgeContext(contextPlan.ProviderConversationID, toolBridgeSignature)
 	}
 	contextPlan.ResponseText = response.Text
 
@@ -416,8 +434,9 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		return fmt.Errorf("no valid content in messages")
 	}
 	useToolBridge := shouldUseToolBridge(req)
+	toolBridgeSignature := ""
 	if useToolBridge {
-		prompt = s.buildToolBridgePrompt(req, contextPlan.Prompt, toolBridgeRequiresToolCall(req))
+		prompt, toolBridgeSignature, _ = s.buildToolBridgePromptForPlan(req, contextPlan)
 	}
 	if openAIRequestDebugEnabled() && s.log != nil {
 		s.log.Info("OpenAI stream execution plan",
@@ -469,9 +488,27 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	var completionText strings.Builder
 	toolBridgeUndecided := useToolBridge && !mustBufferToolBridge(req)
 	toolBridgeStreamingContent := false
+	traceForward := openAIStreamForwardTraceEnabled()
+	traceOpenAIForward := func(kind string, deltaLen int, buffered bool, reason string) {
+		if !traceForward || s.log == nil {
+			return
+		}
+		s.log.Info("OpenAI stream forward trace",
+			zap.String("request_id", requestID),
+			zap.String("kind", kind),
+			zap.Int("delta_len", deltaLen),
+			zap.Bool("buffered", buffered),
+			zap.String("reason", reason),
+			zap.Bool("tools_enabled", req.HasToolsEnabled()),
+			zap.String("tool_choice_mode", req.ToolChoiceMode()),
+			zap.Int("completion_len", completionLen),
+			zap.Int("buffered_output_len", completionText.Len()),
+		)
+	}
 	handleStreamEvent := func(event providers.StreamEvent) bool {
 		switch event.Kind {
 		case "thinking_text":
+			traceOpenAIForward("reasoning_content", len(event.Delta), false, "provider_thinking_delta")
 			return onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 				Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{ReasoningContent: event.Delta}}},
@@ -480,17 +517,21 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 			completionLen += len(event.Delta)
 			completionText.WriteString(event.Delta)
 			if useToolBridge && mustBufferToolBridge(req) {
+				traceOpenAIForward("content", len(event.Delta), true, "tool_choice_requires_buffer")
 				return true
 			}
 			if toolBridgeUndecided {
 				switch classifyToolBridgeStreamPrefix(completionText.String()) {
 				case "unknown":
+					traceOpenAIForward("content", len(event.Delta), true, "tool_bridge_prefix_unknown")
 					return true
 				case "tool_json":
+					traceOpenAIForward("content", len(event.Delta), true, "tool_bridge_json_candidate")
 					return true
 				case "content":
 					toolBridgeUndecided = false
 					toolBridgeStreamingContent = true
+					traceOpenAIForward("content", completionText.Len(), false, "tool_bridge_normal_content_released")
 					return onEvent(dto.ChatCompletionChunk{
 						ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 						Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{Content: completionText.String()}}},
@@ -498,8 +539,10 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 				}
 			}
 			if useToolBridge && !toolBridgeStreamingContent {
+				traceOpenAIForward("content", len(event.Delta), true, "tool_bridge_waiting_for_decision")
 				return true
 			}
+			traceOpenAIForward("content", len(event.Delta), false, "provider_content_delta")
 			return onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 				Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{Content: event.Delta}}},
@@ -582,6 +625,9 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	}
 	if err != nil {
 		return err
+	}
+	if useToolBridge && toolBridgeSignature != "" {
+		s.rememberToolBridgeContext(contextPlan.ProviderConversationID, toolBridgeSignature)
 	}
 	contextPlan.ResponseText = completionText.String()
 
@@ -841,7 +887,7 @@ func buildToolResultAnswerPrompt(userMsg, assistantMsg dto.ChatCompletionMessage
 	b.WriteString(compactText(userMsg.Content, 3000))
 	if len(assistantMsg.ToolCalls) > 0 {
 		b.WriteString("\n\nRequested tools:\n")
-		b.WriteString(compactText(toolCallsForPrompt(assistantMsg.ToolCalls), 2000))
+		b.WriteString(compactText(toolCallSummaryForPrompt(assistantMsg.ToolCalls), 2000))
 	}
 	if len(toolMsgs) == 0 {
 		b.WriteString("\n\nTool results:\nNo tool result content was provided.")
@@ -999,6 +1045,45 @@ func (s *OpenAIService) forgetToolPlannerConversation(plannerID string) {
 			delete(s.toolPlannerUpdated, key)
 		}
 	}
+}
+
+func (s *OpenAIService) toolBridgeContextReady(providerID, signature string) bool {
+	providerID = strings.TrimSpace(providerID)
+	signature = strings.TrimSpace(signature)
+	if providerID == "" || signature == "" {
+		return false
+	}
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	if s.toolBridgeContexts == nil {
+		return false
+	}
+	return s.toolBridgeContexts[providerID] == signature
+}
+
+func (s *OpenAIService) rememberToolBridgeContext(providerID, signature string) {
+	providerID = strings.TrimSpace(providerID)
+	signature = strings.TrimSpace(signature)
+	if providerID == "" || signature == "" {
+		return
+	}
+	now := time.Now()
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	if s.toolBridgeContexts == nil {
+		s.toolBridgeContexts = make(map[string]string)
+	}
+	if s.toolBridgeUpdated == nil {
+		s.toolBridgeUpdated = make(map[string]time.Time)
+	}
+	for id, updatedAt := range s.toolBridgeUpdated {
+		if now.Sub(updatedAt) > transcriptContextTTL {
+			delete(s.toolBridgeContexts, id)
+			delete(s.toolBridgeUpdated, id)
+		}
+	}
+	s.toolBridgeContexts[providerID] = signature
+	s.toolBridgeUpdated[providerID] = now
 }
 
 func (s *OpenAIService) providerConversationReady(id string) bool {
@@ -1966,12 +2051,84 @@ func toolCallsForPrompt(calls []dto.ChatCompletionToolCall) string {
 	return string(body)
 }
 
+func toolCallSummaryForPrompt(calls []dto.ChatCompletionToolCall) string {
+	var b strings.Builder
+	for i, call := range calls {
+		name := strings.TrimSpace(call.Function.Name)
+		if name == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("- ")
+		b.WriteString(name)
+		args := strings.TrimSpace(call.Function.Arguments)
+		if args != "" {
+			b.WriteString(" args: ")
+			b.WriteString(args)
+		}
+		if call.ID != "" {
+			b.WriteString(" (")
+			b.WriteString(call.ID)
+			b.WriteString(")")
+		} else {
+			b.WriteString(" (#")
+			b.WriteString(strconv.Itoa(i + 1))
+			b.WriteString(")")
+		}
+	}
+	return b.String()
+}
+
 func compactText(text string, limit int) string {
 	text = strings.TrimSpace(text)
 	if limit <= 0 || len(text) <= limit {
 		return text
 	}
 	return text[:limit] + "\n[truncated]"
+}
+
+func (s *OpenAIService) buildToolBridgePromptForPlan(req dto.ChatCompletionRequest, plan openAIContextPlan) (string, string, bool) {
+	signature := toolBridgeSignature(req)
+	reuseInstructions := strings.TrimSpace(plan.ProviderConversationID) != "" &&
+		plan.AutoContext &&
+		signature != "" &&
+		s.toolBridgeContextReady(plan.ProviderConversationID, signature)
+	if reuseInstructions {
+		return s.buildToolBridgeLightPrompt(req, plan.Prompt, toolBridgeRequiresToolCall(req)), signature, true
+	}
+	return s.buildToolBridgePrompt(req, plan.Prompt, toolBridgeRequiresToolCall(req)), signature, false
+}
+
+func toolBridgeSignature(req dto.ChatCompletionRequest) string {
+	type toolSignature struct {
+		Name        string `json:"name"`
+		Description string `json:"description,omitempty"`
+		Parameters  string `json:"parameters,omitempty"`
+	}
+	tools := make([]toolSignature, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		if !strings.EqualFold(t.Type, "function") || strings.TrimSpace(t.Function.Name) == "" {
+			continue
+		}
+		tools = append(tools, toolSignature{
+			Name:        strings.TrimSpace(t.Function.Name),
+			Description: strings.TrimSpace(t.Function.Description),
+			Parameters:  strings.TrimSpace(string(t.Function.Parameters)),
+		})
+	}
+	if len(tools) == 0 {
+		return ""
+	}
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
+	body, err := json.Marshal(tools)
+	if err != nil {
+		return ""
+	}
+	return sha256Hex(string(body))
 }
 
 func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
@@ -2026,6 +2183,37 @@ func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, bas
 
 	b.WriteString("\nConversation:\n")
 	b.WriteString(basePrompt)
+	return b.String()
+}
+
+func (s *OpenAIService) buildToolBridgeLightPrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
+	latestPrompt := strings.TrimSpace(basePrompt)
+	if latest, ok := latestUserMessage(req.Messages); ok {
+		latestPrompt = compactText(latest.Content, 1500)
+	}
+	if req.ToolChoiceMode() == "auto" && !requireToolCall {
+		return latestPrompt
+	}
+
+	var b strings.Builder
+	b.WriteString("Use the OpenAI tool protocol and available tools already defined in this Gemini conversation.\n")
+	b.WriteString("If the current request needs a tool, return exactly one JSON object with status=tool_calls. If no tool is needed and tool_choice is auto, answer normally in Markdown.\n")
+	if requireToolCall {
+		b.WriteString("This request requires a tool call; return status=tool_calls with at least one valid tool call.\n")
+	}
+	toolChoiceMode := req.ToolChoiceMode()
+	if toolChoiceMode == "required" {
+		b.WriteString("tool_choice is required; return at least one valid tool call.\n")
+	}
+	if toolChoiceMode == "function" {
+		if forced := req.ForcedToolName(); forced != "" {
+			b.WriteString("tool_choice selects function: ")
+			b.WriteString(forced)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\nCurrent user request:\n")
+	b.WriteString(latestPrompt)
 	return b.String()
 }
 

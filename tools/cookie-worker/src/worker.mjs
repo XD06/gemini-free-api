@@ -317,8 +317,9 @@ async function loadDotEnv(filePath) {
 
 function applyLifecycleDefaults() {
   const event = process.env.npm_lifecycle_event || '';
-  if (event === 'login' && process.env.COOKIE_WORKER_OPEN_ONLY === undefined) {
+  if (event === 'login') {
     process.env.COOKIE_WORKER_OPEN_ONLY = 'true';
+    process.env.COOKIE_WORKER_ONCE = 'true';
   }
   if ((event === 'sync' || event === 'once') && process.env.COOKIE_WORKER_ONCE === undefined) {
     process.env.COOKIE_WORKER_ONCE = 'true';

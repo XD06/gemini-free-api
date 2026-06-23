@@ -35,6 +35,7 @@ type GeminiConfig struct {
 	CookieCachePath            string
 	AccountStatePath           string
 	CookieCache                bool
+	StartupCookieRotate        bool
 	CookieWorkerEnabled        bool
 	CookieWorkerCommand        string
 	CookieWorkerDir            string
@@ -114,6 +115,7 @@ func New() (*Config, error) {
 	cfg.Gemini.CookieCache = getEnvBool("GEMINI_COOKIE_CACHE_ENABLED", true)
 	cfg.Gemini.CookieCachePath = getEnv("GEMINI_COOKIE_CACHE_PATH", "data/cookies/accounts.json")
 	cfg.Gemini.AccountStatePath = getEnv("GEMINI_ACCOUNT_STATE_PATH", "data/state/accounts.json")
+	cfg.Gemini.StartupCookieRotate = getEnvBool("GEMINI_STARTUP_COOKIE_ROTATE", true)
 	cfg.Gemini.CookieWorkerEnabled = getEnvBool("GEMINI_COOKIE_WORKER_ENABLED", true)
 	cfg.Gemini.CookieWorkerCommand = getEnv("GEMINI_COOKIE_WORKER_COMMAND", "npm run sync --silent")
 	cfg.Gemini.CookieWorkerDir = getEnv("GEMINI_COOKIE_WORKER_DIR", "tools/cookie-worker")

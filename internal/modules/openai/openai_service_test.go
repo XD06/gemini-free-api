@@ -1527,6 +1527,114 @@ func TestCreateChatCompletionStreamAppendsToolBridgeToExistingMainConversation(t
 	}
 }
 
+func TestCreateChatCompletionStreamReusesToolBridgeInstructionsInSameConversation(t *testing.T) {
+	tools := []dto.ToolDefinition{{
+		Type: "function",
+		Function: dto.ToolFunctionDefinition{
+			Name:        "lookup_weather",
+			Description: "Get weather",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`),
+		},
+	}}
+	client := &fakeGeminiClient{
+		streamEventsByCall: [][]providers.StreamEvent{
+			{{Kind: "content_delta", Delta: "你好"}},
+			{{Kind: "content_delta", Delta: "SpaceX 是一家航天公司。"}},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	firstReq := dto.ChatCompletionRequest{
+		Model:    "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{{Role: "user", Content: "你好"}},
+		Tools:    tools,
+		Stream:   true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), firstReq, func(dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("first stream returned error: %v", err)
+	}
+	if len(client.prompts) != 1 || !strings.Contains(client.prompts[0], "Available tools:") {
+		t.Fatalf("first tool bridge prompt should include full tools, got %#v", client.prompts)
+	}
+
+	secondReq := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+			{Role: "assistant", Content: "你好"},
+			{Role: "user", Content: "你知道 SpaceX 吗？"},
+		},
+		Tools:  tools,
+		Stream: true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), secondReq, func(dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("second stream returned error: %v", err)
+	}
+	if len(client.prompts) != 2 {
+		t.Fatalf("expected two prompts, got %#v", client.prompts)
+	}
+	if strings.Contains(client.prompts[1], "Available tools:") || strings.Contains(client.prompts[1], "parameters:") {
+		t.Fatalf("second prompt should reuse existing tool instructions, got %q", client.prompts[1])
+	}
+	if strings.Contains(client.prompts[1], "already defined in this Gemini conversation") {
+		t.Fatalf("auto follow-up should not repeat tool reminders, got %q", client.prompts[1])
+	}
+	if client.prompts[1] != "你知道 SpaceX 吗？" {
+		t.Fatalf("second prompt should be only the current user request, got %q", client.prompts[1])
+	}
+	if len(client.configs) < 2 || client.configs[0].ConversationID == "" || client.configs[1].ConversationID != client.configs[0].ConversationID {
+		t.Fatalf("expected second request to reuse provider conversation, configs=%#v", client.configs)
+	}
+}
+
+func TestCreateChatCompletionStreamResendsToolBridgeInstructionsWhenToolsChange(t *testing.T) {
+	firstTools := []dto.ToolDefinition{{
+		Type:     "function",
+		Function: dto.ToolFunctionDefinition{Name: "lookup_weather", Parameters: json.RawMessage(`{"type":"object"}`)},
+	}}
+	secondTools := []dto.ToolDefinition{{
+		Type:     "function",
+		Function: dto.ToolFunctionDefinition{Name: "lookup_time", Parameters: json.RawMessage(`{"type":"object"}`)},
+	}}
+	client := &fakeGeminiClient{
+		streamEventsByCall: [][]providers.StreamEvent{
+			{{Kind: "content_delta", Delta: "你好"}},
+			{{Kind: "content_delta", Delta: "现在继续。"}},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	firstReq := dto.ChatCompletionRequest{
+		Model:    "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{{Role: "user", Content: "你好"}},
+		Tools:    firstTools,
+		Stream:   true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), firstReq, func(dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("first stream returned error: %v", err)
+	}
+
+	secondReq := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "你好"},
+			{Role: "assistant", Content: "你好"},
+			{Role: "user", Content: "继续"},
+		},
+		Tools:  secondTools,
+		Stream: true,
+	}
+	if err := service.CreateChatCompletionStream(context.Background(), secondReq, func(dto.ChatCompletionChunk) bool { return true }); err != nil {
+		t.Fatalf("second stream returned error: %v", err)
+	}
+	if len(client.prompts) != 2 {
+		t.Fatalf("expected two prompts, got %#v", client.prompts)
+	}
+	if !strings.Contains(client.prompts[1], "Available tools:") || !strings.Contains(client.prompts[1], "lookup_time") {
+		t.Fatalf("changed tools should trigger full tool prompt, got %q", client.prompts[1])
+	}
+}
+
 // TestPlanRequestContextSkipsUntrustedProviderConversation reproduces the
 // "lost early turns" root cause: a provider conversation flagged untrusted
 // must not be reused for server-side context, forcing the next turn to

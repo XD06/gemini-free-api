@@ -36,6 +36,7 @@ type Client struct {
 	cookieSource    string
 	cookieCache     bool
 	cookieCachePath string
+	startupRotate   bool
 	httpClient      *req.Client
 	rawHTTPClient   *http.Client
 	cookies         *CookieStore
@@ -177,6 +178,7 @@ func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfi
 		cookieSource:          account.CookieSource,
 		cookieCache:           cfg.Gemini.CookieCache,
 		cookieCachePath:       cfg.Gemini.CookieCachePath,
+		startupRotate:         cfg.Gemini.StartupCookieRotate,
 		httpClient:            client,
 		rawHTTPClient:         rawClient,
 		cookies:               cookies,
@@ -327,13 +329,18 @@ func (c *Client) Init(ctx context.Context) error {
 	}
 
 	// Active rotation at start: "启动时主动轮换：Init 阶段先轮换一次拿最新 PSIDTS"
-	if c.cookies.Secure1PSID != "" {
+	if c.startupRotate && c.cookies.Secure1PSID != "" {
 		c.log.Info("Proactively rotating cookies at startup to get fresh __Secure-1PSIDTS...")
 		if err := c.RotateCookies(); err != nil {
 			c.log.Warn("Startup cookie rotation failed, continuing...", zap.Error(err))
 		} else {
 			c.log.Info("Successfully rotated cookies at startup")
 		}
+	} else if !c.startupRotate {
+		c.log.Info("Skipping startup cookie rotation",
+			zap.String("account", c.accountID),
+			zap.String("reason", "GEMINI_STARTUP_COOKIE_ROTATE=false"),
+		)
 	}
 
 	// Populate cookies
