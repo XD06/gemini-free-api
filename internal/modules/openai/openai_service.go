@@ -1239,6 +1239,8 @@ func (s *OpenAIService) forgetProviderConversation(providerID string) {
 	}
 	delete(s.providerLatestTranscript, providerID)
 	delete(s.providerLatestLength, providerID)
+	delete(s.toolBridgeContexts, providerID)
+	delete(s.toolBridgeUpdated, providerID)
 }
 
 func (s *OpenAIService) providerConversationForExplicitID(clientID string) string {
@@ -2092,9 +2094,7 @@ func compactText(text string, limit int) string {
 func (s *OpenAIService) buildToolBridgePromptForPlan(req dto.ChatCompletionRequest, plan openAIContextPlan) (string, string, bool) {
 	signature := toolBridgeSignature(req)
 	reuseInstructions := strings.TrimSpace(plan.ProviderConversationID) != "" &&
-		plan.AutoContext &&
-		signature != "" &&
-		s.toolBridgeContextReady(plan.ProviderConversationID, signature)
+		plan.AutoContext
 	if reuseInstructions {
 		return s.buildToolBridgeLightPrompt(req, plan.Prompt, toolBridgeRequiresToolCall(req)), signature, true
 	}
@@ -2138,10 +2138,12 @@ func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, bas
 	b.WriteString("If a tool is needed, return exactly one JSON object and no surrounding text.\n")
 	b.WriteString("Tool-call JSON schema:\n")
 	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
+	b.WriteString("When you output this JSON, the client will execute the requested tool(s) and send the tool result back in the next message; then you should answer the user naturally based on that result.\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Use only tool names listed below.\n")
 	b.WriteString("- arguments must be a valid JSON object matching the tool's parameters schema.\n")
 	b.WriteString("- Do not put JSON in markdown code fences.\n")
+	b.WriteString("- Tool-call JSON is an internal request for tool execution, not the final answer to the user.\n")
 	b.WriteString("- If no tool is needed and tool_choice is auto, answer the user normally in Markdown. Do not wrap normal text in JSON.\n")
 	if requireToolCall {
 		b.WriteString("- The current user request requires external/web/tool data. You must return status=tool_calls with at least one valid tool call. Do not answer from memory.\n")
@@ -2197,7 +2199,7 @@ func (s *OpenAIService) buildToolBridgeLightPrompt(req dto.ChatCompletionRequest
 
 	var b strings.Builder
 	b.WriteString("Use the OpenAI tool protocol and available tools already defined in this Gemini conversation.\n")
-	b.WriteString("If the current request needs a tool, return exactly one JSON object with status=tool_calls. If no tool is needed and tool_choice is auto, answer normally in Markdown.\n")
+	b.WriteString("If the current request needs a tool, return exactly one JSON object with status=tool_calls. The client will execute the tool and send the result back; then answer naturally. If no tool is needed and tool_choice is auto, answer normally in Markdown.\n")
 	if requireToolCall {
 		b.WriteString("This request requires a tool call; return status=tool_calls with at least one valid tool call.\n")
 	}

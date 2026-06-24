@@ -1525,6 +1525,9 @@ func TestCreateChatCompletionStreamAppendsToolBridgeToExistingMainConversation(t
 	if client.configs[0].ConversationID != "provider-thread" {
 		t.Fatalf("tool bridge must append to main conversation, got %q", client.configs[0].ConversationID)
 	}
+	if client.prompts[0] != "今天 GitHub 的热点是什么？" {
+		t.Fatalf("same-topic tool bridge should send only latest user request, got %q", client.prompts[0])
+	}
 }
 
 func TestCreateChatCompletionStreamReusesToolBridgeInstructionsInSameConversation(t *testing.T) {
@@ -1587,7 +1590,7 @@ func TestCreateChatCompletionStreamReusesToolBridgeInstructionsInSameConversatio
 	}
 }
 
-func TestCreateChatCompletionStreamResendsToolBridgeInstructionsWhenToolsChange(t *testing.T) {
+func TestCreateChatCompletionStreamDoesNotResendToolBridgeInstructionsInSameConversationWhenToolsChange(t *testing.T) {
 	firstTools := []dto.ToolDefinition{{
 		Type:     "function",
 		Function: dto.ToolFunctionDefinition{Name: "lookup_weather", Parameters: json.RawMessage(`{"type":"object"}`)},
@@ -1630,8 +1633,67 @@ func TestCreateChatCompletionStreamResendsToolBridgeInstructionsWhenToolsChange(
 	if len(client.prompts) != 2 {
 		t.Fatalf("expected two prompts, got %#v", client.prompts)
 	}
-	if !strings.Contains(client.prompts[1], "Available tools:") || !strings.Contains(client.prompts[1], "lookup_time") {
-		t.Fatalf("changed tools should trigger full tool prompt, got %q", client.prompts[1])
+	if strings.Contains(client.prompts[1], "Available tools:") || strings.Contains(client.prompts[1], "lookup_time") {
+		t.Fatalf("same-topic follow-up should not resend tool instructions, got %q", client.prompts[1])
+	}
+	if client.prompts[1] != "继续" {
+		t.Fatalf("same-topic follow-up should send only latest user request, got %q", client.prompts[1])
+	}
+}
+
+func TestCreateChatCompletionStreamFallbackFreshConversationRestoresFullToolPrompt(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamErrs: []error{errors.New("gemini bard error 1097")},
+		streamEventsByCall: [][]providers.StreamEvent{
+			nil,
+			{{Kind: "content_delta", Delta: "fallback answer"}},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	prefix := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好，有什么可以帮你？"},
+	}
+	key := transcriptFingerprint(prefix)
+	service.transcriptContexts[key] = "provider-1"
+	service.transcriptContextUpdated[key] = time.Now()
+	service.providerLatestTranscript["provider-1"] = key
+	service.providerLatestLength["provider-1"] = len(prefix)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: append(cloneChatMessages(prefix), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "查一下今天新闻",
+		}),
+		Tools: []dto.ToolDefinition{{
+			Type:     "function",
+			Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+		}},
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		return true
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(client.prompts) != 2 {
+		t.Fatalf("expected failed same-topic call and fresh fallback, got prompts %#v", client.prompts)
+	}
+	if client.prompts[0] != "查一下今天新闻" {
+		t.Fatalf("same-topic attempt should send only latest user request, got %q", client.prompts[0])
+	}
+	if !strings.Contains(client.prompts[1], "Available tools:") || !strings.Contains(client.prompts[1], "search") {
+		t.Fatalf("fresh fallback must restore full tool prompt, got %q", client.prompts[1])
+	}
+	if !strings.Contains(client.prompts[1], "你好") || !strings.Contains(client.prompts[1], "查一下今天新闻") {
+		t.Fatalf("fresh fallback must include full OpenAI context, got %q", client.prompts[1])
+	}
+	if len(client.configs) != 2 || client.configs[1].ConversationID == "" || client.configs[1].ConversationID == "provider-1" {
+		t.Fatalf("fresh fallback should use a new provider conversation, got %#v", client.configs)
 	}
 }
 
