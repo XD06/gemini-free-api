@@ -1,16 +1,27 @@
+# syntax=docker/dockerfile:1
+
 # Stage 1: Build
 FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
-# Cache dependencies
+# Optional: speed up module downloads for users behind the GFW.
+# Override with: docker compose build --build-arg GOPROXY=off
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
+# Cache dependencies — layer is only invalidated when go.mod/go.sum change.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
 
-# Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o main ./cmd/server/main.go
+# Build binary — BuildKit cache mounts preserve the Go build cache across
+# rebuilds, so incremental compilation kicks in even after COPY . . changes.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o main ./cmd/server/main.go
 
 # Stage 2: Final Image
 FROM alpine:3.22.2

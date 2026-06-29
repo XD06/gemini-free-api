@@ -27,6 +27,11 @@ services:
       - ./data:/home/appuser/data
       # Hard-coded cookie jar dir (gemini_service.go).
       - ./.cookies:/home/appuser/.cookies
+      # Mount .env as read-only so config changes take effect on
+      # `docker compose restart` — NO rebuild needed.
+      # The app calls godotenv.Overload() at startup which reads this file
+      # and overrides env vars set by env_file above.
+      - ./.env:/home/appuser/.env:ro
     healthcheck:
       # NOTE: must be a real GET, not `wget --spider`. --spider issues a HEAD,
       # but /health is GET-only (Fiber app.Get), so HEAD returns 404 and wget
