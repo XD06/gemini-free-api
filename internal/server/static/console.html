@@ -684,6 +684,230 @@ body {
 
 .reveal.in { opacity: 1; transform: translateY(0); }
 
+/* ========== Tabs ========== */
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0;
+}
+
+.tab {
+  padding: 10px 20px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  border-bottom: 2px solid transparent;
+  transition: all .15s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tab:hover { color: var(--ink-2); }
+.tab.active { color: var(--ink); border-bottom-color: var(--ink); }
+.tab svg { width: 14px; height: 14px; }
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ========== Playground ========== */
+.pg-layout {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 200px);
+  min-height: 500px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.pg-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.pg-select {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  outline: none;
+  cursor: pointer;
+}
+
+.pg-select:focus { border-color: var(--ink-2); }
+
+.pg-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.pg-msg {
+  display: flex;
+  gap: 12px;
+  max-width: 85%;
+}
+
+.pg-msg.user { align-self: flex-end; flex-direction: row-reverse; }
+
+.pg-msg-avatar {
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.pg-msg.user .pg-msg-avatar { background: var(--pale-blu-bg); color: var(--pale-blu-tx); }
+.pg-msg.assistant .pg-msg-avatar { background: #F0EEE6; color: #6B6356; }
+
+.pg-msg-bubble {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.pg-msg.user .pg-msg-bubble {
+  background: var(--ink);
+  color: #fff;
+}
+
+.pg-msg.assistant .pg-msg-bubble {
+  background: var(--surface-2);
+  color: var(--ink);
+  border: 1px solid var(--border);
+}
+
+.pg-msg-bubble pre {
+  background: rgba(0,0,0,0.06);
+  padding: 10px 12px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.pg-msg-bubble code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.pg-msg-bubble pre code { background: none; padding: 0; }
+
+.pg-msg .thinking {
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
+  margin-bottom: 6px;
+  padding: 6px 10px;
+  background: rgba(0,0,0,0.03);
+  border-radius: 4px;
+  border-left: 2px solid var(--muted-2);
+}
+
+.pg-input-area {
+  border-top: 1px solid var(--border);
+  padding: 12px 16px;
+  flex-shrink: 0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.pg-input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+  resize: none;
+  min-height: 42px;
+  max-height: 120px;
+  line-height: 1.5;
+  transition: border-color .2s;
+}
+
+.pg-input:focus { border-color: var(--ink-2); }
+.pg-input::placeholder { color: var(--muted-2); }
+
+.pg-send {
+  padding: 10px 16px;
+  background: var(--ink);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all .15s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.pg-send:hover { background: #333; }
+.pg-send:active { transform: scale(0.98); }
+.pg-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.pg-send svg { width: 14px; height: 14px; }
+
+.pg-send .spinner {
+  width: 14px; height: 14px;
+  border: 1.5px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+}
+
+.pg-empty {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--muted);
+}
+
+.pg-empty svg { width: 32px; height: 32px; color: var(--border); margin-bottom: 12px; }
+
+.pg-clear {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pg-clear:hover { color: var(--pale-red-tx); }
+
 /* ========== Responsive ========== */
 @media (max-width: 768px) {
   .app { padding: 0 20px; }
@@ -695,6 +919,7 @@ body {
   .drawer { width: 100vw; }
   .toolbar { flex-direction: column; align-items: stretch; }
   .search-box { max-width: none; }
+  .pg-msg { max-width: 95%; }
 }
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -743,6 +968,18 @@ body {
     </div>
   </header>
 
+  <div class="tabs" style="margin-top:8px">
+    <button class="tab active" id="tabAccounts" onclick="switchTab('accounts')">
+      <svg viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="10" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M5 7h6M5 10h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      账号管理
+    </button>
+    <button class="tab" id="tabPlayground" onclick="switchTab('playground')">
+      <svg viewBox="0 0 16 16" fill="none"><path d="M3 12l3-8 2 5 2-3 3 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Playground
+    </button>
+  </div>
+
+  <section class="tab-panel active" id="panelAccounts">
   <section class="hero reveal">
     <div class="hero-left">
       <h1 class="hero-title">管理你的 <em>Gemini</em> 账号池</h1>
@@ -794,6 +1031,41 @@ body {
     </div>
 
     <div class="accounts-grid" id="accountsGrid"></div>
+  </section>
+
+  </section>
+
+  <section class="tab-panel" id="panelPlayground">
+    <div class="pg-layout">
+      <div class="pg-toolbar">
+        <select class="pg-select" id="pgModel">
+          <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+          <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+          <option value="gemini-3.1-pro">gemini-3.1-pro</option>
+        </select>
+        <select class="pg-select" id="pgThinking">
+          <option value="">Thinking: Default</option>
+          <option value="low">Thinking: Low</option>
+          <option value="medium">Thinking: Medium</option>
+          <option value="high">Thinking: High</option>
+        </select>
+        <button class="pg-clear" onclick="clearChat()">清空对话</button>
+      </div>
+      <div class="pg-messages" id="pgMessages">
+        <div class="pg-empty">
+          <svg viewBox="0 0 48 48" fill="none"><path d="M8 36c0-4 4-6 8-6s8 2 8 6M24 36c0-4 4-6 8-6s8 2 8 6M16 30v-6M32 30v-6M12 18l4-2 4 2M28 18l4-2 4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div>发送消息开始对话</div>
+          <div style="font-size:12px;margin-top:4px">使用 OpenAI 兼容流式接口，真实测试模型回复</div>
+        </div>
+      </div>
+      <div class="pg-input-area">
+        <textarea class="pg-input" id="pgInput" placeholder="输入消息…  (Enter 发送, Shift+Enter 换行)" rows="1" onkeydown="pgKeydown(event)" oninput="pgAutoSize(this)"></textarea>
+        <button class="pg-send" id="pgSend" onclick="pgSend()">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M2 8l12-5-5 12-2-5-5-2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+          <span>发送</span>
+        </button>
+      </div>
+    </div>
   </section>
 
   <footer class="footer">
@@ -1312,6 +1584,186 @@ function initReveal() {
     el.classList.remove('in');
     revealObserver.observe(el);
   });
+}
+
+// ===== Playground =====
+const PG = {
+  messages: [],
+  sending: false,
+};
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  if (name === 'accounts') {
+    document.getElementById('tabAccounts').classList.add('active');
+    document.getElementById('panelAccounts').classList.add('active');
+  } else {
+    document.getElementById('tabPlayground').classList.add('active');
+    document.getElementById('panelPlayground').classList.add('active');
+  }
+}
+
+function pgAutoSize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function pgKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    pgSend();
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function renderMarkdown(text) {
+  // Simple markdown: code blocks, inline code, bold, line breaks
+  let html = escapeHtml(text);
+  // Code blocks
+  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    return '<pre><code>' + code.trim() + '</code></pre>';
+  });
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Bold
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // Line breaks
+  html = html.replace(/\n/g, '<br>');
+  return html;
+}
+
+function renderPgMessages() {
+  const container = document.getElementById('pgMessages');
+  if (PG.messages.length === 0) {
+    container.innerHTML = `<div class="pg-empty"><svg viewBox="0 0 48 48" fill="none"><path d="M8 36c0-4 4-6 8-6s8 2 8 6M24 36c0-4 4-6 8-6s8 2 8 6M16 30v-6M32 30v-6M12 18l4-2 4 2M28 18l4-2 4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><div>发送消息开始对话</div><div style="font-size:12px;margin-top:4px">使用 OpenAI 兼容流式接口，真实测试模型回复</div></div>`;
+    return;
+  }
+  container.innerHTML = PG.messages.map(m => {
+    const avatar = m.role === 'user' ? 'U' : 'AI';
+    let bubble = '';
+    if (m.thinking) {
+      bubble += '<div class="thinking">💭 ' + escapeHtml(m.thinking) + '</div>';
+    }
+    bubble += '<div class="pg-msg-content">' + renderMarkdown(m.content) + '</div>';
+    return `<div class="pg-msg ${m.role}">
+      <div class="pg-msg-avatar">${avatar}</div>
+      <div class="pg-msg-bubble">${bubble}</div>
+    </div>`;
+  }).join('');
+  container.scrollTop = container.scrollHeight;
+}
+
+function clearChat() {
+  PG.messages = [];
+  renderPgMessages();
+}
+
+async function pgSend() {
+  if (PG.sending) return;
+  const input = document.getElementById('pgInput');
+  const text = input.value.trim();
+  if (!text) return;
+
+  PG.messages.push({ role: 'user', content: text });
+  input.value = '';
+  input.style.height = 'auto';
+
+  // Add empty assistant message for streaming
+  PG.messages.push({ role: 'assistant', content: '', thinking: '' });
+  PG.sending = true;
+
+  const btn = document.getElementById('pgSend');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  renderPgMessages();
+
+  const model = document.getElementById('pgModel').value;
+  const thinking = document.getElementById('pgThinking').value;
+
+  const reqBody = {
+    model: model,
+    stream: true,
+    messages: PG.messages.filter(m => m.content || m.role === 'user').slice(0, -1).map(m => ({
+      role: m.role,
+      content: m.content
+    }))
+  };
+  // Add current user message
+  reqBody.messages.push({ role: 'user', content: text });
+
+  if (thinking) {
+    reqBody.reasoning_effort = thinking;
+  }
+
+  try {
+    const res = await fetch('/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + State.token },
+      body: JSON.stringify(reqBody)
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error?.message || 'HTTP ' + res.status);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const assistantIdx = PG.messages.length - 1;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const chunk = JSON.parse(data);
+          const delta = chunk.choices?.[0]?.delta;
+          if (!delta) continue;
+          if (delta.content) {
+            PG.messages[assistantIdx].content += delta.content;
+          }
+          if (delta.reasoning_content) {
+            PG.messages[assistantIdx].thinking += delta.reasoning_content;
+          }
+          renderPgMessages();
+        } catch(e) { /* skip parse errors */ }
+      }
+    }
+
+    // If no content received, show error
+    if (!PG.messages[assistantIdx].content && !PG.messages[assistantIdx].thinking) {
+      PG.messages[assistantIdx].content = '(空回复)';
+    }
+
+  } catch(e) {
+    // Update the assistant message with error
+    const assistantIdx = PG.messages.length - 1;
+    if (PG.messages[assistantIdx] && PG.messages[assistantIdx].role === 'assistant') {
+      PG.messages[assistantIdx].content = '❌ 错误: ' + e.message;
+    }
+    toast('对话失败: ' + e.message, 'err');
+  } finally {
+    PG.sending = false;
+    btn.disabled = false;
+    btn.innerHTML = '<svg viewBox="0 0 16 16" fill="none"><path d="M2 8l12-5-5 12-2-5-5-2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg><span>发送</span>';
+    renderPgMessages();
+    document.getElementById('pgInput').focus();
+  }
 }
 
 // ===== Init =====
