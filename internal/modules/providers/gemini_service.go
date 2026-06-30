@@ -2064,6 +2064,41 @@ func (c *Client) RefreshAccount(ctx context.Context, accountID string) error {
 	return nil
 }
 
+// UpdateAccountProxy is not supported on single-client mode.
+func (c *Client) UpdateAccountProxy(ctx context.Context, accountID, proxyURL string) error {
+	return fmt.Errorf("not supported in single-account mode")
+}
+
+// AddAccount is not supported on single-client mode.
+func (c *Client) AddAccount(ctx context.Context, accountID, secure1PSID, secure1PSIDTS, proxyURL string) error {
+	return fmt.Errorf("not supported in single-account mode")
+}
+
+// RemoveAccount is not supported on single-client mode.
+func (c *Client) RemoveAccount(ctx context.Context, accountID string) error {
+	return fmt.Errorf("not supported in single-account mode")
+}
+
+// TestAccount sends a simple test message through this client to verify the model works.
+func (c *Client) TestAccount(ctx context.Context, accountID string) (string, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID != "" && accountID != c.accountID {
+		return "", fmt.Errorf("Gemini account %q not found", accountID)
+	}
+	resp, err := c.GenerateContent(ctx, "Hi, please reply with only the word: OK")
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("empty response")
+	}
+	text := strings.TrimSpace(resp.Text)
+	if text == "" {
+		return "", fmt.Errorf("empty text in response")
+	}
+	return text, nil
+}
+
 func (c *Client) checkConversationContinuity(id, expectedCID string, metadata map[string]any, contentAlreadyEmitted bool) error {
 	id = strings.TrimSpace(id)
 	expectedCID = strings.TrimSpace(expectedCID)

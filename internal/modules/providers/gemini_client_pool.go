@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"gemini-free-api/internal/commons/configs"
 
+	"github.com/imroc/req/v3"
 	"go.uber.org/zap"
 )
 
@@ -29,7 +31,11 @@ type GeminiClient interface {
 type AccountManager interface {
 	ListAccountStatuses() []AccountStatus
 	UpdateAccountCookies(ctx context.Context, accountID, secure1PSID, secure1PSIDTS string) error
+	UpdateAccountProxy(ctx context.Context, accountID, proxyURL string) error
 	RefreshAccount(ctx context.Context, accountID string) error
+	AddAccount(ctx context.Context, accountID, secure1PSID, secure1PSIDTS, proxyURL string) error
+	RemoveAccount(ctx context.Context, accountID string) error
+	TestAccount(ctx context.Context, accountID string) (string, error)
 }
 
 type ClientPool struct {
@@ -44,20 +50,13 @@ type ClientPool struct {
 	activeIndex     int
 	activeUntil     time.Time
 	statePath       string
+	cfg             *configs.Config
 	log             *zap.Logger
 }
 
 type cookieRefreshFunc func(ctx context.Context, accountID string) error
 
 func NewGeminiClient(cfg *configs.Config, log *zap.Logger) GeminiClient {
-	accounts := cfg.Gemini.Accounts
-	if len(accounts) == 0 {
-		accounts = []configs.GeminiAccountConfig{defaultGeminiAccountConfig(cfg)}
-	}
-	if len(accounts) == 1 {
-		accounts = applyCookieCache(cfg, accounts)
-		return NewClientForAccount(cfg, accounts[0], log)
-	}
 	return NewClientPool(cfg, log)
 }
 
@@ -79,6 +78,7 @@ func NewClientPool(cfg *configs.Config, log *zap.Logger) *ClientPool {
 		internalRefresh: refreshClientSessionInPlace,
 		activeIndex:     -1,
 		statePath:       cfg.Gemini.AccountStatePath,
+		cfg:             cfg,
 		log:             log,
 	}
 	for _, account := range accounts {
@@ -873,6 +873,180 @@ func accountAuditLogEnabled() bool {
 	default:
 		return false
 	}
+}
+
+// AddAccount creates a new Gemini account client at runtime and adds it to the pool.
+func (p *ClientPool) AddAccount(ctx context.Context, accountID, secure1PSID, secure1PSIDTS, proxyURL string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return fmt.Errorf("account ID is required")
+	}
+	if secure1PSID == "" {
+		return fmt.Errorf("secure_1psid is required")
+	}
+
+	p.mu.Lock()
+	if p.clientsByID[accountID] != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("account %q already exists", accountID)
+	}
+	p.mu.Unlock()
+
+	account := configs.GeminiAccountConfig{
+		ID:              accountID,
+		Secure1PSID:     secure1PSID,
+		Secure1PSIDTS:   secure1PSIDTS,
+		CookieSource:    "console",
+		ProxyURL:        proxyURL,
+		Priority:        1,
+		StayMinutes:     60,
+		RefreshInterval: p.cfg.Gemini.RefreshInterval,
+		MaxRetries:      p.cfg.Gemini.MaxRetries,
+	}
+
+	client := NewClientForAccount(p.cfg, account, p.log)
+
+	p.mu.Lock()
+	p.clients = append(p.clients, client)
+	p.clientsByID[accountID] = client
+	p.stayByID[accountID] = accountStayDuration(account)
+	p.mu.Unlock()
+
+	if p.log != nil {
+		p.log.Info("Gemini account added via console",
+			zap.String("account", accountID),
+			zap.String("proxy", redactProxyURL(proxyURL)),
+		)
+	}
+
+	// Initialize in background so the API call doesn't block.
+	go func() {
+		if err := client.Init(context.Background()); err != nil {
+			if p.log != nil {
+				p.log.Warn("Console-added account init failed",
+					zap.String("account", accountID),
+					zap.Error(err),
+				)
+			}
+		}
+	}()
+
+	return nil
+}
+
+// RemoveAccount removes an account from the pool and closes its client.
+func (p *ClientPool) RemoveAccount(ctx context.Context, accountID string) error {
+	accountID = strings.TrimSpace(accountID)
+	p.mu.Lock()
+	client, ok := p.clientsByID[accountID]
+	if !ok {
+		p.mu.Unlock()
+		return fmt.Errorf("account %q not found", accountID)
+	}
+
+	// Remove from slices/maps.
+	delete(p.clientsByID, accountID)
+	delete(p.stayByID, accountID)
+	newClients := make([]*Client, 0, len(p.clients)-1)
+	for _, c := range p.clients {
+		if c.accountID != accountID {
+			newClients = append(newClients, c)
+		}
+	}
+	p.clients = newClients
+
+	// Fix activeIndex if needed.
+	if p.activeIndex >= len(p.clients) {
+		p.activeIndex = -1
+	}
+
+	// Remove conversation bindings for this account.
+	for convID, accID := range p.conversationTo {
+		if accID == accountID {
+			delete(p.conversationTo, convID)
+		}
+	}
+	p.mu.Unlock()
+
+	if err := client.Close(); err != nil && p.log != nil {
+		p.log.Warn("failed to close removed account", zap.String("account", accountID), zap.Error(err))
+	}
+
+	if p.log != nil {
+		p.log.Info("Gemini account removed via console", zap.String("account", accountID))
+	}
+	return nil
+}
+
+// UpdateAccountProxy changes the proxy URL for an existing account.
+func (p *ClientPool) UpdateAccountProxy(ctx context.Context, accountID, proxyURL string) error {
+	_ = ctx
+	client := p.clientByID(accountID)
+	if client == nil {
+		return fmt.Errorf("account %q not found", accountID)
+	}
+	client.mu.Lock()
+	client.proxyURL = strings.TrimSpace(proxyURL)
+	client.mu.Unlock()
+
+	// Rebuild HTTP clients with the new proxy.
+	newReqClient := req.NewClient().
+		SetTimeout(10 * time.Minute).
+		SetCommonHeaders(DefaultHeaders)
+	if strings.TrimSpace(proxyURL) != "" {
+		newReqClient.SetProxyURL(proxyURL)
+	}
+	newRawTransport := &http.Transport{
+		Proxy:                 proxyFunc(proxyURL),
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
+	}
+	newRawClient := &http.Client{
+		Transport: newRawTransport,
+		Timeout:   5 * time.Minute,
+	}
+
+	client.mu.Lock()
+	client.httpClient = newReqClient
+	client.rawHTTPClient = newRawClient
+	client.mu.Unlock()
+
+	if p.log != nil {
+		p.log.Info("Gemini account proxy updated via console",
+			zap.String("account", accountID),
+			zap.String("proxy", redactProxyURL(proxyURL)),
+		)
+	}
+	return nil
+}
+
+// TestAccount sends a simple test message through the specified account's client
+// to verify the model truly works end-to-end. Returns the response text on success.
+func (p *ClientPool) TestAccount(ctx context.Context, accountID string) (string, error) {
+	client := p.clientByID(accountID)
+	if client == nil {
+		return "", fmt.Errorf("Gemini account %q not found", accountID)
+	}
+	if !client.IsHealthy() {
+		return "", fmt.Errorf("Gemini account %q is not healthy (state: %s)", accountID, client.AccountStatus().State)
+	}
+	resp, err := client.GenerateContent(ctx, "Hi, please reply with only the word: OK")
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("empty response from account %q", accountID)
+	}
+	text := strings.TrimSpace(resp.Text)
+	if text == "" {
+		return "", fmt.Errorf("empty text in response from account %q", accountID)
+	}
+	return text, nil
 }
 
 func (p *ClientPool) bindConversation(conversationID, accountID string) {

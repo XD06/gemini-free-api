@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"gemini-free-api/internal/commons/configs"
@@ -34,6 +35,18 @@ func NewGeminiFreeAPI(log *zap.Logger, cfg *configs.Config) *fiber.App {
 		app.Use(limiter.New(limiter.Config{
 			Max:        cfg.RateLimit.MaxRequests,
 			Expiration: time.Duration(cfg.RateLimit.WindowMs) * time.Millisecond,
+			Next: func(c fiber.Ctx) bool {
+				// Skip rate limiting for non-API routes: console UI, docs,
+				// health check, and admin management endpoints.
+				path := c.Path()
+				if path == "/console" || path == "/docs" || path == "/openapi.json" || path == "/health" {
+					return true
+				}
+				if strings.HasPrefix(path, "/admin/") {
+					return true
+				}
+				return false
+			},
 		}))
 	}
 
