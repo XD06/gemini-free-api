@@ -1,0 +1,1202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Console — Gemini Free API</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #FBFBFA;
+  --surface: #FFFFFF;
+  --surface-2: #F9F9F8;
+  --ink: #111111;
+  --ink-2: #2F3437;
+  --muted: #787774;
+  --muted-2: #A8A6A3;
+  --border: #EAEAEA;
+  --border-2: rgba(0,0,0,0.06);
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  --pale-red-bg: #FDEBEC;  --pale-red-tx: #9F2F2D;
+  --pale-grn-bg: #EDF3EC;  --pale-grn-tx: #346538;
+  --pale-yel-bg: #FBF3DB;  --pale-yel-tx: #956400;
+  --pale-blu-bg: #E1F3FE;  --pale-blu-tx: #1F6C9F;
+
+  --font-sans: 'Geist', 'SF Pro Display', 'Helvetica Neue', sans-serif;
+  --font-serif: 'Instrument Serif', 'Newsreader', serif;
+  --font-mono: 'Geist Mono', 'SF Mono', 'JetBrains Mono', monospace;
+
+  --maxw: 1080px;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  min-height: 100vh;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(0,0,0,0.018), transparent);
+}
+
+.app { max-width: var(--maxw); margin: 0 auto; padding: 0 32px; }
+
+/* ========== Header ========== */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+
+.brand-mark {
+  width: 28px; height: 28px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.brand-mark svg { width: 18px; height: 18px; }
+
+.brand-text {
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.brand-text span { color: var(--muted); font-weight: 400; }
+
+.header-actions { display: flex; align-items: center; gap: 12px; }
+
+.token-pill {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+  user-select: none;
+}
+
+.token-pill:hover { border-color: var(--muted-2); }
+
+.token-pill.active {
+  background: var(--pale-grn-bg);
+  border-color: transparent;
+  color: var(--pale-grn-tx);
+}
+
+.token-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--muted-2);
+}
+
+.token-pill.active .token-dot { background: var(--pale-grn-tx); }
+
+/* ========== Hero ========== */
+.hero {
+  padding: 28px 0 24px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.hero-left { display: flex; flex-direction: column; gap: 4px; }
+
+.hero-title {
+  font-family: var(--font-serif);
+  font-size: 24px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.hero-title em {
+  font-style: italic;
+  color: var(--muted);
+}
+
+.hero-sub {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* ========== Stats ========== */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+  margin-bottom: 48px;
+}
+
+.stat {
+  padding: 24px;
+  border-right: 1px solid var(--border);
+}
+.stat:last-child { border-right: none; }
+
+.stat-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.stat-value {
+  margin-top: 8px;
+  font-size: 32px;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  color: var(--ink);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-foot {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted-2);
+}
+
+/* ========== Section ========== */
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.section-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* ========== Toolbar ========== */
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  gap: 16px;
+}
+
+.search-box {
+  flex: 1;
+  max-width: 320px;
+  position: relative;
+}
+
+.search-box input {
+  width: 100%;
+  padding: 8px 12px 8px 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+  transition: border-color .2s;
+}
+
+.search-box input:focus { border-color: var(--muted-2); }
+.search-box input::placeholder { color: var(--muted-2); }
+
+.search-box svg {
+  position: absolute;
+  left: 10px; top: 50%;
+  transform: translateY(-50%);
+  width: 14px; height: 14px;
+  color: var(--muted-2);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  border: none;
+  cursor: pointer;
+  transition: all .15s ease;
+  white-space: nowrap;
+}
+
+.btn-primary {
+  background: var(--ink);
+  color: #fff;
+}
+.btn-primary:hover { background: #333; }
+.btn-primary:active { transform: scale(0.98); }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+.btn-ghost:hover { border-color: var(--muted-2); color: var(--ink-2); }
+
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+
+.btn svg { width: 14px; height: 14px; }
+
+/* ========== Account Cards ========== */
+.accounts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+  margin-bottom: 64px;
+}
+
+.account-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  overflow: hidden;
+  transition: box-shadow .2s ease;
+}
+
+.account-card:hover {
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.card-top {
+  padding: 20px 20px 16px;
+}
+
+.card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.card-id { display: flex; align-items: center; gap: 10px; }
+
+.card-avatar {
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.card-avatar.a1 { background: #F0EEE6; color: #6B6356; }
+.card-avatar.a2 { background: #E8EDE8; color: #4A6B50; }
+.card-avatar.a3 { background: #EDE8E0; color: #7A6850; }
+
+.card-name {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.card-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+}
+
+.badge-dot { width: 5px; height: 5px; border-radius: 50%; }
+
+.badge-healthy { background: var(--pale-grn-bg); color: var(--pale-grn-tx); }
+.badge-healthy .badge-dot { background: var(--pale-grn-tx); }
+
+.badge-expired  { background: var(--pale-red-bg); color: var(--pale-red-tx); }
+.badge-expired .badge-dot { background: var(--pale-red-tx); }
+
+.badge-refreshing { background: var(--pale-yel-bg); color: var(--pale-yel-tx); }
+.badge-refreshing .badge-dot { background: var(--pale-yel-tx); animation: pulse 1.4s ease-in-out infinite; }
+
+.badge-uninit   { background: var(--surface-2); color: var(--muted); }
+.badge-uninit .badge-dot { background: var(--muted-2); }
+
+.badge-active {
+  background: var(--pale-blu-bg);
+  color: var(--pale-blu-tx);
+}
+.badge-active .badge-dot { background: var(--pale-blu-tx); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.card-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.field-label {
+  font-family: var(--font-mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+}
+
+.field-value {
+  font-family: var(--font-mono);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.field-value.dim { color: var(--muted-2); }
+
+.card-actions {
+  display: flex;
+  gap: 0;
+  border-top: 1px solid var(--border);
+}
+
+.card-btn {
+  flex: 1;
+  padding: 11px;
+  background: transparent;
+  border: none;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all .15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.card-btn:not(:last-child) { border-right: 1px solid var(--border); }
+.card-btn:hover { background: var(--surface-2); color: var(--ink); }
+.card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.card-btn.primary { color: var(--ink); font-weight: 500; }
+.card-btn.primary:hover { background: var(--surface-2); }
+
+.card-btn svg { width: 13px; height: 13px; }
+
+.card-btn .spinner {
+  width: 12px; height: 12px;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--ink);
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ========== Drawer ========== */
+.drawer-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.25);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .3s ease;
+  z-index: 40;
+}
+
+.drawer-overlay.open { opacity: 1; pointer-events: auto; }
+
+.drawer {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 480px;
+  max-width: 100vw;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  transform: translateX(100%);
+  transition: transform .35s cubic-bezier(0.16,1,0.3,1);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+.drawer.open { transform: translateX(0); }
+
+.drawer-head {
+  padding: 24px 28px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.drawer-title {
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.drawer-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.drawer-close {
+  width: 32px; height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted);
+  transition: all .15s;
+}
+
+.drawer-close:hover { border-color: var(--muted-2); color: var(--ink); }
+
+.drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px;
+}
+
+.drawer-foot {
+  padding: 16px 28px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+/* ========== Form ========== */
+.form-group { margin-bottom: 24px; }
+
+.form-label {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.form-input, .form-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+  transition: border-color .2s;
+  resize: vertical;
+}
+
+.form-input:focus, .form-textarea:focus { border-color: var(--ink-2); }
+.form-input::placeholder, .form-textarea::placeholder { color: var(--muted-2); }
+
+.form-textarea { min-height: 72px; line-height: 1.5; }
+
+.form-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted-2);
+}
+
+/* ========== Token Gate ========== */
+.gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  text-align: center;
+}
+
+.gate-icon {
+  width: 48px; height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 20px;
+}
+
+.gate-icon svg { width: 24px; height: 24px; color: var(--muted); }
+
+.gate-title {
+  font-family: var(--font-serif);
+  font-size: 22px;
+  letter-spacing: -0.02em;
+  margin-bottom: 8px;
+}
+
+.gate-sub {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 24px;
+  max-width: 340px;
+}
+
+.gate-input {
+  width: 340px;
+  max-width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+  transition: border-color .2s;
+  text-align: center;
+}
+
+.gate-input:focus { border-color: var(--ink-2); }
+.gate-input::placeholder { color: var(--muted-2); }
+
+/* ========== Toast ========== */
+.toast-wrap {
+  position: fixed;
+  bottom: 24px; right: 24px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toast {
+  background: var(--ink);
+  color: #fff;
+  padding: 12px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  animation: toastIn .3s cubic-bezier(0.16,1,0.3,1);
+  max-width: 360px;
+}
+
+.toast.err { background: #9F2F2D; }
+.toast.ok  { background: #346538; }
+
+@keyframes toastIn {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+
+/* ========== Footer ========== */
+.footer {
+  padding: 32px 0 48px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted-2);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.footer a { color: var(--muted); text-decoration: none; }
+.footer a:hover { color: var(--ink); }
+
+/* ========== Empty State ========== */
+.empty {
+  text-align: center;
+  padding: 80px 20px;
+  color: var(--muted);
+}
+
+.empty svg { width: 40px; height: 40px; color: var(--border); margin-bottom: 16px; }
+
+/* ========== Reveal ========== */
+.reveal {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity .6s cubic-bezier(0.16,1,0.3,1), transform .6s cubic-bezier(0.16,1,0.3,1);
+}
+
+.reveal.in { opacity: 1; transform: translateY(0); }
+
+/* ========== Responsive ========== */
+@media (max-width: 768px) {
+  .app { padding: 0 20px; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .stat:nth-child(2) { border-right: none; }
+  .stat:nth-child(1), .stat:nth-child(2) { border-bottom: 1px solid var(--border); }
+  .hero-title { font-size: 20px; }
+  .hero { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .drawer { width: 100vw; }
+  .toolbar { flex-direction: column; align-items: stretch; }
+  .search-box { max-width: none; }
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted-2); }
+
+.live-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--pale-grn-tx);
+  display: inline-block;
+  animation: pulse 2s ease-in-out infinite;
+}
+</style>
+</head>
+<body>
+
+<div class="app" id="appMain" style="display:none">
+  <header class="header">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M12 0C12 6.627 6.627 12 0 12c6.627 0 12 5.373 12 12 0-6.627 5.373-12 12-12-6.627 0-12-5.373-12-12z" fill="url(#gemini-spark)"/>
+          <defs>
+            <linearGradient id="gemini-spark" x1="2" y1="2" x2="22" y2="22">
+              <stop offset="0" stop-color="#1BA1E3"/>
+              <stop offset="0.35" stop-color="#5489D6"/>
+              <stop offset="0.65" stop-color="#9B40D1"/>
+              <stop offset="1" stop-color="#E3397C"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <div class="brand-text">Gemini Free API <span>/ Console</span></div>
+    </div>
+    <div class="header-actions">
+      <div class="token-pill active" id="tokenPill" onclick="disconnect()">
+        <span class="token-dot"></span>
+        <span id="tokenText">已连接</span>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="fetchAccounts()">
+        <svg viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.24-4.24M14 8a6 6 0 01-10.24 4.24M12 2v4h-4M4 14v-4h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        刷新
+      </button>
+    </div>
+  </header>
+
+  <section class="hero reveal">
+    <div class="hero-left">
+      <h1 class="hero-title">管理你的 <em>Gemini</em> 账号池</h1>
+      <p class="hero-sub">查看状态、更新 Cookie、手动刷新 — 无需编辑 .env，无需重新构建镜像。</p>
+    </div>
+  </section>
+
+  <section class="stats reveal" id="statsBar">
+    <div class="stat">
+      <div class="stat-label">Total</div>
+      <div class="stat-value" id="statTotal">—</div>
+      <div class="stat-foot">configured accounts</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Healthy</div>
+      <div class="stat-value" id="statHealthy" style="color: var(--pale-grn-tx)">—</div>
+      <div class="stat-foot">ready to serve</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Active</div>
+      <div class="stat-value" id="statActive">—</div>
+      <div class="stat-foot" id="statActiveUntil">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Issues</div>
+      <div class="stat-value" id="statIssues" style="color: var(--pale-red-tx)">—</div>
+      <div class="stat-foot">need attention</div>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="section-head">
+      <div class="section-title">Accounts</div>
+      <div class="section-meta">
+        <span class="live-dot"></span>
+        <span id="lastSync">auto-refresh 15s</span>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="search-box">
+        <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/><path d="M11 11l3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        <input type="text" id="searchInput" placeholder="搜索账号 ID…" oninput="renderAccounts()">
+      </div>
+      <button class="btn btn-primary" onclick="openAddDrawer()">
+        <svg viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        添加账号
+      </button>
+    </div>
+
+    <div class="accounts-grid" id="accountsGrid"></div>
+  </section>
+
+  <footer class="footer">
+    <span>Gemini Free API Console</span>
+    <span>v1.0 · <a href="/docs" target="_blank">API Docs</a></span>
+  </footer>
+</div>
+
+<!-- Token Gate -->
+<div class="app" id="appGate">
+  <div class="gate">
+    <div class="gate-icon">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 1a4 4 0 00-4 4v6a4 4 0 008 0V5a4 4 0 00-4-4z" stroke="currentColor" stroke-width="1.5"/><path d="M5 11v1a7 7 0 0014 0v-1M12 19v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    </div>
+    <div class="gate-title">连接到管理后台</div>
+    <div class="gate-sub">输入 COOKIE_SYNC_TOKEN 以管理你的 Gemini 账号池。Token 会保存在本地浏览器中。</div>
+    <input class="gate-input" type="password" id="gateToken" placeholder="COOKIE_SYNC_TOKEN" onkeydown="if(event.key==='Enter')connect()">
+  </div>
+</div>
+
+<!-- Drawer -->
+<div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title" id="drawerTitle">编辑 Cookie</div>
+      <div class="drawer-sub" id="drawerSub">account: —</div>
+    </div>
+    <button class="drawer-close" onclick="closeDrawer()">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body">
+    <div class="form-group">
+      <label class="form-label">Account ID</label>
+      <input class="form-input" id="formAccountId" placeholder="acc1" disabled>
+      <div class="form-hint">账号唯一标识，创建后不可修改</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">__Secure-1PSID</label>
+      <textarea class="form-textarea" id="formPSID" placeholder="gO8bZ..." style="min-height:56px"></textarea>
+      <div class="form-hint">从 gemini.google.com 的 Cookie 中获取</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">__Secure-1PSIDTS</label>
+      <textarea class="form-textarea" id="formPSIDTS" placeholder="gsidts..." style="min-height:56px"></textarea>
+      <div class="form-hint">会话令牌，可留空让系统自动轮换获取</div>
+    </div>
+  </div>
+  <div class="drawer-foot">
+    <button class="btn btn-ghost" onclick="closeDrawer()">取消</button>
+    <button class="btn btn-primary" id="drawerSave" onclick="saveDrawer()">保存</button>
+  </div>
+</aside>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+const State = {
+  token: '',
+  accounts: [],
+  editing: null,
+  refreshTimer: null,
+};
+
+// ===== Token management =====
+function getToken() { return localStorage.getItem('gfa_console_token') || ''; }
+function setToken(t) { localStorage.setItem('gfa_console_token', t); }
+function clearToken() { localStorage.removeItem('gfa_console_token'); }
+
+function connect() {
+  const input = document.getElementById('gateToken');
+  const t = input.value.trim();
+  if (!t) { toast('请输入 Token', 'err'); return; }
+  setToken(t);
+  State.token = t;
+  verifyAndEnter();
+}
+
+function disconnect() {
+  clearToken();
+  State.token = '';
+  State.accounts = [];
+  stopAutoRefresh();
+  document.getElementById('appMain').style.display = 'none';
+  document.getElementById('appGate').style.display = 'block';
+  document.getElementById('gateToken').value = '';
+}
+
+async function verifyAndEnter() {
+  try {
+    const res = await fetch('/admin/accounts', { headers: apiHeaders() });
+    if (res.status === 401 || res.status === 403) {
+      clearToken();
+      State.token = '';
+      toast('Token 无效或 COOKIE_SYNC_TOKEN 未配置', 'err');
+      return;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    document.getElementById('appGate').style.display = 'none';
+    document.getElementById('appMain').style.display = 'block';
+    initReveal();
+    fetchAccounts();
+    startAutoRefresh();
+  } catch(e) {
+    toast('连接失败: ' + e.message, 'err');
+  }
+}
+
+// ===== API =====
+function apiHeaders() {
+  return { 'Content-Type': 'application/json', 'X-Cookie-Sync-Token': State.token };
+}
+
+async function fetchAccounts() {
+  try {
+    const res = await fetch('/admin/accounts', { headers: apiHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    State.accounts = data.accounts || [];
+    renderAll();
+    document.getElementById('lastSync').textContent = 'updated ' + fmtRel(Date.now());
+  } catch(e) {
+    toast('获取账号列表失败: ' + e.message, 'err');
+  }
+}
+
+async function apiUpdateCookies(id, psid, psidts) {
+  const res = await fetch('/admin/accounts/' + id + '/cookies', {
+    method: 'POST', headers: apiHeaders(),
+    body: JSON.stringify({ secure_1psid: psid, secure_1psidts: psidts, source: 'console' })
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error?.message || 'HTTP ' + res.status);
+  }
+  return res.json();
+}
+
+async function apiRefresh(id) {
+  const res = await fetch('/admin/accounts/' + id + '/refresh', {
+    method: 'POST', headers: apiHeaders()
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error?.message || 'HTTP ' + res.status);
+  }
+  return res.json();
+}
+
+async function apiTest() {
+  const t0 = Date.now();
+  const res = await fetch('/v1/models', { headers: apiHeaders() });
+  const latency = Date.now() - t0;
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return { ok: true, latency };
+}
+
+// ===== Render =====
+function renderAll() { renderStats(); renderAccounts(); }
+
+function renderStats() {
+  const a = State.accounts;
+  document.getElementById('statTotal').textContent = a.length;
+  document.getElementById('statHealthy').textContent = a.filter(x => x.healthy).length;
+  document.getElementById('statActive').textContent = a.filter(x => x.active).length;
+  document.getElementById('statIssues').textContent = a.filter(x => !x.healthy).length;
+  const act = a.find(x => x.active);
+  document.getElementById('statActiveUntil').textContent =
+    (act && act.active_until) ? 'until ' + fmtTime(act.active_until) : '—';
+}
+
+function stateMeta(s) {
+  switch(s) {
+    case 'healthy':    return { cls: 'badge-healthy',    label: 'Healthy' };
+    case 'expired':    return { cls: 'badge-expired',    label: 'Expired' };
+    case 'refreshing': return { cls: 'badge-refreshing', label: 'Refreshing' };
+    case 'needs_manual_login': return { cls: 'badge-expired', label: 'Manual Login' };
+    case 'uninitialized': return { cls: 'badge-uninit', label: 'Uninitialized' };
+    default: return { cls: 'badge-uninit', label: s || 'Unknown' };
+  }
+}
+
+function avatarClass(id) { return 'a' + ((id || '').charCodeAt(0) % 3 + 1); }
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return isNaN(d) ? '—' : d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtRel(ts) {
+  const diff = Math.floor((Date.now() - ts) / 1000);
+  if (diff < 5) return 'just now';
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  return Math.floor(diff/3600) + 'h ago';
+}
+
+function fmtRelISO(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return isNaN(d) ? '—' : fmtRel(d.getTime());
+}
+
+function renderAccounts() {
+  const grid = document.getElementById('accountsGrid');
+  const q = (document.getElementById('searchInput').value || '').trim().toLowerCase();
+  const accs = State.accounts.filter(a => !q || a.id.toLowerCase().includes(q));
+
+  if (accs.length === 0) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><svg viewBox="0 0 48 48" fill="none"><rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2"/><path d="M14 20h20M14 28h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><div>没有匹配的账号</div></div>`;
+    return;
+  }
+
+  grid.innerHTML = accs.map((a) => {
+    const meta = stateMeta(a.state);
+    const isRefreshing = a.state === 'refreshing';
+    return `
+    <div class="account-card">
+      <div class="card-top">
+        <div class="card-header">
+          <div class="card-id">
+            <div class="card-avatar ${avatarClass(a.id)}">${a.id.slice(0,2).toUpperCase()}</div>
+            <div>
+              <div class="card-name">${a.id}</div>
+              <div class="card-sub">${a.cookie_source || 'env'}</div>
+            </div>
+          </div>
+          <span class="badge ${meta.cls}"><span class="badge-dot"></span>${meta.label}</span>
+        </div>
+        <div class="card-fields">
+          <div class="field-row">
+            <span class="field-label">Proxy</span>
+            <span class="field-value ${a.proxy_url ? '' : 'dim'}">${a.proxy_url || 'default'}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-label">Last Sync</span>
+            <span class="field-value">${fmtRelISO(a.last_cookie_sync)}</span>
+          </div>
+          <div class="field-row">
+            <span class="field-label">Validated</span>
+            <span class="field-value">${fmtRelISO(a.last_validated)}</span>
+          </div>
+          ${a.last_error ? `<div class="field-row"><span class="field-label">Error</span><span class="field-value" style="color:var(--pale-red-tx);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${a.last_error}">${a.last_error}</span></div>` : ''}
+          ${a.active ? `<div class="field-row"><span class="field-label">Active Until</span><span class="field-value" style="color:var(--pale-blu-tx)">${fmtTime(a.active_until)}</span></div>` : ''}
+        </div>
+      </div>
+      <div class="card-actions">
+        <button class="card-btn primary" onclick="openEditDrawer('${a.id}')">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M11 2l3 3-8 8H3v-3l8-8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+          Cookie
+        </button>
+        <button class="card-btn" onclick="doTest(this)" ${isRefreshing ? 'disabled' : ''}>
+          <svg viewBox="0 0 16 16" fill="none"><path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Test
+        </button>
+        <button class="card-btn" onclick="doRefresh('${a.id}', this)" ${isRefreshing ? 'disabled' : ''}>
+          ${isRefreshing ? '<span class="spinner"></span>' : '<svg viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.24-4.24M14 8a6 6 0 01-10.24 4.24M12 2v4h-4M4 14v-4h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>'}
+          ${isRefreshing ? 'Refreshing' : 'Refresh'}
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ===== Actions =====
+async function doTest(btn) {
+  const orig = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner"></span> Testing';
+  btn.disabled = true;
+  try {
+    const result = await apiTest();
+    toast('API 可用 · ' + result.latency + 'ms', 'ok');
+  } catch(e) {
+    toast('测试失败: ' + e.message, 'err');
+  } finally {
+    btn.innerHTML = orig;
+    btn.disabled = false;
+  }
+}
+
+async function doRefresh(id, btn) {
+  const orig = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner"></span> Refreshing';
+  btn.disabled = true;
+  try {
+    await apiRefresh(id);
+    toast('账号 ' + id + ' 刷新成功', 'ok');
+    fetchAccounts();
+  } catch(e) {
+    toast('刷新失败: ' + e.message, 'err');
+  } finally {
+    btn.innerHTML = orig;
+    btn.disabled = false;
+  }
+}
+
+// ===== Drawer =====
+function openEditDrawer(id) {
+  const acc = State.accounts.find(a => a.id === id);
+  if (!acc) return;
+  State.editing = id;
+  document.getElementById('drawerTitle').textContent = '更新 Cookie';
+  document.getElementById('drawerSub').textContent = 'account: ' + id;
+  document.getElementById('formAccountId').value = id;
+  document.getElementById('formAccountId').disabled = true;
+  document.getElementById('formPSID').value = '';
+  document.getElementById('formPSIDTS').value = '';
+  showDrawer();
+}
+
+function openAddDrawer() {
+  State.editing = 'add';
+  document.getElementById('drawerTitle').textContent = '添加账号';
+  document.getElementById('drawerSub').textContent = 'new account';
+  document.getElementById('formAccountId').value = '';
+  document.getElementById('formAccountId').disabled = false;
+  document.getElementById('formPSID').value = '';
+  document.getElementById('formPSIDTS').value = '';
+  showDrawer();
+}
+
+function showDrawer() {
+  document.getElementById('drawer').classList.add('open');
+  document.getElementById('drawerOverlay').classList.add('open');
+}
+
+function closeDrawer() {
+  document.getElementById('drawer').classList.remove('open');
+  document.getElementById('drawerOverlay').classList.remove('open');
+  State.editing = null;
+}
+
+async function saveDrawer() {
+  const id = document.getElementById('formAccountId').value.trim();
+  const psid = document.getElementById('formPSID').value.trim();
+  const psidts = document.getElementById('formPSIDTS').value.trim();
+
+  if (!id) { toast('请填写 Account ID', 'err'); return; }
+  if (!psid) { toast('请填写 __Secure-1PSID', 'err'); return; }
+
+  const btn = document.getElementById('drawerSave');
+  const orig = btn.textContent;
+  btn.textContent = '保存中…';
+  btn.disabled = true;
+
+  try {
+    await apiUpdateCookies(id, psid, psidts);
+    toast(State.editing === 'add' ? '账号 ' + id + ' 已添加' : '账号 ' + id + ' Cookie 已更新', 'ok');
+    closeDrawer();
+    fetchAccounts();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'err');
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+}
+
+// ===== Auto Refresh =====
+function startAutoRefresh() {
+  stopAutoRefresh();
+  State.refreshTimer = setInterval(fetchAccounts, 15000);
+}
+
+function stopAutoRefresh() {
+  if (State.refreshTimer) { clearInterval(State.refreshTimer); State.refreshTimer = null; }
+}
+
+// ===== Toast =====
+function toast(msg, type) {
+  const wrap = document.getElementById('toastWrap');
+  const el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(8px)';
+    el.style.transition = 'all .3s';
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
+}
+
+// ===== Reveal =====
+let revealObserver = null;
+function initReveal() {
+  if (revealObserver) return;
+  revealObserver = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
+  }, { threshold: 0.05 });
+  document.querySelectorAll('.reveal').forEach(el => {
+    el.classList.remove('in');
+    revealObserver.observe(el);
+  });
+}
+
+// ===== Init =====
+State.token = getToken();
+if (State.token) {
+  verifyAndEnter();
+}
+</script>
+</body>
+</html>

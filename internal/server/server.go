@@ -39,6 +39,7 @@ func NewGeminiFreeAPI(log *zap.Logger, cfg *configs.Config) *fiber.App {
 
 	app.Get("/docs", ScalarUI)
 	app.Get("/openapi.json", OpenAPISpec)
+	app.Get("/console", ConsoleUI)
 
 	app.Get("/health", HealthCheck)
 
