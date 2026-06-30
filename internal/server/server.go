@@ -19,7 +19,11 @@ import (
 // New creates a new Fiber app instance
 func NewGeminiFreeAPI(log *zap.Logger, cfg *configs.Config) *fiber.App {
 	app := fiber.New(fiber.Config{
-		AppName: "Gemini Free API",
+		AppName:      "Gemini Free API",
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 0, // streaming responses need no write deadline
+		IdleTimeout:  30 * time.Second,
+		BodyLimit:    32 * 1024 * 1024,
 	})
 
 	app.Use(cors.New(cors.Config{

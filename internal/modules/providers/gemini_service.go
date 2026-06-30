@@ -1283,6 +1283,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	var lastContentAt time.Time
 	var buf bytes.Buffer
 	continuityChecked := expectedConversationCID == ""
+	metadataStored := false
 	finalizeStreamConversation := func() error {
 		metadata := extractConversationMetadataFromBuffer(buf.Bytes())
 		if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
@@ -1428,15 +1429,20 @@ readLoop:
 				debugCapture.WriteRaw(result.data, time.Since(requestStart))
 			}
 			entryTrace.CaptureChunk(result.data, time.Since(requestStart))
-			metadata := extractConversationMetadataFromBuffer(buf.Bytes())
-			if cid, _ := metadata["cid"].(string); cid != "" {
-				if !continuityChecked {
-					if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
-						return err
+			if !continuityChecked || !metadataStored {
+				metadata := extractConversationMetadataFromBuffer(buf.Bytes())
+				if cid, _ := metadata["cid"].(string); cid != "" {
+					if !continuityChecked {
+						if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
+							return err
+						}
+						continuityChecked = true
 					}
-					continuityChecked = true
+					if !metadataStored {
+						c.updateConversation(config.ConversationID, metadata)
+						metadataStored = true
+					}
 				}
-				c.updateConversation(config.ConversationID, metadata)
 			}
 			parseBuffer := recentBytes(buf.Bytes(), maxStreamParseBufferBytes)
 			if !onEvent(parseBuffer, "") {
