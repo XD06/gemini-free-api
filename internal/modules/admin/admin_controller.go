@@ -89,7 +89,7 @@ func (c *Controller) HandleUpdateCookies(ctx fiber.Ctx) error {
 	}
 
 	accountID := ctx.Params("account_id")
-	reqCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := manager.UpdateAccountCookies(reqCtx, accountID, req.Secure1PSID, req.Secure1PSIDTS); err != nil {
 		if c.log != nil {
@@ -104,13 +104,13 @@ func (c *Controller) HandleUpdateCookies(ctx fiber.Ctx) error {
 	}
 
 	if c.log != nil {
-		c.log.Info("admin cookie update succeeded",
+		c.log.Info("admin cookie update accepted, validating in background",
 			zap.String("account", accountID),
 			zap.String("source", req.Source),
 		)
-		c.logAccountAudit("cookie_sync_ok", accountID, req.Source, "validated")
+		c.logAccountAudit("cookie_sync_ok", accountID, req.Source, "accepted")
 	}
-	return ctx.JSON(fiber.Map{"status": "ok", "account": accountID})
+	return ctx.JSON(fiber.Map{"status": "ok", "account": accountID, "message": "cookies saved, validating in background"})
 }
 
 func (c *Controller) HandleRefreshAccount(ctx fiber.Ctx) error {

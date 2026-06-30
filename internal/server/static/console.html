@@ -1516,13 +1516,15 @@ async function saveDrawer() {
       // Edit mode: update cookies if PSID provided, then update proxy.
       if (psid) {
         await apiUpdateCookies(id, psid, psidts);
-        toast('账号 ' + id + ' Cookie 已更新', 'ok');
+        toast('账号 ' + id + ' Cookie 已保存，正在后台验证…', 'ok');
       }
       await apiUpdateProxy(id, proxy);
       if (!psid) toast('账号 ' + id + ' 代理已更新', 'ok');
     }
     closeDrawer();
     fetchAccounts();
+    // Auto-refresh after 5s to show validation result.
+    setTimeout(() => fetchAccounts(), 5000);
   } catch(e) {
     toast('保存失败: ' + e.message, 'err');
   } finally {

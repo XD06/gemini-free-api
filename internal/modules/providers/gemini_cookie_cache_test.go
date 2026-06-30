@@ -12,7 +12,7 @@ import (
 func TestApplyCookieCacheFillsMissingAccountCookies(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
-	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "worker"); err != nil {
+	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "", "worker"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -32,7 +32,7 @@ func TestApplyCookieCacheFillsMissingAccountCookies(t *testing.T) {
 func TestApplyCookieCacheOverridesEnvCookies(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
-	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "worker"); err != nil {
+	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "", "worker"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,7 +57,7 @@ func TestApplyCookieCacheOverridesEnvCookies(t *testing.T) {
 func TestSaveAccountCookieCacheWritesPrivateFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
-	if err := saveAccountCookieCache(path, "acc1", "psid", "ts", "worker"); err != nil {
+	if err := saveAccountCookieCache(path, "acc1", "psid", "ts", "", "worker"); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)

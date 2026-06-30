@@ -224,7 +224,71 @@ func (p *ClientPool) UpdateAccountCookies(ctx context.Context, accountID, secure
 	if client == nil {
 		return fmt.Errorf("Gemini account %q not found", accountID)
 	}
-	return client.UpdateCookies(ctx, secure1PSID, secure1PSIDTS)
+
+	secure1PSID = cleanCookie(secure1PSID)
+	secure1PSIDTS = cleanCookie(secure1PSIDTS)
+	if secure1PSID == "" {
+		return fmt.Errorf("secure_1psid is required")
+	}
+
+	// Update cookies in memory immediately.
+	client.cookies.mu.Lock()
+	client.cookies.Secure1PSID = secure1PSID
+	client.cookies.Secure1PSIDTS = secure1PSIDTS
+	client.cookies.UpdatedAt = time.Now()
+	client.cookies.mu.Unlock()
+
+	// Persist to cache file immediately so cookies survive restarts.
+	if client.cookieCache {
+		proxyURL := client.proxyURL
+		if err := saveAccountCookieCache(client.cookieCachePath, accountID, secure1PSID, secure1PSIDTS, proxyURL, "console"); err != nil && p.log != nil {
+			p.log.Warn("failed to save account cookie cache on update",
+				zap.String("account", accountID), zap.Error(err))
+		}
+	}
+
+	// Mark as refreshing so the console shows the validating state.
+	client.setAccountState(AccountStateRefreshing, nil)
+
+	// Validate in background — this makes the API call return instantly.
+	go func() {
+		if err := client.refreshSessionToken(); err != nil {
+			client.setAccountState(AccountStateExpired, err)
+			client.mu.Lock()
+			client.healthy = false
+			client.mu.Unlock()
+			if p.log != nil {
+				p.log.Warn("async cookie validation failed",
+					zap.String("account", accountID), zap.Error(err))
+			}
+			return
+		}
+
+		// Validation succeeded — persist full cookie set and mark healthy.
+		client.httpClient.SetCommonCookies(client.cookies.ToHTTPCookies()...)
+		if err := client.SaveCachedCookies(); err != nil && p.log != nil {
+			p.log.Warn("failed to save updated cookies after async validation",
+				zap.String("account", accountID), zap.Error(err))
+		}
+		client.cookieSource = "console"
+
+		client.statusMu.Lock()
+		client.healthState = AccountStateHealthy
+		client.lastError = ""
+		client.lastValidated = time.Now()
+		client.lastCookieSync = time.Now()
+		client.statusMu.Unlock()
+
+		client.mu.Lock()
+		client.healthy = true
+		client.mu.Unlock()
+
+		if p.log != nil {
+			p.log.Info("async cookie validation succeeded", zap.String("account", accountID))
+		}
+	}()
+
+	return nil
 }
 
 func (p *ClientPool) RefreshAccount(ctx context.Context, accountID string) error {
@@ -912,6 +976,14 @@ func (p *ClientPool) AddAccount(ctx context.Context, accountID, secure1PSID, sec
 	p.stayByID[accountID] = accountStayDuration(account)
 	p.mu.Unlock()
 
+	// Persist to cookie cache file so the account survives restarts.
+	if p.cfg.Gemini.CookieCache {
+		if err := saveAccountCookieCache(p.cfg.Gemini.CookieCachePath, accountID, secure1PSID, secure1PSIDTS, proxyURL, "console"); err != nil && p.log != nil {
+			p.log.Warn("failed to persist new account to cookie cache",
+				zap.String("account", accountID), zap.Error(err))
+		}
+	}
+
 	if p.log != nil {
 		p.log.Info("Gemini account added via console",
 			zap.String("account", accountID),
@@ -968,6 +1040,14 @@ func (p *ClientPool) RemoveAccount(ctx context.Context, accountID string) error 
 	}
 	p.mu.Unlock()
 
+	// Remove from cookie cache file so it doesn't reappear on restart.
+	if p.cfg.Gemini.CookieCache {
+		if err := removeAccountCookieCache(p.cfg.Gemini.CookieCachePath, accountID); err != nil && p.log != nil {
+			p.log.Warn("failed to remove account from cookie cache",
+				zap.String("account", accountID), zap.Error(err))
+		}
+	}
+
 	if err := client.Close(); err != nil && p.log != nil {
 		p.log.Warn("failed to close removed account", zap.String("account", accountID), zap.Error(err))
 	}
@@ -1015,6 +1095,14 @@ func (p *ClientPool) UpdateAccountProxy(ctx context.Context, accountID, proxyURL
 	client.httpClient = newReqClient
 	client.rawHTTPClient = newRawClient
 	client.mu.Unlock()
+
+	// Persist proxy to cookie cache file so it survives restarts.
+	if p.cfg.Gemini.CookieCache {
+		if err := saveAccountProxyCache(p.cfg.Gemini.CookieCachePath, accountID, proxyURL); err != nil && p.log != nil {
+			p.log.Warn("failed to persist proxy to cookie cache",
+				zap.String("account", accountID), zap.Error(err))
+		}
+	}
 
 	if p.log != nil {
 		p.log.Info("Gemini account proxy updated via console",

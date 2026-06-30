@@ -847,7 +847,7 @@ func (c *Client) UpdateCookies(ctx context.Context, secure1PSID, secure1PSIDTS s
 		c.log.Warn("failed to save updated cookies", zap.String("account", c.accountID), zap.Error(err))
 	}
 	if c.cookieCache {
-		if err := saveAccountCookieCache(c.cookieCachePath, c.accountID, secure1PSID, secure1PSIDTS, "worker"); err != nil && c.log != nil {
+		if err := saveAccountCookieCache(c.cookieCachePath, c.accountID, secure1PSID, secure1PSIDTS, c.proxyURL, "worker"); err != nil && c.log != nil {
 			c.log.Warn("failed to save account cookie cache", zap.String("account", c.accountID), zap.Error(err))
 		}
 	}
