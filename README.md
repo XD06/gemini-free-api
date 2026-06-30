@@ -9,26 +9,13 @@
 | 能力 | OpenAI 兼容 | Claude 兼容 | Gemini 原生兼容 | 说明 |
 |:---|:---:|:---:|:---:|:---|
 | 普通文本对话 | 支持 | 支持 | 支持 | 三种协议都会转发到 Gemini  |
-| 流式输出 | 实时流式 | 模拟流式 | 模拟流式 | 只有 OpenAI 兼容接口接入 provider 实时流 |
+| 流式输出 | **实时流式** | 模拟流式 | 模拟流式 | 只有 OpenAI 兼容接口接入 provider 实时流 |
 | Thinking Level | **支持** | 未接入 | 未接入 | OpenAI 支持 `reasoning_effort` / `reasoning.effort` / `thinking_level` |
 | 思考内容输出 | 支持 | 未接入 | 未接入 | OpenAI 流式通过 `delta.reasoning_content` 输出 |
 | 服务端多轮上下文 | **实验性支持** | 未接入 | 未接入 | 复用 Gemini Web 的 `c/r/rc/context token`，可让多轮对话落在同一 Gemini Web 记录；该能力依赖网页端私有状态，偶发 1097/1060 或记录断裂时会回退 |
 | 图片/文件输入 | 支持 | 支持 | 支持 | OpenAI 支持 data URL、远程 URL、`file_id` 和 `/files` 上传；文件会先上传到 Google `content-push` |
 | 图片生成 | **暂不支持** | 不支持 | 不支持 | OpenAI `/images/generations` |
 | 工具调用 | **实验性桥接** | 桥接支持 | 桥接支持 | 通过 prompt 约束输出工具调用 JSON，非 Gemini Web 原生 tool calling；复杂多轮和格式稳定性弱于纯聊天 |
-
-## 使用建议与稳定性边界
-
-本项目最稳定、最流畅的场景是 **OpenAI 兼容接口 + 普通纯文本聊天 + 不启用工具**。这条路径可以直接使用 Gemini Web 的实时流式响应，首字节和持续输出体验最好，也最不容易污染 Gemini Web 的服务端话题记录。
-
-服务端多轮上下文和工具调用都属于实验性增强：
-
-- 服务端多轮上下文依赖 Gemini Web 私有的 `cid/rid/rcid/context token`。这些字段不是公开 API，Google 调整网页端行为、账号风控、出口 IP 变化、`source-path` 差异或模型差异，都可能导致续聊返回 `BardErrorInfo [1097]`、`[1060]`、空正文或新建记录。
-- 程序会在“还没有向客户端输出正文”时尽量回退到完整 OpenAI 历史 prompt，保证客户端不要空白；但回退后不能保证仍落在 Gemini Web 同一条网页记录中。
-- 工具调用不是 Gemini Web 原生 tool calling。当前实现会让 Gemini 在临时规划会话中按约定输出 `{"tool_calls": ...}`，再映射回 OpenAI 工具调用格式。因此工具 schema、工具结果和多轮历史可能增加 prompt 复杂度，出现格式错乱、工具参数污染或一次性输出的概率高于纯聊天。
-- 如果客户端只是普通聊天，请不要传 `tools` 字段。只要请求里没有工具字段，工具桥接不会介入，流式路径保持最短。
-
-推荐默认策略：日常聊天关闭工具；需要搜索、MCP 或外部工具时再启用工具，并把它视为“尽力而为”的实验能力。对稳定性要求高的自动化任务，建议客户端保留完整 `messages` 历史，不能只依赖 Gemini Web 服务端上下文。
 
 ## 快速启动
 
@@ -174,8 +161,6 @@ curl http://localhost:8787/openai/v1/files \
 不传 thinking 字段时使用 Gemini Web 默认档位。
 
 ## 模型列表
-
-当前项目按 Gemini Web 界面实际使用的内部模型 ID 发送请求，并对 OpenAI 客户端暴露更容易理解的别名。`/openai/v1/models` 返回的是可传入 `model` 字段的名字。
 
 | 可传模型名 | 传参方式 | 说明 |
 |:---|:---|:---|
