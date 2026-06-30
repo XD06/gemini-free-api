@@ -27,6 +27,12 @@ go run cmd/server/main.go
 
 ### 基础配置
 
+**获取cookie**：
+
+1. 请访问[gemini.google.com](https://gemini.google.com/)并登录
+2. 按`F12` →**Application**→**Storage**→ **Cookies**
+3. 复制`__Secure-1PSID`和`__Secure-1PSIDTS`的值
+
 ```env
 PORT=8787
 COOKIE_SYNC_TOKEN=你的管理密钥
