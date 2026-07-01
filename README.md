@@ -77,7 +77,7 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 
 控制台内置 Playground 聊天界面，支持模型切换、Thinking Level 调节和流式对话测试。
 
-![Playground](./asset/playground_metool.gif)
+![Playground](./asset/playground.gif)
 
 ## 调用示例
 
