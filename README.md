@@ -206,7 +206,7 @@ go test ./...
 
 维护者文档：
 
-- [技术细节](docs/technical-details.md) — 多轮上下文、工具桥接、容错策略、排错开关、环境变量完整列表
+- [技术细节](docs/technical-details.md) — 多轮上下文、工具桥接、Cookie 快速同步与 Worker、容错策略、排错开关、环境变量完整列表
 - [Core Bridge Handoff](docs/core-bridge-handoff.md) — 核心边界和改动入口
 - [Stream Pipeline](docs/openai-gemini-stream-pipeline.md) — 完整流程说明
 

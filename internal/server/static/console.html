@@ -816,16 +816,83 @@ body {
 
 .pg-msg-bubble pre code { background: none; padding: 0; }
 
-.pg-msg .thinking {
-  font-size: 12px;
-  color: var(--muted);
-  font-style: italic;
-  margin-bottom: 6px;
-  padding: 6px 10px;
-  background: rgba(0,0,0,0.03);
-  border-radius: 4px;
-  border-left: 2px solid var(--muted-2);
+/* Thinking block */
+.pg-thinking {
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface-2);
 }
+
+.pg-thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  transition: background .15s;
+}
+
+.pg-thinking-header:hover { background: rgba(0,0,0,0.025); }
+
+.pg-thinking-header .pg-think-icon {
+  width: 14px; height: 14px;
+  flex-shrink: 0;
+  color: var(--muted-2);
+  transition: transform .2s;
+}
+
+.pg-thinking.collapsed .pg-thinking-header .pg-think-icon {
+  transform: rotate(-90deg);
+}
+
+.pg-thinking-header .pg-think-label { flex: 1; }
+
+.pg-thinking-header .pg-think-status {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted-2);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pg-thinking-header .pg-think-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #8B7FE8;
+  animation: pg-think-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pg-think-pulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+.pg-thinking-body {
+  padding: 8px 12px 10px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.pg-thinking-body p { margin: 0 0 6px; }
+.pg-thinking-body p:last-child { margin-bottom: 0; }
+.pg-thinking-body code { font-family: var(--font-mono); font-size: 11.5px; }
+.pg-thinking-body pre { background: rgba(0,0,0,0.04); padding: 8px 10px; border-radius: 4px; overflow-x: auto; margin: 6px 0; }
+.pg-thinking-body pre code { background: none; padding: 0; }
+.pg-thinking-body ul, .pg-thinking-body ol { padding-left: 18px; margin: 4px 0; }
+.pg-thinking-body li { margin-bottom: 2px; }
+
+.pg-thinking.collapsed .pg-thinking-body { display: none; }
 
 .pg-input-area {
   border-top: 1px solid var(--border);
@@ -1044,10 +1111,9 @@ body {
           <option value="gemini-3.1-pro">gemini-3.1-pro</option>
         </select>
         <select class="pg-select" id="pgThinking">
-          <option value="">Thinking: Default</option>
-          <option value="low">Thinking: Low</option>
-          <option value="medium">Thinking: Medium</option>
-          <option value="high">Thinking: High</option>
+          <option value="">Thinking: 关闭</option>
+          <option value="low">Thinking: Standard</option>
+          <option value="high">Thinking: Extended</option>
         </select>
         <button class="pg-clear" onclick="clearChat()">清空对话</button>
       </div>
@@ -1625,7 +1691,8 @@ function escapeHtml(text) {
 }
 
 function renderMarkdown(text) {
-  // Simple markdown: code blocks, inline code, bold, line breaks
+  if (!text) return '';
+  // Simple markdown: code blocks, inline code, bold, lists, line breaks
   let html = escapeHtml(text);
   // Code blocks
   html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
@@ -1635,9 +1702,19 @@ function renderMarkdown(text) {
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
   // Bold
   html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  // Line breaks
+  // Unordered lists
+  html = html.replace(/^(?:- |\* )(.+)$/gm, '<li>$1</li>');
+  html = html.replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, '<ul>$1</ul>');
+  // Ordered lists
+  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+  // Paragraphs: split on double newlines
+  html = html.replace(/\n\n/g, '</p><p>');
+  // Single newlines to <br> (but not inside pre/ul)
   html = html.replace(/\n/g, '<br>');
-  return html;
+  // Clean up: remove <br> inside <ul> and <pre>
+  html = html.replace(/<ul>([\s\S]*?)<\/ul>/g, (m) => m.replace(/<br>/g, ''));
+  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (m) => m.replace(/<br>/g, '\n'));
+  return '<p>' + html + '</p>';
 }
 
 function renderPgMessages() {
@@ -1646,11 +1723,24 @@ function renderPgMessages() {
     container.innerHTML = `<div class="pg-empty"><svg viewBox="0 0 48 48" fill="none"><path d="M8 36c0-4 4-6 8-6s8 2 8 6M24 36c0-4 4-6 8-6s8 2 8 6M16 30v-6M32 30v-6M12 18l4-2 4 2M28 18l4-2 4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><div>发送消息开始对话</div><div style="font-size:12px;margin-top:4px">使用 OpenAI 兼容流式接口，真实测试模型回复</div></div>`;
     return;
   }
-  container.innerHTML = PG.messages.map(m => {
+  container.innerHTML = PG.messages.map((m, idx) => {
     const avatar = m.role === 'user' ? 'U' : 'AI';
     let bubble = '';
     if (m.thinking) {
-      bubble += '<div class="thinking">💭 ' + escapeHtml(m.thinking) + '</div>';
+      const isLast = idx === PG.messages.length - 1;
+      const isStreaming = PG.sending && isLast;
+      const collapsed = m.thinkingCollapsed ? 'collapsed' : '';
+      const statusHtml = isStreaming
+        ? '<span class="pg-think-status"><span class="pg-think-dot"></span>思考中…</span>'
+        : '<span class="pg-think-status">已完成</span>';
+      bubble += `<div class="pg-thinking ${collapsed}" data-msg-idx="${idx}">`;
+      bubble += `<div class="pg-thinking-header" onclick="toggleThinking(${idx})">`;
+      bubble += '<svg class="pg-think-icon" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      bubble += '<span class="pg-think-label">思考过程</span>';
+      bubble += statusHtml;
+      bubble += '</div>';
+      bubble += '<div class="pg-thinking-body">' + renderMarkdown(m.thinking) + '</div>';
+      bubble += '</div>';
     }
     bubble += '<div class="pg-msg-content">' + renderMarkdown(m.content) + '</div>';
     return `<div class="pg-msg ${m.role}">
@@ -1659,6 +1749,13 @@ function renderPgMessages() {
     </div>`;
   }).join('');
   container.scrollTop = container.scrollHeight;
+}
+
+function toggleThinking(idx) {
+  if (PG.messages[idx]) {
+    PG.messages[idx].thinkingCollapsed = !PG.messages[idx].thinkingCollapsed;
+    renderPgMessages();
+  }
 }
 
 function clearChat() {
@@ -1677,7 +1774,7 @@ async function pgSend() {
   input.style.height = 'auto';
 
   // Add empty assistant message for streaming
-  PG.messages.push({ role: 'assistant', content: '', thinking: '' });
+  PG.messages.push({ role: 'assistant', content: '', thinking: '', thinkingCollapsed: false });
   PG.sending = true;
 
   const btn = document.getElementById('pgSend');
@@ -1720,6 +1817,16 @@ async function pgSend() {
     const decoder = new TextDecoder();
     let buffer = '';
     const assistantIdx = PG.messages.length - 1;
+    let renderPending = false;
+
+    function scheduleRender() {
+      if (renderPending) return;
+      renderPending = true;
+      requestAnimationFrame(() => {
+        renderPending = false;
+        renderPgMessages();
+      });
+    }
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1742,7 +1849,7 @@ async function pgSend() {
           if (delta.reasoning_content) {
             PG.messages[assistantIdx].thinking += delta.reasoning_content;
           }
-          renderPgMessages();
+          scheduleRender();
         } catch(e) { /* skip parse errors */ }
       }
     }
