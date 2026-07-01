@@ -1870,6 +1870,11 @@ async function pgSend() {
     PG.sending = false;
     btn.disabled = false;
     btn.innerHTML = '<svg viewBox="0 0 16 16" fill="none"><path d="M2 8l12-5-5 12-2-5-5-2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg><span>发送</span>';
+    // Auto-collapse thinking when streaming completes
+    const assistantIdx = PG.messages.length - 1;
+    if (PG.messages[assistantIdx] && PG.messages[assistantIdx].role === 'assistant' && PG.messages[assistantIdx].thinking) {
+      PG.messages[assistantIdx].thinkingCollapsed = true;
+    }
     renderPgMessages();
     document.getElementById('pgInput').focus();
   }
