@@ -44,6 +44,7 @@ type ClientPool struct {
 	clientsByID     map[string]*Client
 	stayByID        map[string]time.Duration
 	conversationTo  map[string]string
+	conversationSeen map[string]time.Time // when each conversation binding was last used
 	refreshing      map[string]bool
 	externalRefresh cookieRefreshFunc
 	internalRefresh func(*Client) error
@@ -73,6 +74,7 @@ func NewClientPool(cfg *configs.Config, log *zap.Logger) *ClientPool {
 		clientsByID:     make(map[string]*Client),
 		stayByID:        make(map[string]time.Duration),
 		conversationTo:  make(map[string]string),
+		conversationSeen: make(map[string]time.Time),
 		refreshing:      make(map[string]bool),
 		externalRefresh: newExternalCookieRefresher(cfg, log),
 		internalRefresh: refreshClientSessionInPlace,
@@ -539,6 +541,10 @@ func (p *ClientPool) clientForOptions(ctx context.Context, options ...GenerateOp
 				p.mu.Unlock()
 				return nil, fmt.Errorf("Gemini conversation %q is bound to missing account %q", config.ConversationID, accountID)
 			}
+			if p.conversationSeen == nil {
+				p.conversationSeen = make(map[string]time.Time)
+			}
+			p.conversationSeen[config.ConversationID] = time.Now()
 			p.logAccountAudit("conversation_reused", client, config.ConversationID, "bound_conversation")
 			p.mu.Unlock()
 			return client, nil
@@ -560,6 +566,11 @@ func (p *ClientPool) clientForOptions(ctx context.Context, options ...GenerateOp
 	}
 	if config.ConversationID != "" {
 		p.conversationTo[config.ConversationID] = client.accountID
+		if p.conversationSeen == nil {
+			p.conversationSeen = make(map[string]time.Time)
+		}
+		p.conversationSeen[config.ConversationID] = time.Now()
+		p.pruneConversationBindingsLocked()
 		p.logAccountAudit("conversation_bound", client, config.ConversationID, "new_conversation")
 	} else if p.log != nil {
 		p.logAccountAudit("active_account_used", client, "", "stateless_request")
@@ -1144,6 +1155,30 @@ func (p *ClientPool) bindConversation(conversationID, accountID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.conversationTo[conversationID] = accountID
+	if p.conversationSeen == nil {
+		p.conversationSeen = make(map[string]time.Time)
+	}
+	p.conversationSeen[conversationID] = time.Now()
+}
+
+// conversationBindingTTL is how long a conversation-to-account binding is
+// kept after its last use. Entries older than this are pruned to prevent
+// unbounded growth of the conversationTo map in long-running instances.
+const conversationBindingTTL = 12 * time.Hour
+
+// pruneConversationBindingsLocked removes stale conversation bindings.
+// Caller must hold p.mu.
+func (p *ClientPool) pruneConversationBindingsLocked() {
+	if p.conversationSeen == nil {
+		return
+	}
+	now := time.Now()
+	for id, seen := range p.conversationSeen {
+		if now.Sub(seen) > conversationBindingTTL {
+			delete(p.conversationTo, id)
+			delete(p.conversationSeen, id)
+		}
+	}
 }
 
 type errorChatSession struct {

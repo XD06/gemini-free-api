@@ -53,13 +53,14 @@ type Client struct {
 	autoRefresh           bool
 	refreshInterval       time.Duration
 	stopRefresh           chan struct{}
+	closeOnce             sync.Once
 	maxRetries            int
 	cachedModels          []ModelInfo
 	cachedAliases         map[string]string
 	conversations         map[string]*SessionMetadata
 	conversationSeen      map[string]time.Time
 	conversationUntrusted map[string]bool
-	conversationMu        sync.Mutex
+	conversationMu        sync.RWMutex
 	statusMu              sync.RWMutex
 	healthState           string
 	lastError             string
@@ -389,14 +390,9 @@ func (c *Client) refreshSessionToken() error {
 		zap.String("proxy", redactProxyURL(c.proxyURL)),
 	)
 	// 1. Initial hit to google.com to get extra cookies (NID, etc)
-	tmpClient := req.NewClient().
-		SetTimeout(30 * time.Second).
-		SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	if c.proxyURL != "" {
-		tmpClient.SetProxyURL(c.proxyURL)
-	}
-
-	resp1, err := tmpClient.R().Get("https://www.google.com/")
+	// Reuse the existing httpClient to avoid creating a new transport
+	// (and new TLS connections) on every refresh.
+	resp1, err := c.httpClient.R().Get("https://www.google.com/")
 	extraCookies := ""
 	if err == nil {
 		parts := []string{}
@@ -431,10 +427,9 @@ func (c *Client) refreshSessionToken() error {
 		"User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 
-	hClient := c.newHTTPClient(30 * time.Second)
-	hClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return nil // follow redirects
-	}
+	// Reuse the existing rawHTTPClient (already configured with proxy, TLS,
+	// and connection pooling) instead of creating a new one each time.
+	hClient := c.rawHTTPClient
 
 	// Helper to merge cookies into a map to avoid duplicates
 	mergeCookies := func(baseStr string, newCks []*http.Cookie) string {
@@ -1091,6 +1086,11 @@ const maxStreamParseBufferBytes = 512 * 1024
 const defaultStreamFinishIdleTimeout = 1500 * time.Millisecond
 const defaultStreamFirstContentTimeout = 45 * time.Second
 
+// streamParseMinIntervalBytes limits how often the full parse buffer is
+// re-scanned for text deltas. Without this, every 16 KB chunk triggers a
+// full O(n) scan of up to 512 KB, making long responses O(n²) in CPU.
+const streamParseMinIntervalBytes = 8 * 1024
+
 func (c *Client) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
 	state := &StreamState{}
 	return c.generateContentStreamInternal(ctx, prompt, func(buffer []byte, deltaText string) bool {
@@ -1282,6 +1282,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	var lastText string
 	var lastContentAt time.Time
 	var buf bytes.Buffer
+	var lastParseLen int // bytes of buf at last text-extraction attempt; used to throttle re-parses
 	continuityChecked := expectedConversationCID == ""
 	metadataStored := false
 	finalizeStreamConversation := func() error {
@@ -1320,11 +1321,21 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	readCh := make(chan streamReadResult, 1)
 	go readStreamChunks(readCtx, httpResp.Body, readCh)
 
+	// Create timers once and reuse via Reset to avoid per-iteration allocation.
+	var idleTimer *time.Timer
+	var firstContentTimer *time.Timer
+	defer func() {
+		if idleTimer != nil {
+			idleTimer.Stop()
+		}
+		if firstContentTimer != nil {
+			firstContentTimer.Stop()
+		}
+	}()
+
 readLoop:
 	for {
-		var idleTimer *time.Timer
 		var idleCh <-chan time.Time
-		var firstContentTimer *time.Timer
 		var firstContentCh <-chan time.Time
 		if timeout, ok := streamFinishIdleRemaining(lastText, lastContentAt, finishIdleTimeout); ok {
 			if timeout <= 0 {
@@ -1339,7 +1350,11 @@ readLoop:
 				_ = httpResp.Body.Close()
 				return nil
 			}
-			idleTimer = time.NewTimer(timeout)
+			if idleTimer == nil {
+				idleTimer = time.NewTimer(timeout)
+			} else {
+				idleTimer.Reset(timeout)
+			}
 			idleCh = idleTimer.C
 		}
 		if lastText == "" && firstContentTimeout > 0 {
@@ -1353,7 +1368,11 @@ readLoop:
 				_ = httpResp.Body.Close()
 				return fmt.Errorf("gemini stream first content timeout after %s", firstContentTimeout)
 			}
-			firstContentTimer = time.NewTimer(remaining)
+			if firstContentTimer == nil {
+				firstContentTimer = time.NewTimer(remaining)
+			} else {
+				firstContentTimer.Reset(remaining)
+			}
 			firstContentCh = firstContentTimer.C
 		}
 
@@ -1361,12 +1380,6 @@ readLoop:
 		select {
 		case readResult, ok := <-readCh:
 			if !ok {
-				if idleTimer != nil {
-					idleTimer.Stop()
-				}
-				if firstContentTimer != nil {
-					firstContentTimer.Stop()
-				}
 				break readLoop
 			}
 			if idleTimer != nil {
@@ -1450,6 +1463,18 @@ readLoop:
 			}
 		}
 		parseBuffer := recentBytes(buf.Bytes(), maxStreamParseBufferBytes)
+		// Throttle re-parsing: only attempt text extraction when enough new
+		// bytes have accumulated since the last attempt, or when the stream
+		// has ended (result.err != nil). This avoids O(n²) re-scans of the
+		// full buffer on every 16 KB chunk for long responses.
+		shouldParse := buf.Len()-lastParseLen >= streamParseMinIntervalBytes || result.err != nil
+		if !shouldParse {
+			if result.err != nil {
+				break readLoop
+			}
+			continue
+		}
+		lastParseLen = buf.Len()
 		text := extractStreamTextFromBuffer(parseBuffer)
 		if text == "" {
 			text = extractTextFromBuffer(parseBuffer)
@@ -1968,8 +1993,8 @@ func (c *Client) conversationMetadata(id string) []interface{} {
 		return nil
 	}
 
-	c.conversationMu.Lock()
-	defer c.conversationMu.Unlock()
+	c.conversationMu.RLock()
+	defer c.conversationMu.RUnlock()
 	meta := c.conversations[id]
 	if meta == nil || (meta.ConversationID == "" && meta.ResponseID == "" && meta.ChoiceID == "") {
 		return nil
@@ -1983,8 +2008,8 @@ func (c *Client) conversationContextToken(id string) interface{} {
 		return nil
 	}
 
-	c.conversationMu.Lock()
-	defer c.conversationMu.Unlock()
+	c.conversationMu.RLock()
+	defer c.conversationMu.RUnlock()
 	meta := c.conversations[id]
 	if meta == nil || meta.Extra == nil {
 		return nil
@@ -2002,8 +2027,8 @@ func (c *Client) conversationSourcePath(id string) string {
 		return ""
 	}
 
-	c.conversationMu.Lock()
-	defer c.conversationMu.Unlock()
+	c.conversationMu.RLock()
+	defer c.conversationMu.RUnlock()
 	meta := c.conversations[id]
 	if meta == nil || meta.ConversationID == "" {
 		return ""
@@ -2021,8 +2046,8 @@ func (c *Client) conversationID(id string) string {
 		return ""
 	}
 
-	c.conversationMu.Lock()
-	defer c.conversationMu.Unlock()
+	c.conversationMu.RLock()
+	defer c.conversationMu.RUnlock()
 	meta := c.conversations[id]
 	if meta == nil {
 		return ""
@@ -2234,8 +2259,8 @@ func (c *Client) IsConversationUntrusted(id string) bool {
 	if id == "" {
 		return false
 	}
-	c.conversationMu.Lock()
-	defer c.conversationMu.Unlock()
+	c.conversationMu.RLock()
+	defer c.conversationMu.RUnlock()
 	return c.conversationUntrusted[id]
 }
 
@@ -3135,7 +3160,7 @@ func (c *Client) StartChat(options ...ChatOption) ChatSession {
 }
 
 func (c *Client) Close() error {
-	close(c.stopRefresh)
+	c.closeOnce.Do(func() { close(c.stopRefresh) })
 	c.mu.Lock()
 	c.healthy = false
 	c.mu.Unlock()

@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -126,8 +127,12 @@ const (
 var errEmptyProviderStream = fmt.Errorf("provider stream completed without content")
 
 func generateChatID() string {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return fmt.Sprintf("chatcmpl-%d%06d", time.Now().Unix(), r.Intn(1000000))
+	b := make([]byte, 12)
+	if _, err := cryptorand.Read(b); err != nil {
+		// Fallback to time-based ID if crypto/rand fails.
+		return fmt.Sprintf("chatcmpl-%d%06d", time.Now().Unix(), time.Now().UnixNano()%1000000)
+	}
+	return fmt.Sprintf("chatcmpl-%x", b)
 }
 
 func (s *OpenAIService) ListModels() []providers.ModelInfo {
@@ -1483,6 +1488,33 @@ func (s *OpenAIService) pruneTranscriptContextsLocked(now time.Time) {
 		if now.Sub(updatedAt) > transcriptContextTTL {
 			delete(s.userWindowContexts, key)
 			delete(s.userWindowUpdated, key)
+		}
+	}
+	// Prune stale toolBridge entries.
+	if s.toolBridgeUpdated != nil {
+		for id, updatedAt := range s.toolBridgeUpdated {
+			if now.Sub(updatedAt) > transcriptContextTTL {
+				delete(s.toolBridgeContexts, id)
+				delete(s.toolBridgeUpdated, id)
+			}
+		}
+	}
+	// Prune stale toolPlanner entries.
+	if s.toolPlannerUpdated != nil {
+		for k, updatedAt := range s.toolPlannerUpdated {
+			if now.Sub(updatedAt) > transcriptContextTTL {
+				delete(s.toolPlannerContexts, k)
+				delete(s.toolPlannerUpdated, k)
+			}
+		}
+	}
+	// Prune stale explicitProvider entries.
+	if s.explicitProviderUpdated != nil {
+		for k, updatedAt := range s.explicitProviderUpdated {
+			if now.Sub(updatedAt) > transcriptContextTTL {
+				delete(s.explicitProviderContexts, k)
+				delete(s.explicitProviderUpdated, k)
+			}
 		}
 	}
 	for len(s.transcriptContexts) > maxTranscriptContextEntries {

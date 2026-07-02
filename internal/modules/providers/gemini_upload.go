@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"gemini-free-api/internal/commons/models"
 )
@@ -79,7 +80,15 @@ func (c *Client) uploadRequestFiles(ctx context.Context, cfg *GenerateConfig, co
 		return nil, nil
 	}
 
-	out := make([]uploadedFile, 0, total)
+	// Build a unified list of upload tasks so we can parallelise them while
+	// preserving order in the output slice.
+	type uploadTask struct {
+		name     string
+		mimeType string
+		data     []byte
+	}
+	tasks := make([]uploadTask, 0, total)
+
 	for _, path := range cfg.Files {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -90,11 +99,7 @@ func (c *Client) uploadRequestFiles(ctx context.Context, cfg *GenerateConfig, co
 		if mimeType == "" {
 			mimeType = http.DetectContentType(data)
 		}
-		uploaded, err := c.uploadFile(ctx, name, mimeType, data, cookieHdr)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, uploaded)
+		tasks = append(tasks, uploadTask{name: name, mimeType: mimeType, data: data})
 	}
 
 	for i, file := range cfg.InputFiles {
@@ -106,11 +111,39 @@ func (c *Client) uploadRequestFiles(ctx context.Context, cfg *GenerateConfig, co
 		if mimeType == "" {
 			mimeType = http.DetectContentType(file.Data)
 		}
-		uploaded, err := c.uploadFile(ctx, name, mimeType, file.Data, cookieHdr)
+		tasks = append(tasks, uploadTask{name: name, mimeType: mimeType, data: file.Data})
+	}
+
+	// Upload concurrently to avoid serial latency when multiple files are
+	// attached. Cap concurrency to 4 to avoid overwhelming the proxy.
+	concurrency := 4
+	if concurrency > len(tasks) {
+		concurrency = len(tasks)
+	}
+
+	out := make([]uploadedFile, len(tasks))
+	errs := make([]error, len(tasks))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+
+	for i, task := range tasks {
+		wg.Add(1)
+		go func(idx int, t uploadTask) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			uploaded, err := c.uploadFile(ctx, t.name, t.mimeType, t.data, cookieHdr)
+			out[idx] = uploaded
+			errs[idx] = err
+		}(i, task)
+	}
+	wg.Wait()
+
+	// Check for errors in order so the first failure is reported.
+	for _, err := range errs {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, uploaded)
 	}
 
 	return out, nil

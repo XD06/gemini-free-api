@@ -94,7 +94,7 @@ func saveAccountCookieCache(path, accountID, secure1PSID, secure1PSIDTS, proxyUR
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return atomicWriteFile(path, data, 0600)
 }
 
 // saveAccountProxyCache updates only the proxy URL for an account in the cookie
@@ -132,7 +132,7 @@ func saveAccountProxyCache(path, accountID, proxyURL string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return atomicWriteFile(path, data, 0600)
 }
 
 // removeAccountCookieCache removes an account entry from the cookie cache file.
@@ -165,7 +165,7 @@ func removeAccountCookieCache(path, accountID string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return atomicWriteFile(path, data, 0600)
 }
 
 func readCookieCache(path string) (cookieCacheFile, error) {
@@ -178,4 +178,31 @@ func readCookieCache(path string) (cookieCacheFile, error) {
 		return cookieCacheFile{}, err
 	}
 	return cache, nil
+}
+
+// atomicWriteFile writes data to path atomically by first writing to a
+// temporary file in the same directory and then renaming it. This prevents
+// truncated/corrupted files if the process is killed mid-write (e.g. Docker
+// restart).
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op if rename succeeded
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
