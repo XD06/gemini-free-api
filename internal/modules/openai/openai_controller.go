@@ -118,7 +118,6 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		// Capture client info before starting stream
-	clientIP := c.IP()
 	userAgent := string(c.Request().Header.UserAgent())
 
 	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
@@ -126,8 +125,17 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
+			var firstByteTime time.Time
+			var firstByteRecorded bool
+
 			traceForward := openAIStreamForwardTraceEnabled()
 			streamErr := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
+				// Record first byte latency on first content chunk
+				if !firstByteRecorded {
+					firstByteTime = time.Now()
+					firstByteRecorded = true
+				}
+
 				flushStart := time.Now()
 				ok := utils.SendSSEEvent(w, h.log, chunk)
 				if traceForward {
@@ -146,6 +154,11 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			})
 
 			duration := time.Since(startTime).Milliseconds()
+			firstByteLatency := int64(0)
+			if firstByteRecorded {
+				firstByteLatency = firstByteTime.Sub(startTime).Milliseconds()
+			}
+
 			status := "success"
 			errMsg := ""
 			if streamErr != nil {
@@ -164,16 +177,16 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 
 			// Update request record (use captured values, not c.*)
 			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
-				ID:           requestID,
-				Timestamp:    startTime,
-				Model:        req.Model,
-				Stream:       req.Stream,
-				Status:       status,
-				ErrorMessage: errMsg,
-				Duration:     duration,
-				IP:           clientIP,
-				UserAgent:    userAgent,
-				RequestPath:  "/v1/chat/completions",
+				ID:               requestID,
+				Timestamp:        startTime,
+				Model:            req.Model,
+				Stream:           req.Stream,
+				Status:           status,
+				ErrorMessage:     errMsg,
+				Duration:         duration,
+				FirstByteLatency: firstByteLatency,
+				UserAgent:        userAgent,
+				RequestPath:      "/v1/chat/completions",
 			})
 		})
 
@@ -196,16 +209,16 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		h.log.Error("CreateChatCompletion failed", zap.Error(err), zap.String("model", req.Model))
 		// Update request record with error
 		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
-			ID:           requestID,
-			Timestamp:    startTime,
-			Model:        req.Model,
-			Stream:       req.Stream,
-			Status:       status,
-			ErrorMessage: errMsg,
-			Duration:     duration,
-			IP:           c.IP(),
-			UserAgent:    string(c.Request().Header.UserAgent()),
-			RequestPath:  "/v1/chat/completions",
+			ID:               requestID,
+			Timestamp:        startTime,
+			Model:            req.Model,
+			Stream:           req.Stream,
+			Status:           status,
+			ErrorMessage:     errMsg,
+			Duration:         duration,
+			FirstByteLatency: duration, // For non-streaming, first byte = total duration
+			UserAgent:        string(c.Request().Header.UserAgent()),
+			RequestPath:      "/v1/chat/completions",
 		})
 		return c.Status(fiber.StatusInternalServerError).JSON(utils.ErrorToResponse(err, "api_error"))
 	}
@@ -214,16 +227,16 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 
 	// Update request record with success
 	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
-		ID:           requestID,
-		Timestamp:    startTime,
-		Model:        req.Model,
-		Stream:       req.Stream,
-		Status:       status,
-		Duration:     duration,
-		TokensOutput: tokensOutput,
-		IP:           c.IP(),
-		UserAgent:    string(c.Request().Header.UserAgent()),
-		RequestPath:  "/v1/chat/completions",
+		ID:               requestID,
+		Timestamp:        startTime,
+		Model:            req.Model,
+		Stream:           req.Stream,
+		Status:           status,
+		Duration:         duration,
+		FirstByteLatency: duration, // For non-streaming, first byte = total duration
+		TokensOutput:     tokensOutput,
+		UserAgent:        string(c.Request().Header.UserAgent()),
+		RequestPath:      "/v1/chat/completions",
 	})
 
 	return c.JSON(response)

@@ -1359,7 +1359,7 @@ body {
       <div class="toolbar">
         <div class="search-box">
           <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/><path d="M11 11l3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-          <input type="text" id="requestSearchInput" placeholder="搜索模型、账号或IP…" oninput="renderRequests()">
+          <input type="text" id="requestSearchInput" placeholder="搜索模型、状态…" oninput="renderRequests()">
         </div>
         <button class="btn btn-ghost btn-sm" onclick="fetchRequests()">
           <svg viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.24-4.24l-1.42 1.42A4 4 0 004 8h2l-3 3-3-3h2zM14 8a6 6 0 01-10.24 4.24l1.42-1.42A4 4 0 0012 8h-2l3-3 3 3h-2z" stroke="currentColor" stroke-width="1.3"/></svg>
@@ -1372,16 +1372,15 @@ body {
           <thead>
             <tr>
               <th>时间</th>
-              <th>账号</th>
               <th>模型</th>
               <th>模式</th>
               <th>状态</th>
-              <th>耗时</th>
-              <th>IP</th>
+              <th>首字节</th>
+              <th>总耗时</th>
             </tr>
           </thead>
           <tbody id="requestsTableBody">
-            <tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">加载中...</td></tr>
+            <tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">加载中...</td></tr>
           </tbody>
         </table>
       </div>
@@ -2259,14 +2258,12 @@ function renderRequests() {
   if (search) {
     filtered = filtered.filter(r =>
       (r.model || '').toLowerCase().includes(search) ||
-      (r.account_id || '').toLowerCase().includes(search) ||
-      (r.ip || '').toLowerCase().includes(search) ||
       (r.status || '').toLowerCase().includes(search)
     );
   }
 
   if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">暂无记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">暂无记录</td></tr>';
     return;
   }
 
@@ -2276,18 +2273,17 @@ function renderRequests() {
     const statusClass = r.status === 'success' ? 'success' : r.status === 'error' ? 'error' : 'pending';
     const statusText = r.status === 'success' ? '成功' : r.status === 'error' ? '失败' : '进行中';
     const duration = r.duration_ms ? r.duration_ms + 'ms' : '-';
-    const account = r.account_id || '-';
+    const firstByte = r.first_byte_ms ? r.first_byte_ms + 'ms' : '-';
     const model = r.model || '-';
     const streamIcon = r.stream ? '<span title="流式">⚡</span>' : '';
 
     return `<tr>
       <td class="req-time" title="${date} ${time}">${time}</td>
-      <td class="req-account">${escapeHtml(account)}</td>
       <td class="req-model">${escapeHtml(model)}</td>
       <td class="req-stream ${r.stream ? 'active' : ''}">${streamIcon} ${r.stream ? 'Stream' : 'Standard'}</td>
       <td><span class="req-status ${statusClass}">${statusText}</span></td>
+      <td class="req-duration">${firstByte}</td>
       <td class="req-duration">${duration}</td>
-      <td class="req-ip">${escapeHtml(r.ip || '-')}</td>
     </tr>`;
   }).join('');
 
