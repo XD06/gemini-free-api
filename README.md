@@ -186,19 +186,94 @@ BenchmarkGenerateChatID-12                 crypto/rand     240 ns/op    88 B/op
 
 ## Docker 部署
 
+### 快速启动
+
 ```bash
+# 1. 复制环境配置
+cp .env.example .env
+# 编辑 .env 填写 COOKIE_SYNC_TOKEN 和 Cookie
+
+# 2. 启动服务
 docker compose up -d --build
+
+# 3. 查看日志
+docker compose logs -f
 ```
 
-- 多阶段构建，BuildKit 缓存挂载，`GOPROXY=goproxy.cn`
-- `.env` 只读挂载，修改后 `docker compose restart` 即可生效
-- `console.html` 通过 `go:embed` 编入二进制
+服务启动后访问：
+- API 端点：`http://localhost:8787/openai/v1/chat/completions`
+- Web 控制台：`http://localhost:8787/console`
+- API 文档：`http://localhost:8787/docs`
 
-| 挂载 | 说明 |
+### 配置说明
+
+#### 单账号模式
+
+```env
+COOKIE_SYNC_TOKEN=your_secure_token
+GEMINI_1PSID=your__Secure_1PSID_cookie
+GEMINI_1PSIDTS=your__Secure_1PSIDTS_cookie  # 可选
+```
+
+#### 多账号模式（推荐）
+
+```env
+COOKIE_SYNC_TOKEN=your_secure_token
+GEMINI_ACCOUNTS=acc1,acc2,acc3
+
+GEMINI_ACCOUNT_ACC1_1PSID=xxx
+GEMINI_ACCOUNT_ACC1_PRIORITY=3
+GEMINI_ACCOUNT_ACC1_PROXY=http://host.docker.internal:10808
+
+GEMINI_ACCOUNT_ACC2_1PSID=xxx
+GEMINI_ACCOUNT_ACC2_PRIORITY=2
+```
+
+### 网络配置
+
+| 场景 | 代理地址写法 |
 |:---|:---|
-| `./data` | Cookie 缓存和账号状态 |
-| `./.env` (ro) | 配置文件 |
-| `./.cookies` | Cookie jar |
+| 宿主机代理 (Windows/Mac) | `http://host.docker.internal:10808` |
+| 宿主机代理 (Linux) | `http://172.17.0.1:10808` |
+| 容器内 Clash | `http://clash:7890` |
+| 无代理 | 留空 |
+
+### 数据持久化
+
+| 挂载路径 | 说明 | 建议 |
+|:---|:---|:---|
+| `./data` | Cookie 缓存、账号状态、请求日志 | 必须持久化 |
+| `./.env` | 配置文件（只读挂载） | 修改后 `docker compose restart` 生效 |
+| `./.cookies` | Cookie jar 文件 | 可选 |
+
+### 常用命令
+
+```bash
+# 重新构建并启动
+docker compose up -d --build
+
+# 查看实时日志
+docker compose logs -f
+
+# 仅重启服务（配置更新后）
+docker compose restart
+
+# 停止服务
+docker compose down
+
+# 完全清理（包括数据卷）
+docker compose down -v
+
+# 进入容器调试
+docker compose exec app sh
+```
+
+### 构建特性
+
+- **多阶段构建**：分离编译和运行环境，镜像体积更小
+- **BuildKit 缓存**：Go 模块缓存挂载，重复构建更快
+- **国内加速**：默认使用 `GOPROXY=goproxy.cn`
+- **静态资源嵌入**：`console.html` 通过 `go:embed` 编入二进制
 
 ## Admin API
 

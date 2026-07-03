@@ -118,9 +118,9 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		// Capture client info before starting stream
-	userAgent := string(c.Request().Header.UserAgent())
+		userAgent := string(c.Request().Header.UserAgent())
 
-	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
+		c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
@@ -130,14 +130,15 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 
 			traceForward := openAIStreamForwardTraceEnabled()
 			streamErr := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
-				// Record first byte latency on first content chunk
+				flushStart := time.Now()
+				ok := utils.SendSSEEvent(w, h.log, chunk)
+
+				// Record first byte latency after first successful flush
 				if !firstByteRecorded {
 					firstByteTime = time.Now()
 					firstByteRecorded = true
 				}
 
-				flushStart := time.Now()
-				ok := utils.SendSSEEvent(w, h.log, chunk)
 				if traceForward {
 					contentLen, reasoningLen, toolCallCount, finishReason := summarizeStreamChunkForTrace(chunk)
 					h.log.Info("OpenAI SSE flush trace",
