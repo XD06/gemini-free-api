@@ -715,6 +715,122 @@ body {
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
+/* ========== Requests Table ========== */
+.requests-table-container {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+  overflow-x: auto;
+}
+
+.requests-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.requests-table th,
+.requests-table td {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.requests-table th {
+  background: var(--surface-2);
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.requests-table tbody tr:hover {
+  background: var(--surface-2);
+}
+
+.requests-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.req-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.req-status.success {
+  background: var(--pale-grn-bg);
+  color: var(--pale-grn-tx);
+}
+
+.req-status.error {
+  background: var(--pale-red-bg);
+  color: var(--pale-red-tx);
+}
+
+.req-status.pending {
+  background: var(--pale-yel-bg);
+  color: var(--pale-yel-tx);
+}
+
+.req-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.req-model {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.req-account {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.req-time {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.req-duration {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.req-ip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.req-stream {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.req-stream.active {
+  color: var(--pale-blu-tx);
+}
+
 /* ========== Playground ========== */
 .pg-layout {
   display: flex;
@@ -1106,6 +1222,10 @@ body {
       <svg viewBox="0 0 16 16" fill="none"><path d="M3 12l3-8 2 5 2-3 3 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Playground
     </button>
+    <button class="tab" id="tabRequests" onclick="switchTab('requests')">
+      <svg viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h10M2 12h8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      请求记录
+    </button>
   </div>
 
   <section class="tab-panel active" id="panelAccounts">
@@ -1194,6 +1314,78 @@ body {
         </button>
       </div>
     </div>
+  </section>
+
+  <section class="tab-panel" id="panelRequests">
+    <section class="hero reveal">
+      <div class="hero-left">
+        <h1 class="hero-title">API <em>请求记录</em></h1>
+        <p class="hero-sub">查看最近的 API 调用情况，包括账号、模型、响应时间等详细信息。</p>
+      </div>
+    </section>
+
+    <section class="stats reveal" id="requestStatsBar">
+      <div class="stat">
+        <div class="stat-label">Total</div>
+        <div class="stat-value" id="reqStatTotal">—</div>
+        <div class="stat-foot">total requests</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Success</div>
+        <div class="stat-value" id="reqStatSuccess" style="color: var(--pale-grn-tx)">—</div>
+        <div class="stat-foot">successful</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Errors</div>
+        <div class="stat-value" id="reqStatErrors" style="color: var(--pale-red-tx)">—</div>
+        <div class="stat-foot">failed</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Stream</div>
+        <div class="stat-value" id="reqStatStream">—</div>
+        <div class="stat-foot">streaming</div>
+      </div>
+    </section>
+
+    <section class="reveal">
+      <div class="section-head">
+        <div class="section-title">Recent Requests</div>
+        <div class="section-meta">
+          <span class="live-dot"></span>
+          <span id="lastRequestSync">auto-refresh 5s</span>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="search-box">
+          <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/><path d="M11 11l3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          <input type="text" id="requestSearchInput" placeholder="搜索模型、账号或IP…" oninput="renderRequests()">
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="fetchRequests()">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.24-4.24l-1.42 1.42A4 4 0 004 8h2l-3 3-3-3h2zM14 8a6 6 0 01-10.24 4.24l1.42-1.42A4 4 0 0012 8h-2l3-3 3 3h-2z" stroke="currentColor" stroke-width="1.3"/></svg>
+          刷新
+        </button>
+      </div>
+
+      <div class="requests-table-container" id="requestsTableContainer">
+        <table class="requests-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>账号</th>
+              <th>模型</th>
+              <th>模式</th>
+              <th>状态</th>
+              <th>耗时</th>
+              <th>IP</th>
+            </tr>
+          </thead>
+          <tbody id="requestsTableBody">
+            <tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </section>
 
   <footer class="footer">
@@ -1728,9 +1920,13 @@ function switchTab(name) {
   if (name === 'accounts') {
     document.getElementById('tabAccounts').classList.add('active');
     document.getElementById('panelAccounts').classList.add('active');
-  } else {
+  } else if (name === 'playground') {
     document.getElementById('tabPlayground').classList.add('active');
     document.getElementById('panelPlayground').classList.add('active');
+  } else if (name === 'requests') {
+    document.getElementById('tabRequests').classList.add('active');
+    document.getElementById('panelRequests').classList.add('active');
+    fetchRequests();
   }
 }
 
@@ -2006,11 +2202,123 @@ async function pgSend() {
   }
 }
 
+// ===== Requests =====
+const RequestState = {
+  requests: [],
+  stats: null,
+  refreshTimer: null
+};
+
+async function fetchRequests() {
+  try {
+    const res = await fetch('/admin/requests?limit=200', {
+      headers: { 'X-Cookie-Sync-Token': State.token }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    RequestState.requests = data.requests || [];
+    renderRequests();
+    updateRequestSyncTime();
+  } catch (e) {
+    console.error('Failed to fetch requests:', e);
+    document.getElementById('requestsTableBody').innerHTML =
+      '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--pale-red-tx)">加载失败: ' + escapeHtml(e.message) + '</td></tr>';
+  }
+}
+
+async function fetchRequestStats() {
+  try {
+    const res = await fetch('/admin/requests/stats', {
+      headers: { 'X-Cookie-Sync-Token': State.token }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    RequestState.stats = await res.json();
+    renderRequestStats();
+  } catch (e) {
+    console.error('Failed to fetch request stats:', e);
+  }
+}
+
+function renderRequestStats() {
+  if (!RequestState.stats) return;
+  const s = RequestState.stats;
+  document.getElementById('reqStatTotal').textContent = s.total || 0;
+  document.getElementById('reqStatSuccess').textContent = s.success_count || 0;
+  document.getElementById('reqStatErrors').textContent = s.error_count || 0;
+
+  // Count streaming requests
+  const streamCount = RequestState.requests.filter(r => r.stream).length;
+  document.getElementById('reqStatStream').textContent = streamCount;
+}
+
+function renderRequests() {
+  const search = (document.getElementById('requestSearchInput')?.value || '').toLowerCase();
+  const tbody = document.getElementById('requestsTableBody');
+
+  let filtered = RequestState.requests;
+  if (search) {
+    filtered = filtered.filter(r =>
+      (r.model || '').toLowerCase().includes(search) ||
+      (r.account_id || '').toLowerCase().includes(search) ||
+      (r.ip || '').toLowerCase().includes(search) ||
+      (r.status || '').toLowerCase().includes(search)
+    );
+  }
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">暂无记录</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filtered.map(r => {
+    const time = new Date(r.timestamp).toLocaleTimeString('zh-CN', { hour12: false });
+    const date = new Date(r.timestamp).toLocaleDateString('zh-CN');
+    const statusClass = r.status === 'success' ? 'success' : r.status === 'error' ? 'error' : 'pending';
+    const statusText = r.status === 'success' ? '成功' : r.status === 'error' ? '失败' : '进行中';
+    const duration = r.duration_ms ? r.duration_ms + 'ms' : '-';
+    const account = r.account_id || '-';
+    const model = r.model || '-';
+    const streamIcon = r.stream ? '<span title="流式">⚡</span>' : '';
+
+    return `<tr>
+      <td class="req-time" title="${date} ${time}">${time}</td>
+      <td class="req-account">${escapeHtml(account)}</td>
+      <td class="req-model">${escapeHtml(model)}</td>
+      <td class="req-stream ${r.stream ? 'active' : ''}">${streamIcon} ${r.stream ? 'Stream' : 'Standard'}</td>
+      <td><span class="req-status ${statusClass}">${statusText}</span></td>
+      <td class="req-duration">${duration}</td>
+      <td class="req-ip">${escapeHtml(r.ip || '-')}</td>
+    </tr>`;
+  }).join('');
+
+  // Update stats after rendering
+  renderRequestStats();
+}
+
+function updateRequestSyncTime() {
+  const el = document.getElementById('lastRequestSync');
+  if (el) {
+    const now = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    el.textContent = '上次更新: ' + now;
+  }
+}
+
+function startRequestRefresh() {
+  if (RequestState.refreshTimer) clearInterval(RequestState.refreshTimer);
+  RequestState.refreshTimer = setInterval(() => {
+    // Only refresh if requests tab is active
+    if (document.getElementById('panelRequests')?.classList.contains('active')) {
+      fetchRequests();
+    }
+  }, 5000);
+}
+
 // ===== Init =====
 State.token = getToken();
 if (State.token) {
   verifyAndEnter();
 }
+startRequestRefresh();
 </script>
 </body>
 </html>

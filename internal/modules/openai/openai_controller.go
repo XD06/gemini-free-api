@@ -12,6 +12,7 @@ import (
 
 	models "gemini-free-api/internal/commons/models"
 	utils "gemini-free-api/internal/commons/utils"
+	"gemini-free-api/internal/modules/admin"
 	"gemini-free-api/internal/modules/openai/dto"
 
 	"github.com/gofiber/fiber/v3"
@@ -83,6 +84,7 @@ func (h *OpenAIController) HandleModels(c fiber.Ctx) error {
 // @Router /openai/v1/chat/completions [post]
 func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 	requestID := generateChatID()
+	startTime := time.Now()
 	rawBody := append([]byte(nil), c.Body()...)
 	bindBody := trimJSONBOM(rawBody)
 	if len(bindBody) != len(rawBody) {
@@ -109,6 +111,19 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		)
 	}
 
+	// Log the incoming request
+	record := admin.RequestRecord{
+		ID:          requestID,
+		Timestamp:   startTime,
+		Model:       req.Model,
+		Stream:      req.Stream,
+		Status:      "pending",
+		IP:          c.IP(),
+		UserAgent:   string(c.Request().Header.UserAgent()),
+		RequestPath: "/v1/chat/completions",
+	}
+	admin.GetGlobalLogger().LogRequest(record)
+
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
@@ -120,8 +135,14 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
+			var accountID string
+			var totalTokens int
 			traceForward := openAIStreamForwardTraceEnabled()
 			err := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
+				// Capture account ID from first chunk
+				if accountID == "" && len(chunk.Choices) > 0 {
+					accountID = chunk.Choices[0].Delta.Role // Using Role field to pass account ID
+				}
 				flushStart := time.Now()
 				ok := utils.SendSSEEvent(w, h.log, chunk)
 				if traceForward {
@@ -138,16 +159,40 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 				}
 				return ok
 			})
+
+			duration := time.Since(startTime).Milliseconds()
+			status := "success"
+			errMsg := ""
 			if err != nil {
+				status = "error"
+				errMsg = err.Error()
 				h.log.Error("CreateChatCompletionStream failed", zap.Error(err), zap.String("model", req.Model))
 				errResponse := utils.ErrorToResponse(err, "api_error")
 				utils.SendSSEEvent(w, h.log, errResponse)
 				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 				_ = w.Flush()
-				return
 			}
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			_ = w.Flush()
+
+			// Update request record
+			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+				ID:           requestID,
+				Timestamp:    startTime,
+				AccountID:    accountID,
+				Model:        req.Model,
+				Stream:       req.Stream,
+				Status:       status,
+				ErrorMessage: errMsg,
+				Duration:     duration,
+				TokensOutput: totalTokens,
+				IP:           c.IP(),
+				UserAgent:    string(c.Request().Header.UserAgent()),
+				RequestPath:  "/v1/chat/completions",
+			})
+
+			if err == nil {
+				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+				_ = w.Flush()
+			}
 		})
 
 		return nil
@@ -158,10 +203,46 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 	ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
 	response, err := h.service.CreateChatCompletion(ctx, req)
+	duration := time.Since(startTime).Milliseconds()
+
+	status := "success"
+	errMsg := ""
+	tokensOutput := 0
 	if err != nil {
+		status = "error"
+		errMsg = err.Error()
 		h.log.Error("CreateChatCompletion failed", zap.Error(err), zap.String("model", req.Model))
+		// Update request record with error
+		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+			ID:           requestID,
+			Timestamp:    startTime,
+			Model:        req.Model,
+			Stream:       req.Stream,
+			Status:       status,
+			ErrorMessage: errMsg,
+			Duration:     duration,
+			IP:           c.IP(),
+			UserAgent:    string(c.Request().Header.UserAgent()),
+			RequestPath:  "/v1/chat/completions",
+		})
 		return c.Status(fiber.StatusInternalServerError).JSON(utils.ErrorToResponse(err, "api_error"))
 	}
+
+	tokensOutput = response.Usage.CompletionTokens
+
+	// Update request record with success
+	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+		ID:           requestID,
+		Timestamp:    startTime,
+		Model:        req.Model,
+		Stream:       req.Stream,
+		Status:       status,
+		Duration:     duration,
+		TokensOutput: tokensOutput,
+		IP:           c.IP(),
+		UserAgent:    string(c.Request().Header.UserAgent()),
+		RequestPath:  "/v1/chat/completions",
+	})
 
 	return c.JSON(response)
 }

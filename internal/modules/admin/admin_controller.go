@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +42,8 @@ func (c *Controller) Register(group fiber.Router) {
 	group.Post("/accounts/:account_id/refresh", c.HandleRefreshAccount)
 	group.Post("/accounts/:account_id/test", c.HandleTestAccount)
 	group.Post("/proxy-test", c.HandleTestProxy)
+	group.Get("/requests", c.HandleListRequests)
+	group.Get("/requests/stats", c.HandleRequestStats)
 }
 
 func (c *Controller) HandleListAccounts(ctx fiber.Ctx) error {
@@ -397,4 +400,38 @@ func (c *Controller) requireToken(ctx fiber.Ctx) error {
 		return ctx.Status(fiber.StatusUnauthorized).JSON(utils.ErrorToResponse(fmt.Errorf("invalid admin token"), "unauthorized"))
 	}
 	return nil
+}
+
+// HandleListRequests returns recent API requests
+func (c *Controller) HandleListRequests(ctx fiber.Ctx) error {
+	if err := c.requireToken(ctx); err != nil {
+		return err
+	}
+
+	limit := 100
+	if limitStr := ctx.Query("limit"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 && parsed <= 1000 {
+			limit = parsed
+		}
+	}
+
+	logger := GetGlobalLogger()
+	records := logger.GetRecent(limit)
+
+	return ctx.JSON(fiber.Map{
+		"requests": records,
+		"total":    len(records),
+	})
+}
+
+// HandleRequestStats returns request statistics
+func (c *Controller) HandleRequestStats(ctx fiber.Ctx) error {
+	if err := c.requireToken(ctx); err != nil {
+		return err
+	}
+
+	logger := GetGlobalLogger()
+	stats := logger.GetStats()
+
+	return ctx.JSON(stats)
 }
