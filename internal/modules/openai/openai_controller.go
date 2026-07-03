@@ -135,14 +135,8 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
-			var accountID string
-			var totalTokens int
 			traceForward := openAIStreamForwardTraceEnabled()
 			err := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
-				// Capture account ID from first chunk
-				if accountID == "" && len(chunk.Choices) > 0 {
-					accountID = chunk.Choices[0].Delta.Role // Using Role field to pass account ID
-				}
 				flushStart := time.Now()
 				ok := utils.SendSSEEvent(w, h.log, chunk)
 				if traceForward {
@@ -177,13 +171,11 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 				ID:           requestID,
 				Timestamp:    startTime,
-				AccountID:    accountID,
 				Model:        req.Model,
 				Stream:       req.Stream,
 				Status:       status,
 				ErrorMessage: errMsg,
 				Duration:     duration,
-				TokensOutput: totalTokens,
 				IP:           c.IP(),
 				UserAgent:    string(c.Request().Header.UserAgent()),
 				RequestPath:  "/v1/chat/completions",
