@@ -111,32 +111,23 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		)
 	}
 
-	// Log the incoming request
-	record := admin.RequestRecord{
-		ID:          requestID,
-		Timestamp:   startTime,
-		Model:       req.Model,
-		Stream:      req.Stream,
-		Status:      "pending",
-		IP:          c.IP(),
-		UserAgent:   string(c.Request().Header.UserAgent()),
-		RequestPath: "/v1/chat/completions",
-	}
-	admin.GetGlobalLogger().LogRequest(record)
-
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
 
-		c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
+		// Capture client info before starting stream
+	clientIP := c.IP()
+	userAgent := string(c.Request().Header.UserAgent())
+
+	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 
 			traceForward := openAIStreamForwardTraceEnabled()
-			err := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
+			streamErr := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
 				flushStart := time.Now()
 				ok := utils.SendSSEEvent(w, h.log, chunk)
 				if traceForward {
@@ -157,17 +148,21 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			duration := time.Since(startTime).Milliseconds()
 			status := "success"
 			errMsg := ""
-			if err != nil {
+			if streamErr != nil {
 				status = "error"
-				errMsg = err.Error()
-				h.log.Error("CreateChatCompletionStream failed", zap.Error(err), zap.String("model", req.Model))
-				errResponse := utils.ErrorToResponse(err, "api_error")
+				errMsg = streamErr.Error()
+				h.log.Error("CreateChatCompletionStream failed", zap.Error(streamErr), zap.String("model", req.Model))
+				errResponse := utils.ErrorToResponse(streamErr, "api_error")
 				utils.SendSSEEvent(w, h.log, errResponse)
+				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+				_ = w.Flush()
+			} else {
+				// Success - send DONE
 				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 				_ = w.Flush()
 			}
 
-			// Update request record
+			// Update request record (use captured values, not c.*)
 			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 				ID:           requestID,
 				Timestamp:    startTime,
@@ -176,15 +171,10 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 				Status:       status,
 				ErrorMessage: errMsg,
 				Duration:     duration,
-				IP:           c.IP(),
-				UserAgent:    string(c.Request().Header.UserAgent()),
+				IP:           clientIP,
+				UserAgent:    userAgent,
 				RequestPath:  "/v1/chat/completions",
 			})
-
-			if err == nil {
-				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-				_ = w.Flush()
-			}
 		})
 
 		return nil
