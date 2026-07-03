@@ -329,40 +329,40 @@ func (c *Client) Init(ctx context.Context) error {
 		}
 	}
 
-	// Active rotation at start: "启动时主动轮换：Init 阶段先轮换一次拿最新 PSIDTS"
-	if c.startupRotate && c.cookies.Secure1PSID != "" {
-		c.log.Info("Proactively rotating cookies at startup to get fresh __Secure-1PSIDTS...")
-		if err := c.RotateCookies(); err != nil {
-			c.log.Warn("Startup cookie rotation failed, continuing...", zap.Error(err))
-		} else {
-			c.log.Info("Successfully rotated cookies at startup")
-		}
-	} else if !c.startupRotate {
-		c.log.Info("Skipping startup cookie rotation",
-			zap.String("account", c.accountID),
-			zap.String("reason", "GEMINI_STARTUP_COOKIE_ROTATE=false"),
-		)
-	}
-
-	// Populate cookies
+	// Populate cookies first
 	c.httpClient.SetCommonCookies(c.cookies.ToHTTPCookies()...)
 
-	// Get SNlM0e token
+	// Get SNlM0e token - first try with provided cookies directly
+	// This is the real "can this cookie talk to Gemini" test
 	err := c.refreshSessionToken()
+
+	// If direct SNlM0e fetch fails, try rotation as recovery
 	if err != nil {
-		c.log.Debug("Initial session token fetch failed, attempting cookie rotation", zap.Error(err))
-		// Try to rotate cookies and retry
+		c.log.Info("Direct session token fetch failed, attempting cookie rotation", zap.Error(err))
 		if rotErr := c.RotateCookies(); rotErr == nil {
-			c.log.Debug("Cookie rotation succeeded, retrying session token fetch")
+			c.log.Info("Cookie rotation succeeded, retrying session token fetch")
 			err = c.refreshSessionToken()
 		} else {
-			c.log.Debug("Cookie rotation failed", zap.Error(rotErr))
+			c.log.Warn("Cookie rotation also failed", zap.Error(rotErr))
 		}
 	}
 
 	if err != nil {
 		c.setAccountState(AccountStateNeedsManualLogin, err)
 		return err
+	}
+
+	// Optional: proactive rotation for fresh PSIDTS (only if SNlM0e already works)
+	// This runs in background so it doesn't block init
+	if c.startupRotate && c.cookies.Secure1PSID != "" {
+		go func() {
+			c.log.Info("Proactively rotating cookies in background for fresh __Secure-1PSIDTS...")
+			if rotErr := c.RotateCookies(); rotErr != nil {
+				c.log.Debug("Background cookie rotation failed (non-critical)", zap.Error(rotErr))
+			} else {
+				c.log.Info("Background cookie rotation succeeded")
+			}
+		}()
 	}
 
 	// Save the valid cookies to cache immediately after successful init
