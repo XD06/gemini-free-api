@@ -10,9 +10,12 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,6 +24,8 @@ import (
 )
 
 const defaultOpenAIFileStoreDir = "data/openai-files"
+
+var openAIFileIDPattern = regexp.MustCompile(`^file-[A-Za-z0-9_-]+$`)
 
 type openAIFileStore struct {
 	dir string
@@ -151,8 +156,16 @@ func (s *openAIFileStore) deleteFile(id string) (map[string]interface{}, error) 
 	if err != nil {
 		return nil, err
 	}
-	_ = os.Remove(meta.Path)
-	_ = os.Remove(s.metadataPath(id))
+	dataPath, err := s.safeStoredDataPath(meta.Path)
+	if err != nil {
+		return nil, err
+	}
+	metaPath, err := s.metadataPath(id)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Remove(dataPath)
+	_ = os.Remove(metaPath)
 	return map[string]interface{}{
 		"id":      meta.ID,
 		"object":  "file",
@@ -165,7 +178,11 @@ func (s *openAIFileStore) readFileContent(id string) ([]byte, string, string, er
 	if err != nil {
 		return nil, "", "", err
 	}
-	data, err := os.ReadFile(meta.Path)
+	dataPath, err := s.safeStoredDataPath(meta.Path)
+	if err != nil {
+		return nil, "", "", err
+	}
+	data, err := os.ReadFile(dataPath)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -196,7 +213,11 @@ func (s *openAIFileStore) writeMetadata(meta openAIFileMetadata) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.metadataPath(meta.ID), body, 0600)
+	path, err := s.metadataPath(meta.ID)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, body, 0600)
 }
 
 func (s *openAIFileStore) readMetadata(id string) (openAIFileMetadata, error) {
@@ -204,7 +225,11 @@ func (s *openAIFileStore) readMetadata(id string) (openAIFileMetadata, error) {
 	if id == "" {
 		return openAIFileMetadata{}, fmt.Errorf("file_id is required")
 	}
-	body, err := os.ReadFile(s.metadataPath(id))
+	path, err := s.metadataPath(id)
+	if err != nil {
+		return openAIFileMetadata{}, err
+	}
+	body, err := os.ReadFile(path)
 	if err != nil {
 		return openAIFileMetadata{}, fmt.Errorf("file %q not found", id)
 	}
@@ -215,8 +240,35 @@ func (s *openAIFileStore) readMetadata(id string) (openAIFileMetadata, error) {
 	return meta, nil
 }
 
-func (s *openAIFileStore) metadataPath(id string) string {
-	return filepath.Join(s.dir, strings.TrimSpace(id)+".json")
+func (s *openAIFileStore) metadataPath(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if !openAIFileIDPattern.MatchString(id) {
+		return "", fmt.Errorf("invalid file_id %q", id)
+	}
+	return filepath.Join(s.dir, id+".json"), nil
+}
+
+func (s *openAIFileStore) safeStoredDataPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("stored file path is required")
+	}
+	storeDir, err := filepath.Abs(s.dir)
+	if err != nil {
+		return "", err
+	}
+	dataPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(storeDir, dataPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("stored file path %q is outside file store", path)
+	}
+	return dataPath, nil
 }
 
 func (s *OpenAIService) inputFilesFromModelMessages(ctx context.Context, messages []models.Message) ([]providers.InputFile, error) {
@@ -268,7 +320,11 @@ func (s *OpenAIService) inputFileFromAttachment(ctx context.Context, attachment 
 }
 
 func fetchAttachmentURL(ctx context.Context, attachment models.Attachment) (providers.InputFile, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(attachment.URL), nil)
+	attachmentURL, err := validateAttachmentURL(attachment.URL)
+	if err != nil {
+		return providers.InputFile{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, attachmentURL.String(), nil)
 	if err != nil {
 		return providers.InputFile{}, fmt.Errorf("build attachment fetch request: %w", err)
 	}
@@ -304,6 +360,46 @@ func fetchAttachmentURL(ctx context.Context, attachment models.Attachment) (prov
 		name = filenameFromURL(attachment.URL, mimeType)
 	}
 	return providers.InputFile{Name: name, MimeType: mimeType, Data: data}, nil
+}
+
+func validateAttachmentURL(rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil, fmt.Errorf("invalid attachment URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported attachment URL scheme %q", parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("attachment URL host is required")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil, fmt.Errorf("disallowed attachment host %q", host)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve attachment host %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("resolve attachment host %q: no addresses", host)
+	}
+	for _, ip := range ips {
+		if isDisallowedAttachmentIP(ip) {
+			return nil, fmt.Errorf("disallowed attachment host %q", host)
+		}
+	}
+	return parsed, nil
+}
+
+func isDisallowedAttachmentIP(ip net.IP) bool {
+	return ip == nil ||
+		ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast()
 }
 
 func filenameFromURL(rawURL, mimeType string) string {

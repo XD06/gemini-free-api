@@ -90,6 +90,34 @@ func TestRedactDebugHeadersRemovesSensitiveValues(t *testing.T) {
 	}
 }
 
+func TestSelectStartupPSIDTSUsesFreshCacheOverStaleConfig(t *testing.T) {
+	selected, source, clearCache := selectStartupPSIDTS("old-config-ts", "env", "fresh-cached-ts", nil)
+
+	if selected != "fresh-cached-ts" {
+		t.Fatalf("expected cached PSIDTS to win across restart, got %q", selected)
+	}
+	if source != "cache" {
+		t.Fatalf("expected cache source, got %q", source)
+	}
+	if clearCache {
+		t.Fatal("stale config PSIDTS should not clear the fresher runtime cache")
+	}
+}
+
+func TestSelectStartupPSIDTSPreservesAccountCacheOverLegacyCache(t *testing.T) {
+	selected, source, clearCache := selectStartupPSIDTS("account-cache-ts", "cache", "legacy-cache-ts", nil)
+
+	if selected != "account-cache-ts" {
+		t.Fatalf("expected account cache PSIDTS to win, got %q", selected)
+	}
+	if source != "cache" {
+		t.Fatalf("expected account cache source, got %q", source)
+	}
+	if clearCache {
+		t.Fatal("account cache should not clear legacy cache")
+	}
+}
+
 func TestBuildGenerateInnerIncludesConversationMetadataAndContextToken(t *testing.T) {
 	metadata := []interface{}{"c_1", "r_1", "rc_1", nil, nil, nil, nil, nil, nil, ""}
 	inner := buildGenerateInner("hello", nil, "en", "request-id", metadata, "opaque-token")

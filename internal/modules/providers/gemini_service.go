@@ -318,13 +318,14 @@ func (c *Client) Init(ctx context.Context) error {
 	if c.cookies.Secure1PSID != "" {
 		cachedTS, err := c.LoadCachedCookies()
 
-		// If config has a new PSIDTS that differs from cache, clear cache and use config
-		if configPSIDTS != "" && cachedTS != "" && configPSIDTS != cachedTS {
+		selectedTS, source, clearCache := selectStartupPSIDTS(configPSIDTS, c.cookieSource, cachedTS, err)
+		if clearCache {
 			_ = c.ClearCookieCache()
-			// Keep using the config value (already set above)
-		} else if err == nil && cachedTS != "" && configPSIDTS == "" {
-			// Only use cache if config doesn't provide PSIDTS
-			c.cookies.Secure1PSIDTS = cachedTS
+		}
+		if selectedTS != "" && selectedTS != c.cookies.Secure1PSIDTS {
+			c.cookies.Secure1PSIDTS = selectedTS
+		}
+		if source == "cache" {
 			c.log.Info("Loaded __Secure-1PSIDTS from cache")
 		}
 	}
@@ -695,6 +696,22 @@ func jitterDuration(base time.Duration) time.Duration {
 		return base
 	}
 	return half + time.Duration(rand.Int63n(int64(base)))
+}
+
+func selectStartupPSIDTS(configPSIDTS, configSource, cachedPSIDTS string, cacheErr error) (selected string, source string, clearCache bool) {
+	configPSIDTS = cleanCookie(configPSIDTS)
+	configSource = strings.TrimSpace(configSource)
+	cachedPSIDTS = cleanCookie(cachedPSIDTS)
+	if configPSIDTS != "" && configSource != "" && configSource != "env" {
+		return configPSIDTS, configSource, false
+	}
+	if cacheErr == nil && cachedPSIDTS != "" {
+		return cachedPSIDTS, "cache", false
+	}
+	if configPSIDTS != "" {
+		return configPSIDTS, "config", false
+	}
+	return "", "", false
 }
 
 func (c *Client) RotateCookies() error {
@@ -3468,6 +3485,18 @@ func (c *Client) SaveCachedCookies() error {
 		c.log.Debug("Saved __Secure-1PSIDTS to local cache for future use", zap.String("file", filename))
 	} else {
 		c.log.Warn("Failed to save cookies to cache", zap.String("file", filename), zap.Error(err))
+	}
+	if c.cookieCache {
+		source := strings.TrimSpace(c.cookieSource)
+		if source == "" || source == "env" || source == "cache" {
+			source = "runtime"
+		}
+		if cacheErr := saveAccountCookieCache(c.cookieCachePath, c.accountID, c.cookies.Secure1PSID, c.cookies.Secure1PSIDTS, c.proxyURL, source); cacheErr != nil {
+			if err == nil {
+				err = cacheErr
+			}
+			c.log.Warn("Failed to save account cookie cache", zap.String("account", c.accountID), zap.String("path", c.cookieCachePath), zap.Error(cacheErr))
+		}
 	}
 	return err
 }
