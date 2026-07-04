@@ -6,9 +6,12 @@ import (
 	"time"
 
 	common "gemini-free-api/internal/commons/utils"
+	"gemini-free-api/internal/modules/admin"
 	"gemini-free-api/internal/modules/claude/dto"
+	"gemini-free-api/internal/modules/providers"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -86,6 +89,10 @@ func (h *ClaudeController) HandleModelByID(c fiber.Ctx) error {
 // @Failure 500 {object} map[string]interface{}
 // @Router /claude/v1/messages [post]
 func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
+	requestID := uuid.NewString()
+	startTime := time.Now()
+	userAgent := string(c.Request().Header.UserAgent())
+
 	var req dto.MessageRequest
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -103,11 +110,30 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 		c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
+			ctx, accountHolder := providers.ContextWithAccountID(ctx)
+
+			var firstByteTime time.Time
+			var firstByteRecorded bool
 
 			err := h.service.GenerateMessageStream(ctx, req, func(ev dto.StreamEvent) bool {
+				if !firstByteRecorded {
+					firstByteTime = time.Now()
+					firstByteRecorded = true
+				}
 				return common.SendSSEEvent(w, h.log, ev)
 			})
+
+			duration := time.Since(startTime).Milliseconds()
+			firstByteLatency := int64(0)
+			if firstByteRecorded {
+				firstByteLatency = firstByteTime.Sub(startTime).Milliseconds()
+			}
+
+			status := "success"
+			errMsg := ""
 			if err != nil {
+				status = "error"
+				errMsg = err.Error()
 				h.log.Error("GenerateMessageStream failed", zap.Error(err), zap.String("model", req.Model))
 				errEv := dto.StreamEvent{
 					Type: "error",
@@ -118,6 +144,20 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 				}
 				_ = common.SendSSEEvent(w, h.log, errEv)
 			}
+
+			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+				ID:               requestID,
+				Timestamp:        startTime,
+				Model:            req.Model,
+				Stream:           true,
+				AccountID:        accountHolder.Get(),
+				Status:           status,
+				ErrorMessage:     errMsg,
+				Duration:         duration,
+				FirstByteLatency: firstByteLatency,
+				UserAgent:        userAgent,
+				RequestPath:      "/claude/v1/messages",
+			})
 		})
 
 		return nil
@@ -126,15 +166,44 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 	// Non-streaming mode
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 	response, err := h.service.GenerateMessage(ctx, req)
+	duration := time.Since(startTime).Milliseconds()
+
 	if err != nil {
 		h.log.Error("GenerateMessage failed", zap.Error(err), zap.String("model", req.Model))
+		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+			ID:               requestID,
+			Timestamp:        startTime,
+			Model:            req.Model,
+			Stream:           false,
+			AccountID:        accountHolder.Get(),
+			Status:           "error",
+			ErrorMessage:     err.Error(),
+			Duration:         duration,
+			FirstByteLatency: duration,
+			UserAgent:        userAgent,
+			RequestPath:      "/claude/v1/messages",
+		})
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"type":  "error",
 			"error": fiber.Map{"type": "api_error", "message": err.Error()},
 		})
 	}
+
+	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+		ID:               requestID,
+		Timestamp:        startTime,
+		Model:            req.Model,
+		Stream:           false,
+		AccountID:        accountHolder.Get(),
+		Status:           "success",
+		Duration:         duration,
+		FirstByteLatency: duration,
+		UserAgent:        userAgent,
+		RequestPath:      "/claude/v1/messages",
+	})
 
 	return c.JSON(response)
 }

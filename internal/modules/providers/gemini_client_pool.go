@@ -547,6 +547,9 @@ func (p *ClientPool) clientForOptions(ctx context.Context, options ...GenerateOp
 			p.conversationSeen[config.ConversationID] = time.Now()
 			p.logAccountAudit("conversation_reused", client, config.ConversationID, "bound_conversation")
 			p.mu.Unlock()
+			if holder := AccountIDFromContext(ctx); holder != nil {
+				holder.Set(client.accountID)
+			}
 			return client, nil
 		}
 	}
@@ -576,6 +579,9 @@ func (p *ClientPool) clientForOptions(ctx context.Context, options ...GenerateOp
 		p.logAccountAudit("active_account_used", client, "", "stateless_request")
 	}
 	p.mu.Unlock()
+	if holder := AccountIDFromContext(ctx); holder != nil {
+		holder.Set(client.accountID)
+	}
 	return client, nil
 }
 

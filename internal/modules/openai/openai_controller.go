@@ -14,6 +14,7 @@ import (
 	utils "gemini-free-api/internal/commons/utils"
 	"gemini-free-api/internal/modules/admin"
 	"gemini-free-api/internal/modules/openai/dto"
+	"gemini-free-api/internal/modules/providers"
 
 	"github.com/gofiber/fiber/v3"
 	"go.uber.org/zap"
@@ -124,6 +125,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
+			ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 			var firstByteTime time.Time
 			var firstByteRecorded bool
@@ -182,6 +184,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 				Timestamp:        startTime,
 				Model:            req.Model,
 				Stream:           req.Stream,
+				AccountID:        accountHolder.Get(),
 				Status:           status,
 				ErrorMessage:     errMsg,
 				Duration:         duration,
@@ -197,6 +200,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
+	ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 	response, err := h.service.CreateChatCompletion(ctx, req)
 	duration := time.Since(startTime).Milliseconds()
@@ -214,6 +218,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			Timestamp:        startTime,
 			Model:            req.Model,
 			Stream:           req.Stream,
+			AccountID:        accountHolder.Get(),
 			Status:           status,
 			ErrorMessage:     errMsg,
 			Duration:         duration,
@@ -232,6 +237,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		Timestamp:        startTime,
 		Model:            req.Model,
 		Stream:           req.Stream,
+		AccountID:        accountHolder.Get(),
 		Status:           status,
 		Duration:         duration,
 		FirstByteLatency: duration, // For non-streaming, first byte = total duration

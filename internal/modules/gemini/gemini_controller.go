@@ -8,9 +8,12 @@ import (
 	"time"
 
 	common "gemini-free-api/internal/commons/utils"
+	"gemini-free-api/internal/modules/admin"
 	"gemini-free-api/internal/modules/gemini/dto"
+	"gemini-free-api/internal/modules/providers"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -82,6 +85,10 @@ func (h *GeminiController) HandleV1BetaGenerateContent(c fiber.Ctx) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
+	requestID := uuid.NewString()
+	startTime := time.Now()
+	userAgent := string(c.Request().Header.UserAgent())
+
 	model := c.Params("model")
 	var req dto.GeminiGenerateRequest
 	if err := c.Bind().Body(&req); err != nil {
@@ -90,15 +97,44 @@ func (h *GeminiController) HandleV1BetaGenerateContent(c fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 	response, err := h.service.GenerateContent(ctx, model, req)
+	duration := time.Since(startTime).Milliseconds()
+
 	if err != nil {
 		if err.Error() == "empty content" {
 			return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(err, "invalid_request_error"))
 		}
 		h.log.Error("GenerateContent failed", zap.Error(err), zap.String("model", model))
+		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+			ID:               requestID,
+			Timestamp:        startTime,
+			Model:            model,
+			Stream:           false,
+			AccountID:        accountHolder.Get(),
+			Status:           "error",
+			ErrorMessage:     err.Error(),
+			Duration:         duration,
+			FirstByteLatency: duration,
+			UserAgent:        userAgent,
+			RequestPath:      "/gemini/v1beta/models:generateContent",
+		})
 		return c.Status(fiber.StatusInternalServerError).JSON(common.ErrorToResponse(err, "api_error"))
 	}
+
+	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+		ID:               requestID,
+		Timestamp:        startTime,
+		Model:            model,
+		Stream:           false,
+		AccountID:        accountHolder.Get(),
+		Status:           "success",
+		Duration:         duration,
+		FirstByteLatency: duration,
+		UserAgent:        userAgent,
+		RequestPath:      "/gemini/v1beta/models:generateContent",
+	})
 
 	return c.JSON(response)
 }
@@ -117,6 +153,10 @@ func (h *GeminiController) HandleV1BetaStreamGenerateContent(c fiber.Ctx) error 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
+	requestID := uuid.NewString()
+	startTime := time.Now()
+	userAgent := string(c.Request().Header.UserAgent())
+
 	model := c.Params("model")
 	var req dto.GeminiGenerateRequest
 	if err := c.Bind().Body(&req); err != nil {
@@ -129,14 +169,47 @@ func (h *GeminiController) HandleV1BetaStreamGenerateContent(c fiber.Ctx) error 
 	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
+		ctx, accountHolder := providers.ContextWithAccountID(ctx)
+
+		var firstByteTime time.Time
+		var firstByteRecorded bool
 
 		err := h.service.GenerateContentStream(ctx, model, req, func(resp dto.GeminiGenerateResponse) bool {
+			if !firstByteRecorded {
+				firstByteTime = time.Now()
+				firstByteRecorded = true
+			}
 			return common.SendStreamChunk(w, h.log, resp) == nil
 		})
+
+		duration := time.Since(startTime).Milliseconds()
+		firstByteLatency := int64(0)
+		if firstByteRecorded {
+			firstByteLatency = firstByteTime.Sub(startTime).Milliseconds()
+		}
+
+		status := "success"
+		errMsg := ""
 		if err != nil {
+			status = "error"
+			errMsg = err.Error()
 			h.log.Error("GenerateContentStream failed", zap.Error(err), zap.String("model", model))
 			_ = common.SendStreamChunk(w, h.log, common.ErrorToResponse(err, "api_error"))
 		}
+
+		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
+			ID:               requestID,
+			Timestamp:        startTime,
+			Model:            model,
+			Stream:           true,
+			AccountID:        accountHolder.Get(),
+			Status:           status,
+			ErrorMessage:     errMsg,
+			Duration:         duration,
+			FirstByteLatency: firstByteLatency,
+			UserAgent:        userAgent,
+			RequestPath:      "/gemini/v1beta/models:streamGenerateContent",
+		})
 	})
 
 	return nil

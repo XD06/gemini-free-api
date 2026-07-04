@@ -1374,13 +1374,14 @@ body {
               <th>时间</th>
               <th>模型</th>
               <th>模式</th>
+              <th>账号</th>
               <th>状态</th>
               <th>首字节</th>
               <th>总耗时</th>
             </tr>
           </thead>
           <tbody id="requestsTableBody">
-            <tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">加载中...</td></tr>
+            <tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">加载中...</td></tr>
           </tbody>
         </table>
       </div>
@@ -1497,6 +1498,8 @@ async function verifyAndEnter() {
     initReveal();
     fetchAccounts();
     startAutoRefresh();
+    startRequestRefresh();
+    initAccountGridDelegation();
   } catch(e) {
     toast('连接失败: ' + e.message, 'err');
   }
@@ -1695,24 +1698,24 @@ function renderAccounts() {
             <span class="field-label">Validated</span>
             <span class="field-value">${fmtRelISO(a.last_validated)}</span>
           </div>
-          ${a.last_error ? `<div class="field-row"><span class="field-label">Error</span><span class="field-value" style="color:var(--pale-red-tx);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${a.last_error}">${a.last_error}</span></div>` : ''}
+          ${a.last_error ? `<div class="field-row"><span class="field-label">Error</span><span class="field-value" style="color:var(--pale-red-tx);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(a.last_error)}">${escapeHtml(a.last_error)}</span></div>` : ''}
           ${a.active ? `<div class="field-row"><span class="field-label">Active Until</span><span class="field-value" style="color:var(--pale-blu-tx)">${fmtTime(a.active_until)}</span></div>` : ''}
         </div>
       </div>
       <div class="card-actions">
-        <button class="card-btn primary" onclick="openEditDrawer('${a.id}')">
+        <button class="card-btn primary" data-action="edit" data-id="${escAttr(a.id)}">
           <svg viewBox="0 0 16 16" fill="none"><path d="M11 2l3 3-8 8H3v-3l8-8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
           Edit
         </button>
-        <button class="card-btn" onclick="doTest('${a.id}', this)" ${isRefreshing ? 'disabled' : ''}>
+        <button class="card-btn" data-action="test" data-id="${escAttr(a.id)}" ${isRefreshing ? 'disabled' : ''}>
           <svg viewBox="0 0 16 16" fill="none"><path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
           Test
         </button>
-        <button class="card-btn" onclick="doRefresh('${a.id}', this)" ${isRefreshing ? 'disabled' : ''}>
+        <button class="card-btn" data-action="refresh" data-id="${escAttr(a.id)}" ${isRefreshing ? 'disabled' : ''}>
           ${isRefreshing ? '<span class="spinner"></span>' : '<svg viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.24-4.24M14 8a6 6 0 01-10.24 4.24M12 2v4h-4M4 14v-4h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>'}
           ${isRefreshing ? 'Refreshing' : 'Refresh'}
         </button>
-        <button class="card-btn danger" onclick="doDelete('${a.id}', this)">
+        <button class="card-btn danger" data-action="delete" data-id="${escAttr(a.id)}">
           <svg viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V2.5h4V4M5 4l.5 9h5L11 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
           Delete
         </button>
@@ -1879,9 +1882,30 @@ function stopAutoRefresh() {
   if (State.refreshTimer) { clearInterval(State.refreshTimer); State.refreshTimer = null; }
 }
 
+// ===== Account Grid Event Delegation =====
+let accountGridDelegationInit = false;
+function initAccountGridDelegation() {
+  if (accountGridDelegationInit) return;
+  accountGridDelegationInit = true;
+  document.getElementById('accountsGrid').addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.action;
+    const id = btn.dataset.id;
+    if (!id) return;
+    if (action === 'edit') openEditDrawer(id);
+    else if (action === 'test') doTest(id, btn);
+    else if (action === 'refresh') doRefresh(id, btn);
+    else if (action === 'delete') doDelete(id, btn);
+  });
+}
+
 // ===== Toast =====
 function toast(msg, type) {
   const wrap = document.getElementById('toastWrap');
+  while (wrap.children.length >= 5) {
+    wrap.firstChild.remove();
+  }
   const el = document.createElement('div');
   el.className = 'toast' + (type ? ' ' + type : '');
   el.textContent = msg;
@@ -1911,6 +1935,7 @@ function initReveal() {
 const PG = {
   messages: [],
   sending: false,
+  abortController: null,
 };
 
 function switchTab(name) {
@@ -1945,6 +1970,10 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+
+function escAttr(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function renderMarkdown(text) {
@@ -1984,11 +2013,17 @@ function renderMarkdown(text) {
   // Strikethrough
   html = html.replace(/~~([^~]+)~~/g, '<del>$1</del>');
   
-  // Links
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Links (sanitize javascript: and other dangerous protocols)
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, text, url) => {
+    const href = /^https?:\/\//i.test(url) ? url : '#';
+    return '<a href="' + href + '" target="_blank" rel="noopener">' + text + '</a>';
+  });
   
-  // Images
-  html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img alt="$1" src="$2" style="max-width:100%;border-radius:4px;">');
+  // Images (sanitize src protocol)
+  html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
+    if (!/^https?:\/\//i.test(src)) return '';
+    return '<img alt="' + alt + '" src="' + src + '" style="max-width:100%;border-radius:4px;">';
+  });
   
   // Blockquotes
   html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
@@ -2084,8 +2119,15 @@ function clearChat() {
   renderPgMessages();
 }
 
+function pgCancel() {
+  if (PG.abortController) {
+    PG.abortController.abort();
+    PG.abortController = null;
+  }
+}
+
 async function pgSend() {
-  if (PG.sending) return;
+  if (PG.sending) { pgCancel(); return; }
   const input = document.getElementById('pgInput');
   const text = input.value.trim();
   if (!text) return;
@@ -2098,25 +2140,27 @@ async function pgSend() {
   PG.messages.push({ role: 'assistant', content: '', thinking: '', thinkingCollapsed: false });
   PG.sending = true;
 
+  PG.abortController = new AbortController();
   const btn = document.getElementById('pgSend');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>';
+  btn.innerHTML = '<span class="spinner"></span><span>停止</span>';
 
   renderPgMessages();
 
   const model = document.getElementById('pgModel').value;
   const thinking = document.getElementById('pgThinking').value;
 
+  // Build history: all messages except the empty assistant placeholder at the end.
+  const history = PG.messages.slice(0, -1).filter(m =>
+    (m.content && m.content.trim()) || m.role === 'user'
+  ).map(m => ({
+    role: m.role,
+    content: m.content
+  }));
   const reqBody = {
     model: model,
     stream: true,
-    messages: PG.messages.filter(m => m.content || m.role === 'user').slice(0, -1).map(m => ({
-      role: m.role,
-      content: m.content
-    }))
+    messages: history
   };
-  // Add current user message
-  reqBody.messages.push({ role: 'user', content: text });
 
   if (thinking) {
     reqBody.reasoning_effort = thinking;
@@ -2126,7 +2170,8 @@ async function pgSend() {
     const res = await fetch('/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + State.token },
-      body: JSON.stringify(reqBody)
+      body: JSON.stringify(reqBody),
+      signal: PG.abortController.signal
     });
 
     if (!res.ok) {
@@ -2181,13 +2226,19 @@ async function pgSend() {
     }
 
   } catch(e) {
-    // Update the assistant message with error
     const assistantIdx = PG.messages.length - 1;
-    if (PG.messages[assistantIdx] && PG.messages[assistantIdx].role === 'assistant') {
-      PG.messages[assistantIdx].content = '❌ 错误: ' + e.message;
+    if (e.name === 'AbortError') {
+      if (PG.messages[assistantIdx] && PG.messages[assistantIdx].role === 'assistant' && !PG.messages[assistantIdx].content) {
+        PG.messages[assistantIdx].content = '(已取消)';
+      }
+    } else {
+      if (PG.messages[assistantIdx] && PG.messages[assistantIdx].role === 'assistant') {
+        PG.messages[assistantIdx].content = '❌ 错误: ' + e.message;
+      }
+      toast('对话失败: ' + e.message, 'err');
     }
-    toast('对话失败: ' + e.message, 'err');
   } finally {
+    PG.abortController = null;
     PG.sending = false;
     btn.disabled = false;
     btn.innerHTML = '<svg viewBox="0 0 16 16" fill="none"><path d="M2 8l12-5-5 12-2-5-5-2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg><span>发送</span>';
@@ -2204,7 +2255,6 @@ async function pgSend() {
 // ===== Requests =====
 const RequestState = {
   requests: [],
-  stats: null,
   refreshTimer: null
 };
 
@@ -2225,29 +2275,12 @@ async function fetchRequests() {
   }
 }
 
-async function fetchRequestStats() {
-  try {
-    const res = await fetch('/admin/requests/stats', {
-      headers: { 'X-Cookie-Sync-Token': State.token }
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    RequestState.stats = await res.json();
-    renderRequestStats();
-  } catch (e) {
-    console.error('Failed to fetch request stats:', e);
-  }
-}
-
 function renderRequestStats() {
-  if (!RequestState.stats) return;
-  const s = RequestState.stats;
-  document.getElementById('reqStatTotal').textContent = s.total || 0;
-  document.getElementById('reqStatSuccess').textContent = s.success_count || 0;
-  document.getElementById('reqStatErrors').textContent = s.error_count || 0;
-
-  // Count streaming requests
-  const streamCount = RequestState.requests.filter(r => r.stream).length;
-  document.getElementById('reqStatStream').textContent = streamCount;
+  const reqs = RequestState.requests;
+  document.getElementById('reqStatTotal').textContent = reqs.length;
+  document.getElementById('reqStatSuccess').textContent = reqs.filter(r => r.status === 'success').length;
+  document.getElementById('reqStatErrors').textContent = reqs.filter(r => r.status === 'error').length;
+  document.getElementById('reqStatStream').textContent = reqs.filter(r => r.stream).length;
 }
 
 function renderRequests() {
@@ -2263,7 +2296,7 @@ function renderRequests() {
   }
 
   if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">暂无记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">暂无记录</td></tr>';
     return;
   }
 
@@ -2281,6 +2314,7 @@ function renderRequests() {
       <td class="req-time" title="${date} ${time}">${time}</td>
       <td class="req-model">${escapeHtml(model)}</td>
       <td class="req-stream ${r.stream ? 'active' : ''}">${streamIcon} ${r.stream ? 'Stream' : 'Standard'}</td>
+      <td class="req-account">${escapeHtml(r.account_id || '-')}</td>
       <td><span class="req-status ${statusClass}">${statusText}</span></td>
       <td class="req-duration">${firstByte}</td>
       <td class="req-duration">${duration}</td>
@@ -2314,7 +2348,6 @@ State.token = getToken();
 if (State.token) {
   verifyAndEnter();
 }
-startRequestRefresh();
 </script>
 </body>
 </html>
