@@ -36,7 +36,7 @@ data/cookies/
 data/openai-files/
 data/state/
 tools/cookie-worker/profiles/
-tools/cookie-worker/.env.*
+tools/cookie-worker/.env
 
 # env file
 .env
