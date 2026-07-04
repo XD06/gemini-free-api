@@ -58,6 +58,8 @@ tmp_server_stderr.txt
 # server
 ./server
 
+docs/superpowers/
+docs/bug.md
 # compiled binary
 gemini-free-api
 gemini-free-api.exe

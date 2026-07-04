@@ -246,28 +246,6 @@ GEMINI_ACCOUNT_ACC2_PRIORITY=2
 | `./.env` | 配置文件（只读挂载） | 修改后 `docker compose restart` 生效 |
 | `./.cookies` | Cookie jar 文件 | 可选 |
 
-### 常用命令
-
-```bash
-# 重新构建并启动
-docker compose up -d --build
-
-# 查看实时日志
-docker compose logs -f
-
-# 仅重启服务（配置更新后）
-docker compose restart
-
-# 停止服务
-docker compose down
-
-# 完全清理（包括数据卷）
-docker compose down -v
-
-# 进入容器调试
-docker compose exec app sh
-```
-
 ### 构建特性
 
 - **多阶段构建**：分离编译和运行环境，镜像体积更小
@@ -313,4 +291,4 @@ go test ./...
 
 ## 说明
 
-基于 [ntthanh2603/gemini-web-to-api](https://github.com/ntthanh2603/gemini-web-to-api) 修改。Gemini 网页端结构可能变化，涉及 `f.req`、`x-goog-ext-*`、`c/r/rc/context token` 的行为以抓包和回归测试为准。
+本项目基于[ntthanh2603/gemini-web-to-api](https://github.com/ntthanh2603/gemini-web-to-api) ，后重塑了主要功能，优化了整个请求链路，保留了部分特性。Gemini 网页端结构可能变化，涉及 `f.req`、`x-goog-ext-*`、`c/r/rc/context token` 的行为以抓包和回归测试为准。
