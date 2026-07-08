@@ -1209,153 +1209,183 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		return err
 	}
 
-	requestID := strings.ToUpper(uuid.NewString())
 	resolvedModelID := config.Model
 	expectedConversationCID := c.conversationID(config.ConversationID)
 	sourcePath := ""
 	if config.SourcePath {
 		sourcePath = c.conversationSourcePath(config.ConversationID)
 	}
-	inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
-	innerJSON, _ := json.Marshal(inner)
-	outer := []interface{}{nil, string(innerJSON)}
-	outerJSON, _ := json.Marshal(outer)
 
-	formValues := url.Values{}
-	formValues.Set("at", at)
-	formValues.Set("f.req", string(outerJSON))
-	formBody := formValues.Encode()
-
-	queryValues := url.Values{}
-	queryValues.Set("at", at)
-	queryValues.Set("hl", language)
-	queryValues.Set("_reqid", c.nextRequestID())
-	queryValues.Set("rt", "c")
-	if sourcePath != "" {
-		queryValues.Set("source-path", sourcePath)
-	}
-	if buildLabel != "" {
-		queryValues.Set("bl", buildLabel)
-	}
-	if sessionID != "" {
-		queryValues.Set("f.sid", sessionID)
-	}
-	generateURL := EndpointGenerate + "?" + queryValues.Encode()
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", generateURL, strings.NewReader(formBody))
-	if err != nil {
-		return fmt.Errorf("failed to build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
-	httpReq.Header.Set("Origin", "https://gemini.google.com")
-	httpReq.Header.Set("Referer", "https://gemini.google.com/")
-	httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	httpReq.Header.Set("X-Same-Domain", "1")
-	setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel)
-	if cookieHdr != "" {
-		httpReq.Header.Set("Cookie", cookieHdr)
-	}
-	debugCapture := newStreamDebugCapture(requestID, resolvedModelID, c.log)
-	if debugCapture != nil {
-		defer debugCapture.Close()
-		debugCapture.DumpRequest(generateURL, formBody, httpReq.Header)
-	}
-	maybeDumpStreamRequest(generateURL, formBody, httpReq.Header)
-	logTrace("gemini stream request prepared",
-		zap.String("request_id", requestID),
-		zap.String("url", generateURL),
-		zap.String("account", c.accountID),
-		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
-		zap.String("proxy", redactProxyURL(c.proxyURL)),
-		zap.Int("prompt_len", len(prompt)),
-		zap.Int("uploaded_files", len(uploadedFiles)),
-	)
-
-	requestStart := time.Now()
-	httpResp, err := c.rawHTTPClient.Do(httpReq)
-	if err != nil {
-		return fmt.Errorf("stream request failed: %w", err)
-	}
-	defer httpResp.Body.Close()
-	logTrace("gemini upstream response headers received",
-		zap.Duration("round_trip", time.Since(requestStart)),
-		zap.Int("status", httpResp.StatusCode),
-	)
-	if httpResp.StatusCode != http.StatusOK {
-		bodySnippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, 2048))
-		snippet := strings.TrimSpace(string(bodySnippet))
-		c.log.Warn("Gemini stream returned non-200",
-			zap.Int("status", httpResp.StatusCode),
-			zap.String("body_snippet", snippet),
-			zap.String("request_id", requestID),
-			zap.String("url", generateURL),
-		)
-		if snippet != "" {
-			return fmt.Errorf("stream returned status %d: %s", httpResp.StatusCode, snippet)
-		}
-		return fmt.Errorf("stream returned status %d", httpResp.StatusCode)
+	maxAttempts := c.maxRetries
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
 
-	var lastText string
-	var lastContentAt time.Time
-	var buf bytes.Buffer
-	var lastParseLen int // bytes of buf at last text-extraction attempt; used to throttle re-parses
-	continuityChecked := expectedConversationCID == ""
-	metadataStored := false
-	finalizeStreamConversation := func() error {
-		metadata := extractConversationMetadataFromBuffer(buf.Bytes())
-		if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
-			return err
-		}
-		c.updateConversation(config.ConversationID, metadata)
-		return nil
-	}
-	finishIdleTimeout := streamFinishIdleTimeout()
-	firstContentTimeout := streamFirstContentTimeout()
-	firstContentDeadline := time.Now().Add(firstContentTimeout)
-	firstByteLogged := false
-	firstTextLogged := false
-	entryTrace := newStreamEntryTrace(20)
-	if debugCapture != nil {
-		defer func() {
-			entryTrace.Flush(time.Since(requestStart))
-			debugCapture.DumpEntryTrace(entryTrace)
-		}()
-	}
-	var debugStreamFile *os.File
-	if debugPath := strings.TrimSpace(os.Getenv("GEMINI_DEBUG_STREAM_PATH")); debugPath != "" {
-		if err := os.MkdirAll(filepath.Dir(debugPath), 0755); err == nil {
-			if f, err := os.Create(debugPath); err == nil {
-				debugStreamFile = f
-				defer debugStreamFile.Close()
-			} else {
-				c.log.Warn("failed to create stream debug capture", zap.String("path", debugPath), zap.Error(err))
+	var lastStreamErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := time.Duration(1<<uint(attempt-2)) * time.Second
+			c.log.Warn("Retrying stream request",
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", maxAttempts),
+				zap.Duration("backoff", backoff),
+				zap.Error(lastStreamErr),
+			)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		}
-	}
-	readCtx, stopReader := context.WithCancel(ctx)
-	defer stopReader()
-	readCh := make(chan streamReadResult, 1)
-	go readStreamChunks(readCtx, httpResp.Body, readCh)
 
-	// Create timers once and reuse via Reset to avoid per-iteration allocation.
-	var idleTimer *time.Timer
-	var firstContentTimer *time.Timer
-	defer func() {
-		if idleTimer != nil {
-			idleTimer.Stop()
-		}
-		if firstContentTimer != nil {
-			firstContentTimer.Stop()
-		}
-	}()
+		requestID := strings.ToUpper(uuid.NewString())
+		inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
+		innerJSON, _ := json.Marshal(inner)
+		outer := []interface{}{nil, string(innerJSON)}
+		outerJSON, _ := json.Marshal(outer)
 
-readLoop:
-	for {
-		var idleCh <-chan time.Time
-		var firstContentCh <-chan time.Time
-		if timeout, ok := streamFinishIdleRemaining(lastText, lastContentAt, finishIdleTimeout); ok {
-			if timeout <= 0 {
+		formValues := url.Values{}
+		formValues.Set("at", at)
+		formValues.Set("f.req", string(outerJSON))
+		formBody := formValues.Encode()
+
+		queryValues := url.Values{}
+		queryValues.Set("at", at)
+		queryValues.Set("hl", language)
+		queryValues.Set("_reqid", c.nextRequestID())
+		queryValues.Set("rt", "c")
+		if sourcePath != "" {
+			queryValues.Set("source-path", sourcePath)
+		}
+		if buildLabel != "" {
+			queryValues.Set("bl", buildLabel)
+		}
+		if sessionID != "" {
+			queryValues.Set("f.sid", sessionID)
+		}
+		generateURL := EndpointGenerate + "?" + queryValues.Encode()
+
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", generateURL, strings.NewReader(formBody))
+		if err != nil {
+			lastStreamErr = fmt.Errorf("failed to build request: %w", err)
+			continue
+		}
+		httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+		httpReq.Header.Set("Origin", "https://gemini.google.com")
+		httpReq.Header.Set("Referer", "https://gemini.google.com/")
+		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		httpReq.Header.Set("X-Same-Domain", "1")
+		setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel)
+		if cookieHdr != "" {
+			httpReq.Header.Set("Cookie", cookieHdr)
+		}
+		debugCapture := newStreamDebugCapture(requestID, resolvedModelID, c.log)
+		if debugCapture != nil {
+			debugCapture.DumpRequest(generateURL, formBody, httpReq.Header)
+		}
+		maybeDumpStreamRequest(generateURL, formBody, httpReq.Header)
+		logTrace("gemini stream request prepared",
+			zap.String("request_id", requestID),
+			zap.String("url", generateURL),
+			zap.String("account", c.accountID),
+			zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
+			zap.String("proxy", redactProxyURL(c.proxyURL)),
+			zap.Int("prompt_len", len(prompt)),
+			zap.Int("uploaded_files", len(uploadedFiles)),
+			zap.Int("attempt", attempt),
+		)
+
+		requestStart := time.Now()
+		httpResp, err := c.rawHTTPClient.Do(httpReq)
+		if err != nil {
+			lastStreamErr = fmt.Errorf("stream request failed: %w", err)
+			if debugCapture != nil {
+				debugCapture.Close()
+			}
+			continue
+		}
+
+		logTrace("gemini upstream response headers received",
+			zap.Duration("round_trip", time.Since(requestStart)),
+			zap.Int("status", httpResp.StatusCode),
+		)
+		if httpResp.StatusCode != http.StatusOK {
+			bodySnippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, 2048))
+			httpResp.Body.Close()
+			snippet := strings.TrimSpace(string(bodySnippet))
+			c.log.Warn("Gemini stream returned non-200",
+				zap.Int("status", httpResp.StatusCode),
+				zap.String("body_snippet", snippet),
+				zap.String("request_id", requestID),
+				zap.String("url", generateURL),
+				zap.Int("attempt", attempt),
+			)
+			if snippet != "" {
+				lastStreamErr = fmt.Errorf("stream returned status %d: %s", httpResp.StatusCode, snippet)
+			} else {
+				lastStreamErr = fmt.Errorf("stream returned status %d", httpResp.StatusCode)
+			}
+			if httpResp.StatusCode >= 500 {
+				if debugCapture != nil {
+					debugCapture.Close()
+				}
+				continue
+			}
+			if debugCapture != nil {
+				debugCapture.Close()
+			}
+			break // 4xx errors: no point retrying
+		}
+
+		// --- Stream reading loop ---
+		var lastText string
+		var lastContentAt time.Time
+		var buf bytes.Buffer
+		var lastParseLen int
+		continuityChecked := expectedConversationCID == ""
+		metadataStored := false
+		finalizeStreamConversation := func() error {
+			metadata := extractConversationMetadataFromBuffer(buf.Bytes())
+			if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
+				return err
+			}
+			c.updateConversation(config.ConversationID, metadata)
+			return nil
+		}
+		finishIdleTimeout := streamFinishIdleTimeout()
+		firstContentTimeout := streamFirstContentTimeout()
+		firstContentDeadline := time.Now().Add(firstContentTimeout)
+		firstByteLogged := false
+		firstTextLogged := false
+		entryTrace := newStreamEntryTrace(20)
+		if debugCapture != nil {
+			entryTrace.Flush(time.Since(requestStart))
+			debugCapture.DumpEntryTrace(entryTrace)
+		}
+		var debugStreamFile *os.File
+		if debugPath := strings.TrimSpace(os.Getenv("GEMINI_DEBUG_STREAM_PATH")); debugPath != "" {
+			if err := os.MkdirAll(filepath.Dir(debugPath), 0755); err == nil {
+				if f, err := os.Create(debugPath); err == nil {
+					debugStreamFile = f
+					defer debugStreamFile.Close()
+				} else {
+					c.log.Warn("failed to create stream debug capture", zap.String("path", debugPath), zap.Error(err))
+				}
+			}
+		}
+		readCtx, stopReader := context.WithCancel(ctx)
+		readCh := make(chan streamReadResult, 1)
+		go readStreamChunks(readCtx, httpResp.Body, readCh)
+
+		var idleTimer *time.Timer
+		var firstContentTimer *time.Timer
+
+	readLoop:
+		for {
+			var idleCh <-chan time.Time
+			var firstContentCh <-chan time.Time
+			if timeout, ok := streamFinishIdleRemaining(lastText, lastContentAt, finishIdleTimeout); ok {
+				if timeout <= 0 {
 				logTrace("gemini stream finish idle timeout reached",
 					zap.Duration("idle_timeout", finishIdleTimeout),
 					zap.Int("final_text_len", len(lastText)),
@@ -1518,10 +1548,31 @@ readLoop:
 
 		if result.err != nil {
 			if result.err != io.EOF {
-				return fmt.Errorf("stream read: %w", result.err)
+				lastStreamErr = fmt.Errorf("stream read: %w", result.err)
+				stopReader()
+				httpResp.Body.Close()
+				if idleTimer != nil {
+					idleTimer.Stop()
+				}
+				if firstContentTimer != nil {
+					firstContentTimer.Stop()
+				}
+				if lastText == "" && attempt < maxAttempts {
+					break readLoop // retry
+				}
+				return lastStreamErr
 			}
 			break readLoop
 		}
+	}
+	// Clean up reader and response for this attempt
+	stopReader()
+	httpResp.Body.Close()
+	if idleTimer != nil {
+		idleTimer.Stop()
+	}
+	if firstContentTimer != nil {
+		firstContentTimer.Stop()
 	}
 	entryTrace.Flush(time.Since(requestStart))
 	if debugCapture != nil {
@@ -1534,12 +1585,38 @@ readLoop:
 	)
 	if lastText == "" {
 		if code := extractBardErrorCode(buf.Bytes()); code != "" {
+			lastStreamErr = fmt.Errorf("gemini bard error %s", code)
+			if attempt < maxAttempts {
+				c.log.Warn("Stream returned bard error, will retry",
+					zap.String("code", code),
+					zap.Int("attempt", attempt),
+				)
+				continue
+			}
 			c.markConversationUntrusted(config.ConversationID)
-			return fmt.Errorf("gemini bard error %s", code)
+			return lastStreamErr
 		}
-		return fmt.Errorf("gemini stream completed without parsed content")
+		lastStreamErr = fmt.Errorf("gemini stream completed without parsed content")
+		if attempt < maxAttempts {
+			c.log.Warn("Stream completed without content, will retry",
+				zap.Int("attempt", attempt),
+			)
+			continue
+		}
+		return lastStreamErr
+	}
+	// Success
+	if attempt > 1 {
+		c.log.Info("Stream succeeded after retry", zap.Int("attempt", attempt))
 	}
 	return finalizeStreamConversation()
+	} // end retry loop
+
+	c.log.Error("Stream failed after all attempts",
+		zap.Int("attempts", maxAttempts),
+		zap.Error(lastStreamErr),
+	)
+	return fmt.Errorf("after %d attempts: %w", maxAttempts, lastStreamErr)
 }
 
 func extractBardErrorCode(data []byte) string {
