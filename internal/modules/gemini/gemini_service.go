@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"gemini-free-api/internal/commons/utils"
 	"gemini-free-api/internal/modules/gemini/dto"
@@ -140,39 +139,174 @@ func extensionForMimeType(mimeType string) string {
 	}
 }
 
-// GenerateContentStream handles Gemini's streaming simulation logic in the service layer.
+// GenerateContentStream handles real streaming by forwarding provider stream deltas
+// to the client. When tools are present, the response is buffered for tool-bridge
+// parsing; otherwise deltas are forwarded immediately as GeminiGenerateResponse chunks.
 func (s *GeminiService) GenerateContentStream(ctx context.Context, modelID string, req dto.GeminiGenerateRequest, onEvent func(dto.GeminiGenerateResponse) bool) error {
-	resp, err := s.GenerateContent(ctx, modelID, req)
-	if err != nil {
-		return err
-	}
-
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return nil
-	}
-
-	candidate := resp.Candidates[0]
-	hasFunctionCall := false
-	for _, part := range candidate.Content.Parts {
-		if part.FunctionCall != nil {
-			hasFunctionCall = true
-			break
+	// Extract prompt and input files (same logic as GenerateContent)
+	var promptBuilder strings.Builder
+	inputFiles := make([]providers.InputFile, 0)
+	for _, content := range req.Contents {
+		for i, part := range content.Parts {
+			if part.Text != "" {
+				promptBuilder.WriteString(part.Text)
+				promptBuilder.WriteString("\n")
+			}
+			if part.InlineData != nil && part.InlineData.Data != "" {
+				data, err := providers.DecodeBase64Data(part.InlineData.Data)
+				if err != nil {
+					return fmt.Errorf("decode inline_data: %w", err)
+				}
+				inputFiles = append(inputFiles, providers.InputFile{
+					Name:     fmt.Sprintf("inline_%d%s", i+1, extensionForMimeType(part.InlineData.MimeType)),
+					MimeType: part.InlineData.MimeType,
+					Data:     data,
+				})
+			}
 		}
 	}
 
-	if hasFunctionCall {
-		// Send as one chunk if it's a function call
-		onEvent(*resp)
+	prompt := strings.TrimSpace(promptBuilder.String())
+	if prompt == "" && len(inputFiles) == 0 {
+		return fmt.Errorf("empty content")
+	}
+	if prompt == "" {
+		prompt = fmt.Sprintf("[%d file(s) attached]", len(inputFiles))
+	}
+
+	hasTools := len(req.Tools) > 0
+	if hasTools {
+		prompt = s.buildToolBridgePrompt(req, prompt)
+	}
+
+	opts := []providers.GenerateOption{providers.WithModel(modelID)}
+	if len(inputFiles) > 0 {
+		opts = append(opts, providers.WithInputFiles(inputFiles))
+	}
+
+	if hasTools {
+		return s.streamWithToolBridge(ctx, req, prompt, opts, onEvent)
+	}
+	return s.streamDirect(ctx, prompt, opts, onEvent)
+}
+
+// streamDirect forwards provider stream deltas to the client in real time as
+// GeminiGenerateResponse chunks, ending with a STOP finishReason chunk.
+func (s *GeminiService) streamDirect(
+	ctx context.Context,
+	prompt string,
+	opts []providers.GenerateOption,
+	onEvent func(dto.GeminiGenerateResponse) bool,
+) error {
+	var hasContent bool
+
+	handleStreamEvent := func(event providers.StreamEvent) bool {
+		switch event.Kind {
+		case "content_delta":
+			hasContent = true
+			return onEvent(dto.GeminiGenerateResponse{
+				Candidates: []dto.Candidate{
+					{
+						Index: 0,
+						Content: dto.Content{
+							Role:  "model",
+							Parts: []dto.Part{{Text: event.Delta}},
+						},
+					},
+				},
+			})
+		case "thinking_text":
+			// Gemini native API does not have a standard thinking field in the
+			// streaming response; skip thinking deltas to maintain compatibility.
+			return true
+		}
+		return true
+	}
+
+	streamErr := s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
+
+	// If stream errored, return immediately without sending empty content
+	if streamErr != nil {
+		return streamErr
+	}
+
+	// If nothing was received, send an empty chunk
+	if !hasContent {
+		if !onEvent(dto.GeminiGenerateResponse{
+			Candidates: []dto.Candidate{
+				{
+					Index: 0,
+					Content: dto.Content{
+						Role:  "model",
+						Parts: []dto.Part{{Text: ""}},
+					},
+				},
+			},
+		}) {
+			return nil
+		}
+	}
+
+	// Final STOP chunk
+	_ = onEvent(dto.GeminiGenerateResponse{
+		Candidates: []dto.Candidate{{Index: 0, FinishReason: "STOP"}},
+		UsageMetadata: &dto.UsageMetadata{
+			TotalTokenCount: 0,
+		},
+	})
+	return nil
+}
+
+// streamWithToolBridge buffers the provider stream, then parses the JSON output for
+// function calls. If function calls are found, they are emitted as a single chunk;
+// otherwise the text is streamed out.
+func (s *GeminiService) streamWithToolBridge(
+	ctx context.Context,
+	req dto.GeminiGenerateRequest,
+	prompt string,
+	opts []providers.GenerateOption,
+	onEvent func(dto.GeminiGenerateResponse) bool,
+) error {
+	var fullText strings.Builder
+
+	handleStreamEvent := func(event providers.StreamEvent) bool {
+		if event.Kind == "content_delta" {
+			fullText.WriteString(event.Delta)
+		}
+		return true
+	}
+
+	streamErr := s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
+	if streamErr != nil {
+		return streamErr
+	}
+
+	// Parse buffered output for function calls
+	functionCalls, text := s.parseToolBridgeOutput(req, fullText.String())
+
+	if len(functionCalls) > 0 {
+		resParts := make([]dto.Part, 0, len(functionCalls))
+		for _, fc := range functionCalls {
+			resParts = append(resParts, dto.Part{FunctionCall: &fc})
+		}
+		_ = onEvent(dto.GeminiGenerateResponse{
+			Candidates: []dto.Candidate{
+				{
+					Index: 0,
+					Content: dto.Content{
+						Role:  "model",
+						Parts: resParts,
+					},
+					FinishReason: "FUNCTION_CALL",
+				},
+			},
+			UsageMetadata: &dto.UsageMetadata{TotalTokenCount: 0},
+		})
 		return nil
 	}
 
-	// Simulated text streaming
-	var fullText strings.Builder
-	for _, part := range candidate.Content.Parts {
-		fullText.WriteString(part.Text)
-	}
-
-	chunks := utils.SplitResponseIntoChunks(fullText.String(), 30)
+	// Text content – stream in chunks
+	chunks := utils.SplitResponseIntoChunks(text, 30)
 	for _, content := range chunks {
 		if !onEvent(dto.GeminiGenerateResponse{
 			Candidates: []dto.Candidate{
@@ -187,16 +321,13 @@ func (s *GeminiService) GenerateContentStream(ctx context.Context, modelID strin
 		}) {
 			return nil
 		}
-		if !utils.SleepWithCancel(ctx, 30*time.Millisecond) {
-			return nil
-		}
 	}
 
 	// Final STOP chunk
-	onEvent(dto.GeminiGenerateResponse{
+	_ = onEvent(dto.GeminiGenerateResponse{
 		Candidates: []dto.Candidate{{Index: 0, FinishReason: "STOP"}},
+		UsageMetadata: &dto.UsageMetadata{TotalTokenCount: 0},
 	})
-
 	return nil
 }
 

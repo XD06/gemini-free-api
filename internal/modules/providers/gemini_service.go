@@ -621,8 +621,30 @@ func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string) {
 
 // startAutoRefresh periodically refreshes the PSIDTS cookie
 func (c *Client) startAutoRefresh() {
+	// consecutiveExpired counts how many times rotation failed with 401/403.
+	// Each failure doubles the backoff (up to 30 min) to avoid hammering
+	// Google when cookies are known-bad and waiting for external update.
+	consecutiveExpired := 0
+	const maxExpiredBackoff = 30 * time.Minute
+
 	for {
-		timer := time.NewTimer(jitterDuration(c.refreshInterval))
+		wait := jitterDuration(c.refreshInterval)
+		if consecutiveExpired > 0 {
+			backoff := c.refreshInterval * time.Duration(1<<uint(consecutiveExpired))
+			if backoff > maxExpiredBackoff {
+				backoff = maxExpiredBackoff
+			}
+			if backoff < c.refreshInterval {
+				backoff = c.refreshInterval
+			}
+			wait = backoff
+			c.log.Debug("Using exponential backoff for expired cookies",
+				zap.Int("consecutive_failures", consecutiveExpired),
+				zap.Duration("wait", wait),
+			)
+		}
+
+		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
 			c.log.Debug("Starting scheduled cookie refresh")
@@ -633,9 +655,11 @@ func (c *Client) startAutoRefresh() {
 					strings.Contains(rotateErr.Error(), "status 403")
 
 				if isCookieExpired {
+					consecutiveExpired++
 					c.log.Error("Cookies have expired — please update GEMINI_1PSID and GEMINI_1PSIDTS in .env",
 						zap.Error(rotateErr),
 						zap.String("action", "Visit https://gemini.google.com → F12 → Application → Cookies"),
+						zap.Int("consecutive_failures", consecutiveExpired),
 					)
 					c.mu.Lock()
 					c.healthy = false
@@ -666,7 +690,9 @@ func (c *Client) startAutoRefresh() {
 					c.setAccountState(AccountStateHealthy, nil)
 				}
 			} else {
-				// Rotation succeeded — also refresh session token to keep SNlM0e/at up to date
+				// Rotation succeeded — reset backoff counter
+				consecutiveExpired = 0
+				// Also refresh session token to keep SNlM0e/at up to date
 				if sessionErr := c.refreshSessionToken(); sessionErr != nil {
 					c.log.Warn("Cookie rotated but session token refresh failed", zap.Error(sessionErr))
 					c.setAccountState(AccountStateExpired, sessionErr)
@@ -738,17 +764,20 @@ func (c *Client) RotateCookies() error {
 }
 
 func (c *Client) rotateCookiesOnce() error {
+	// Read cookie values under lock, then release before the HTTP request
+	// to avoid blocking all other cookie reads/writes during the network call.
 	c.cookies.mu.Lock()
-	defer c.cookies.mu.Unlock()
+	psid := c.cookies.Secure1PSID
+	psidts := c.cookies.Secure1PSIDTS
+	c.cookies.mu.Unlock()
 
 	// Prepare cookies for rotation request
-	// NOTE: We access fields directly instead of using ToHTTPCookies() to avoid recursive locking (deadlock)
 	parts := []string{}
-	if c.cookies.Secure1PSID != "" {
-		parts = append(parts, fmt.Sprintf("__Secure-1PSID=%s", c.cookies.Secure1PSID))
+	if psid != "" {
+		parts = append(parts, fmt.Sprintf("__Secure-1PSID=%s", psid))
 	}
-	if c.cookies.Secure1PSIDTS != "" {
-		parts = append(parts, fmt.Sprintf("__Secure-1PSIDTS=%s", c.cookies.Secure1PSIDTS))
+	if psidts != "" {
+		parts = append(parts, fmt.Sprintf("__Secure-1PSIDTS=%s", psidts))
 	}
 	cookieStr := strings.Join(parts, "; ")
 
@@ -762,8 +791,11 @@ func (c *Client) rotateCookiesOnce() error {
 	req.Header.Set("Cookie", cookieStr)
 
 	c.log.Debug("Sending rotation request", zap.String("url", EndpointRotateCookies))
-	hClient := c.newHTTPClient(5 * time.Second)
-	resp, err := hClient.Do(req)
+	// Reuse the pooled rawHTTPClient (already configured with proxy, TLS, and
+	// connection pooling) instead of creating a new Transport on every call.
+	// Creating a new http.Transport each time leaks goroutines and forces a
+	// fresh TLS handshake on every rotation cycle.
+	resp, err := c.rawHTTPClient.Do(req)
 	if err != nil {
 		// Log as Info to avoid scary stacktraces in development mode for expected auth failures
 		c.log.Info("Rotation request failed (network/auth issue)", zap.String("error", err.Error()))
@@ -777,23 +809,28 @@ func (c *Client) rotateCookiesOnce() error {
 	}
 
 	// Extract new PSIDTS from Set-Cookie headers
+	newPSIDTS := ""
 	found := false
 	for _, cookie := range resp.Cookies() {
 		if cookie.Name == "__Secure-1PSIDTS" {
-			c.cookies.Secure1PSIDTS = cookie.Value
-			c.cookies.UpdatedAt = time.Now()
+			newPSIDTS = cookie.Value
 			found = true
-			// Save the new cookie to cache immediately
-			_ = c.SaveCachedCookies()
 		}
 		// Sync to req/v3 client for future calls
 		c.httpClient.SetCommonCookies(cookie)
 	}
 
 	if found {
-		c.log.Info("Cookie rotated successfully", zap.Time("updated_at", c.cookies.UpdatedAt))
+		// Write the new cookie value under lock.
+		c.cookies.mu.Lock()
+		c.cookies.Secure1PSIDTS = newPSIDTS
+		c.cookies.UpdatedAt = time.Now()
+		c.cookies.mu.Unlock()
+		// Save the new cookie to cache immediately
+		_ = c.SaveCachedCookies()
+		c.log.Info("Cookie rotated successfully", zap.Time("updated_at", time.Now()))
 	} else {
-		if c.cookies.Secure1PSIDTS == "" {
+		if psidts == "" {
 			return errors.New("failed to obtain __Secure-1PSIDTS from Google rotation endpoint. Your __Secure-1PSID cookie might be invalid or expired")
 		}
 		// Google returns 200 but omits a new cookie when the existing one is still valid — not an error
@@ -3480,7 +3517,7 @@ func (c *Client) SaveCachedCookies() error {
 	hash := sha256.Sum256([]byte(c.cookies.Secure1PSID))
 	filename := filepath.Join(".cookies", hex.EncodeToString(hash[:])+".txt")
 
-	err := os.WriteFile(filename, []byte(c.cookies.Secure1PSIDTS), 0600)
+	err := atomicWriteFile(filename, []byte(c.cookies.Secure1PSIDTS), 0600)
 	if err == nil {
 		c.log.Debug("Saved __Secure-1PSIDTS to local cache for future use", zap.String("file", filename))
 	} else {

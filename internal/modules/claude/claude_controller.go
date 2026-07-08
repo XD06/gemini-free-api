@@ -3,6 +3,7 @@ package claude
 import (
 	"bufio"
 	"context"
+	"sync"
 	"time"
 
 	common "gemini-free-api/internal/commons/utils"
@@ -18,6 +19,7 @@ import (
 type ClaudeController struct {
 	service *ClaudeService
 	log     *zap.Logger
+	mu      sync.RWMutex
 }
 
 func NewClaudeController(service *ClaudeService) *ClaudeController {
@@ -29,6 +31,8 @@ func NewClaudeController(service *ClaudeService) *ClaudeController {
 
 // SetLogger sets the logger for this handler
 func (h *ClaudeController) SetLogger(log *zap.Logger) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.log = log
 }
 
@@ -120,7 +124,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 					firstByteTime = time.Now()
 					firstByteRecorded = true
 				}
-				return common.SendSSEEvent(w, h.log, ev)
+				return common.SendSSEChunk(w, h.log, ev.Type, ev) == nil
 			})
 
 			duration := time.Since(startTime).Milliseconds()
@@ -142,7 +146,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 						Message: err.Error(),
 					},
 				}
-				_ = common.SendSSEEvent(w, h.log, errEv)
+				_ = common.SendSSEChunk(w, h.log, "error", errEv)
 			}
 
 			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{

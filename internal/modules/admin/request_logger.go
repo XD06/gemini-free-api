@@ -82,6 +82,17 @@ func (rl *RequestLogger) GetAll() []RequestRecord {
 	return rl.GetRecent(rl.size)
 }
 
+// Clear removes all stored records.
+func (rl *RequestLogger) Clear() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for i := range rl.records {
+		rl.records[i] = RequestRecord{}
+	}
+	rl.head = 0
+	rl.size = 0
+}
+
 // GetStats returns statistics for the logged requests
 func (rl *RequestLogger) GetStats() RequestStats {
 	rl.mu.RLock()
@@ -122,8 +133,8 @@ type RequestStats struct {
 	ByStatus     map[string]int `json:"by_status"`
 }
 
-// Global logger instance
-var globalLogger = NewRequestLogger(1000)
+// Global logger instance — keeps at most 100 records (in-memory, cleared on restart)
+var globalLogger = NewRequestLogger(100)
 
 // GetGlobalLogger returns the global request logger instance
 func GetGlobalLogger() *RequestLogger {

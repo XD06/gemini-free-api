@@ -42,18 +42,19 @@ type MessageResponse struct {
 
 // ConfigContent represents the content block in a response
 type ConfigContent struct {
-	Type  string `json:"type"` // "text" or "tool_use"
-	Text  string `json:"text,omitempty"`
-	ID    string `json:"id,omitempty"`    // for tool_use
-	Name  string `json:"name,omitempty"`  // for tool_use
-	Input map[string]interface{} `json:"input,omitempty"` // for tool_use
+	Type     string                 `json:"type"` // "text", "tool_use", or "thinking"
+	Text     string                 `json:"text,omitempty"`
+	Thinking string                 `json:"thinking,omitempty"` // for thinking
+	ID       string                 `json:"id,omitempty"`       // for tool_use
+	Name     string                 `json:"name,omitempty"`     // for tool_use
+	Input    map[string]interface{} `json:"input,omitempty"`    // for tool_use
 }
 
 // StreamEvent represents a streaming event
 type StreamEvent struct {
 	Type         string           `json:"type"`                    // e.g. message_start, content_block_delta
 	Message      *MessageResponse `json:"message,omitempty"`       // present in message_start
-	Index        int              `json:"index,omitempty"`         // present in content_block_start/delta
+	Index        *int             `json:"index,omitempty"`         // present in content_block_start/delta/stop
 	ContentBlock *ConfigContent   `json:"content_block,omitempty"` // present in content_block_start
 	DeltaField   *models.Delta    `json:"delta,omitempty"`         // present in content_block_delta
 	StopReason   string           `json:"stop_reason,omitempty"`   // present in message_stop

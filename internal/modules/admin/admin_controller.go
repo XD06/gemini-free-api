@@ -44,6 +44,7 @@ func (c *Controller) Register(group fiber.Router) {
 	group.Post("/proxy-test", c.HandleTestProxy)
 	group.Get("/requests", c.HandleListRequests)
 	group.Get("/requests/stats", c.HandleRequestStats)
+	group.Delete("/requests", c.HandleClearRequests)
 }
 
 func (c *Controller) HandleListAccounts(ctx fiber.Ctx) error {
@@ -434,4 +435,14 @@ func (c *Controller) HandleRequestStats(ctx fiber.Ctx) error {
 	stats := logger.GetStats()
 
 	return ctx.JSON(stats)
+}
+
+// HandleClearRequests clears all stored request records.
+func (c *Controller) HandleClearRequests(ctx fiber.Ctx) error {
+	if err := c.requireToken(ctx); err != nil {
+		return err
+	}
+	logger := GetGlobalLogger()
+	logger.Clear()
+	return ctx.JSON(fiber.Map{"status": "ok"})
 }

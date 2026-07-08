@@ -9,7 +9,7 @@
 | 能力 | OpenAI | Claude | Gemini 原生 |
 |:---|:---:|:---:|:---:|
 | 文本对话 | ✅ | ✅ | ✅ |
-| 流式输出 | **实时流** | 模拟流 | 模拟流 |
+| 流式输出 | **实时流** | **实时流** | **实时流** |
 | Thinking Level | ✅ | — | — |
 | 多轮上下文 | 实验性 | — | — |
 | 图片/文件输入 | ✅ | ✅ | ✅ |
@@ -83,6 +83,8 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 
 ### 流式对话
 
+**OpenAI 格式**：
+
 ```bash
 curl http://localhost:8787/openai/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -92,6 +94,31 @@ curl http://localhost:8787/openai/v1/chat/completions \
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
+
+**Claude 格式**：
+
+```bash
+curl http://localhost:8787/claude/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.5-flash",
+    "stream": true,
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+**Gemini 原生格式**：
+
+```bash
+curl http://localhost:8787/gemini/v1beta/models/gemini-3.5-flash:streamGenerateContent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"parts": [{"text": "你好"}]}]
+  }'
+```
+
+三种格式均支持真正的流式输出（real streaming），通过 provider 原生 stream 能力实时转发 delta，无需等待完整响应。
 
 ### Thinking Level
 
@@ -174,6 +201,12 @@ for chunk in stream:
 | toolBridge/toolPlanner 清理 | `pruneTranscriptContextsLocked` 遗漏这三组 map | 补全 TTL 清理 | 防止上下文缓存内存泄漏 |
 | `Close()` 双关 panic | 多次调用 `close(stopRefresh)` panic | `sync.Once` 保护 | 杜绝 panic |
 | `generateChatID` 碰撞 | `math/rand` 可能碰撞 | `crypto/rand` 24 字符 hex | 彻底消除碰撞 |
+| Claude/Gemini 假流式 | 先获取完整响应再逐字模拟，首字节延迟极大 | 调用 provider 原生 stream 接口实时转发 delta | 三种格式首字节延迟一致 |
+| Claude SSE 格式不规范 | 仅发送 `data:` 行，缺少 `event:` 行 | 使用 `SendSSEChunk` 同时发送 `event:` + `data:` | 符合 Anthropic API 规范 |
+| Claude `Index=0` 丢失 | `int` + `omitempty` 导致序列化省略 index=0 | 改用 `*int` 指针类型 | 第一个内容块的 index 正确输出 |
+| 流式错误检查顺序错误 | 出错时先发送空内容块再返回错误 | 出错时直接返回错误，不发送空内容 | 客户端不再收到误导性空内容 |
+| Claude/Gemini 日志静默丢弃 | module 未调用 `SetLogger`，一直使用 NopLogger | module 的 `RegisterRoutes` 注入 logger | 错误日志正常输出 |
+| Claude controller data race | `SetLogger` 无锁保护 | 添加 `sync.RWMutex` | 杜绝并发读写竞态 |
 
 ### Benchmark 结果
 
