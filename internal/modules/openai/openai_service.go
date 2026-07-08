@@ -1193,7 +1193,7 @@ func shouldRetryFreshProviderContext(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	for _, token := range []string{
-		"gemini bard error",
+		"gemini bard error 1060",
 		"authentication failed",
 		"cookies invalid",
 		"status 401",

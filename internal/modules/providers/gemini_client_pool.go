@@ -517,7 +517,7 @@ func isAuthOrSessionError(err error) bool {
 		"status 401",
 		"status 403",
 		"barderrorinfo",
-		"bard error",
+		"gemini bard error 1060",
 		"no healthy gemini accounts",
 	} {
 		if strings.Contains(msg, strings.ToLower(token)) {
