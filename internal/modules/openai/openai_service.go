@@ -1170,7 +1170,7 @@ func shouldRetrySameProviderContext(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	for _, token := range []string{
-		"gemini bard error 1097",
+		"gemini bard error",
 		"conversation continuity mismatch",
 		"authentication failed",
 		"cookies invalid",
@@ -1193,6 +1193,7 @@ func shouldRetryFreshProviderContext(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	for _, token := range []string{
+		"gemini bard error",
 		"authentication failed",
 		"cookies invalid",
 		"status 401",

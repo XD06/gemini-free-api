@@ -517,6 +517,7 @@ func isAuthOrSessionError(err error) bool {
 		"status 401",
 		"status 403",
 		"barderrorinfo",
+		"bard error",
 		"no healthy gemini accounts",
 	} {
 		if strings.Contains(msg, strings.ToLower(token)) {
@@ -1142,6 +1143,7 @@ func (p *ClientPool) TestAccount(ctx context.Context, accountID string) (string,
 	}
 	resp, err := client.GenerateContent(ctx, "Hi, please reply with only the word: OK")
 	if err != nil {
+		p.markClientError(client, err)
 		return "", err
 	}
 	if resp == nil {
