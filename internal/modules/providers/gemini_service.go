@@ -3340,6 +3340,13 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 		}, nil
 	}
 
+	// Before returning a generic parse error, check for BardErrorInfo which
+	// indicates a Google-side error (e.g. expired cookies, rate limit, etc.)
+	if code := extractBardErrorCode([]byte(text)); code != "" {
+		c.markConversationUntrusted("")
+		return nil, fmt.Errorf("gemini bard error %s", code)
+	}
+
 	sample := text
 	if len(sample) > 500 {
 		sample = sample[:500]
