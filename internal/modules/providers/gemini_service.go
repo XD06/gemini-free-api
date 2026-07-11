@@ -157,8 +157,9 @@ func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfi
 		ForceAttemptHTTP2:     true,
 	}
 	rawClient := &http.Client{
-		Transport: rawTransport,
-		Timeout:   5 * time.Minute,
+		Transport:     rawTransport,
+		Timeout:       5 * time.Minute,
+		CheckRedirect: stopGoogleRedirects,
 	}
 
 	refreshIntervalMinutes := cfg.Gemini.RefreshInterval
@@ -299,6 +300,24 @@ func (c *Client) nextRequestID() string {
 	return strconv.FormatUint(atomic.AddUint64(&c.requestSeq, 100000), 10)
 }
 
+func stopGoogleRedirects(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+
+func googleChallengeError(resp *http.Response) error {
+	if resp == nil { return nil }
+	urls := []string{}
+	if resp.Request != nil && resp.Request.URL != nil { urls = append(urls, resp.Request.URL.String()) }
+	if location := strings.TrimSpace(resp.Header.Get("Location")); location != "" { urls = append(urls, location) }
+	for _, rawURL := range urls {
+		parsed, err := url.Parse(rawURL)
+		if err != nil { continue }
+		host := strings.ToLower(parsed.Hostname())
+		if (host == "google.com" || strings.HasSuffix(host, ".google.com")) && strings.HasPrefix(parsed.Path, "/sorry/") {
+			return errors.New("Gemini access blocked by a Google challenge page; the configured proxy egress IP is restricted, so Cookie validity could not be checked. Change or rotate the proxy exit and retry")
+		}
+	}
+	return nil
+}
+
 func (c *Client) newHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
@@ -310,7 +329,8 @@ func (c *Client) newHTTPClient(timeout time.Duration) *http.Client {
 			ResponseHeaderTimeout: 15 * time.Second,
 			ForceAttemptHTTP2:     true,
 		},
-		Timeout: timeout,
+		Timeout:       timeout,
+		CheckRedirect: stopGoogleRedirects,
 	}
 }
 
@@ -505,6 +525,9 @@ func (c *Client) refreshSessionTokenContext(parent context.Context) error {
 		return fmt.Errorf("failed to reach gemini app: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := googleChallengeError(resp); err != nil {
+		return err
+	}
 
 	var bodyReader io.ReadCloser = resp.Body
 	// Transport-driven gzip auto-decompression normally clears the

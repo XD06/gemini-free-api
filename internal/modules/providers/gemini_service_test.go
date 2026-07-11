@@ -1340,3 +1340,39 @@ func TestParseResponseKeepsMostCompleteCandidate(t *testing.T) {
 	if err != nil { t.Fatal(err) }
 	if resp.Text != complete { t.Fatalf("expected complete candidate %q, got %q", complete, resp.Text) }
 }
+
+
+func TestGoogleChallengeErrorClassifiesSorryRedirect(t *testing.T) {
+	request, _ := http.NewRequest(http.MethodGet, "https://gemini.google.com/app?hl=en", nil)
+	resp := &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://www.google.com/sorry/index?continue=x"}}, Request: request}
+	err := googleChallengeError(resp)
+	if err == nil || !strings.Contains(err.Error(), "proxy egress IP") { t.Fatalf("expected actionable Google challenge error, got %v", err) }
+}
+
+func TestGeminiHTTPClientsStopAtRedirectResponse(t *testing.T) {
+	client := &Client{}
+	httpClient := client.newHTTPClient(time.Second)
+	request, _ := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if err := httpClient.CheckRedirect(request, nil); !errors.Is(err, http.ErrUseLastResponse) { t.Fatalf("expected redirect policy to stop, got %v", err) }
+}
+
+func TestUpdateCookiesStopsOnGoogleChallengeAndRollsBack(t *testing.T) {
+	calls := 0
+	client := &Client{
+		accountID: "test",
+		cookies: &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"},
+		httpClient: req.NewClient(),
+		rawHTTPClient: &http.Client{
+			Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://www.google.com/sorry/index?continue=x"}}, Body: io.NopCloser(strings.NewReader("challenge")), Request: request}, nil
+			}),
+			CheckRedirect: stopGoogleRedirects,
+		},
+		log: zap.NewNop(),
+	}
+	err := client.UpdateCookies(context.Background(), "new-psid", "new-ts")
+	if err == nil || !strings.Contains(err.Error(), "proxy egress IP") { t.Fatalf("expected actionable proxy challenge error, got %v", err) }
+	if calls != 2 { t.Fatalf("expected one request per validation step, not a redirect loop; got %d requests", calls) }
+	if got := client.GetCookies(); got.Secure1PSID != "old-psid" || got.Secure1PSIDTS != "old-ts" { t.Fatalf("expected failed update to roll back cookies, got %#v", got) }
+}
