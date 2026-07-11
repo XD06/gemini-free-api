@@ -320,6 +320,8 @@ func (c *Controller) HandleTestProxy(ctx fiber.Ctx) error {
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   15 * time.Second,
+		// A challenge/login redirect still proves the proxy can reach Google.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
 	testURL := "https://gemini.google.com"

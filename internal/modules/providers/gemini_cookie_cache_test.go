@@ -29,7 +29,7 @@ func TestApplyCookieCacheFillsMissingAccountCookies(t *testing.T) {
 	}
 }
 
-func TestApplyCookieCacheOverridesEnvCookies(t *testing.T) {
+func TestApplyCookieCachePreservesExplicitEnvCookies(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
 	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "", "worker"); err != nil {
@@ -46,11 +46,11 @@ func TestApplyCookieCacheOverridesEnvCookies(t *testing.T) {
 		Secure1PSIDTS: "env-ts",
 		CookieSource:  "env",
 	}})
-	if accounts[0].Secure1PSID != "cached-psid" || accounts[0].Secure1PSIDTS != "cached-ts" {
-		t.Fatalf("expected cache cookies to win, got %#v", accounts[0])
+	if accounts[0].Secure1PSID != "env-psid" || accounts[0].Secure1PSIDTS != "env-ts" {
+		t.Fatalf("explicit env cookies must win, got %#v", accounts[0])
 	}
-	if accounts[0].CookieSource != "cache" {
-		t.Fatalf("expected cookie source cache, got %q", accounts[0].CookieSource)
+	if accounts[0].CookieSource != "env" {
+		t.Fatalf("expected cookie source env, got %q", accounts[0].CookieSource)
 	}
 }
 

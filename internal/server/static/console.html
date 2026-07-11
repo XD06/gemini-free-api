@@ -1799,6 +1799,7 @@ async function doTest(id, btn) {
     const result = await apiTestAccount(id);
     const reply = result.reply ? ' · 回复: ' + result.reply : '';
     toast('账号 ' + id + ' 可用 · ' + result.latency + 'ms' + reply, 'ok');
+    fetchAccounts();
   } catch(e) {
     toast('测试失败: ' + e.message, 'err');
   } finally {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -356,4 +357,46 @@ func TestUpdateAccountProxyCopiesCookiesToCandidate(t *testing.T) {
 	if !strings.Contains(gotCookieHeader, "__Secure-1PSID=cookie") || !strings.Contains(gotCookieHeader, "__Secure-1PSIDTS=ts") {
 		t.Fatalf("expected current auth cookies copied to candidate validation, got %q", gotCookieHeader)
 	}
+}
+
+
+func TestValidateProxyCandidateAcceptsChallengeRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/sorry", http.StatusFound)
+	}))
+	defer server.Close()
+
+	oldURL := validateProxyURL
+	validateProxyURL = server.URL
+	defer func() { validateProxyURL = oldURL }()
+
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	if err := validateProxyCandidate(context.Background(), client, ""); err != nil {
+		t.Fatalf("challenge redirect should prove proxy reachability: %v", err)
+	}
+}
+
+func TestAccountTestAndRefreshUseLiveProbeToRestoreHealth(t *testing.T) {
+	client := &Client{accountID: "main", healthy: false, healthState: AccountStateExpired}
+	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}}
+	original := accountLivenessProbe
+	accountLivenessProbe = func(context.Context, *Client) (string, error) { return "OK", nil }
+	defer func() { accountLivenessProbe = original }()
+
+	text, err := pool.TestAccount(context.Background(), "main")
+	if err != nil || text != "OK" { t.Fatalf("test result = %q, %v", text, err) }
+	status := client.AccountStatus()
+	if !status.Healthy || status.State != AccountStateHealthy { t.Fatalf("test did not restore health: %#v", status) }
+
+	client.setAccountState(AccountStateExpired, errors.New("stale bootstrap"))
+	if err := pool.RefreshAccount(context.Background(), "main"); err != nil { t.Fatal(err) }
+	status = client.AccountStatus()
+	if !status.Healthy || status.State != AccountStateHealthy { t.Fatalf("refresh did not restore health: %#v", status) }
+}
+
+func TestTerminalAccountStateIsNeverHealthy(t *testing.T) {
+	client := &Client{healthy: true}
+	client.setAccountState(AccountStateExpired, errors.New("failed"))
+	status := client.AccountStatus()
+	if status.Healthy || status.State != AccountStateExpired { t.Fatalf("inconsistent terminal status: %#v", status) }
 }

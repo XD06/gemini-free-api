@@ -58,6 +58,18 @@ type ClientPool struct {
 type cookieRefreshFunc func(ctx context.Context, accountID string) error
 
 var validateProxyClient = validateProxyCandidate
+var validateProxyURL = EndpointInit + "?hl=en"
+
+// accountLivenessProbe uses the same end-to-end request as the console test.
+// It is replaceable by focused pool tests.
+var accountLivenessProbe = func(ctx context.Context, client *Client) (string, error) {
+	resp, err := client.GenerateContent(ctx, "Hi, please reply with only the word: OK")
+	if err != nil { return "", err }
+	if resp == nil { return "", fmt.Errorf("empty response from account %q", client.accountID) }
+	text := strings.TrimSpace(resp.Text)
+	if text == "" { return "", fmt.Errorf("empty text in response from account %q", client.accountID) }
+	return text, nil
+}
 
 func NewGeminiClient(cfg *configs.Config, log *zap.Logger) GeminiClient {
 	return NewClientPool(cfg, log)
@@ -255,20 +267,16 @@ func (p *ClientPool) RefreshAccount(ctx context.Context, accountID string) error
 	if client == nil {
 		return fmt.Errorf("Gemini account %q not found", accountID)
 	}
-	_ = ctx
+
+	// Console refresh revalidates the live generation path. Google can omit the
+	// legacy SNlM0e bootstrap token while an existing conversation still works;
+	// forcing Cookie rotation here used to report that healthy account as expired.
 	client.setAccountState(AccountStateRefreshing, nil)
-	if err := client.RotateCookiesContext(ctx); err != nil {
+	if _, err := accountLivenessProbe(ctx, client); err != nil {
 		client.setAccountState(AccountStateExpired, err)
 		return err
 	}
-	if err := client.refreshSessionToken(); err != nil {
-		client.setAccountState(AccountStateExpired, err)
-		return err
-	}
-	client.setAccountState(AccountStateHealthy, nil)
-	client.mu.Lock()
-	client.healthy = true
-	client.mu.Unlock()
+	client.markValidated()
 	return nil
 }
 
@@ -1018,7 +1026,7 @@ func (p *ClientPool) RemoveAccount(ctx context.Context, accountID string) error 
 func validateProxyCandidate(ctx context.Context, client *http.Client, cookieHeader string) error {
 	validateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(validateCtx, http.MethodGet, EndpointInit+"?hl=en", nil)
+	request, err := http.NewRequestWithContext(validateCtx, http.MethodGet, validateProxyURL, nil)
 	if err != nil { return err }
 	if cookieHeader != "" { request.Header.Set("Cookie", cookieHeader) }
 	response, err := client.Do(request)
@@ -1037,7 +1045,12 @@ func (p *ClientPool) UpdateAccountProxy(ctx context.Context, accountID, proxyURL
 	if proxyURL != "" { newReqClient.SetProxyURL(proxyURL) }
 	newReqClient.SetCommonCookies(client.cookies.ToHTTPCookies()...)
 	newTransport := &http.Transport{Proxy: proxyFunc(proxyURL), MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 15 * time.Second, ForceAttemptHTTP2: true}
-	newRawClient := &http.Client{Transport: newTransport, Timeout: 5 * time.Minute}
+	newRawClient := &http.Client{
+		Transport: newTransport, Timeout: 5 * time.Minute,
+		// A Google challenge/login redirect proves the proxy reached Google.
+		// Stop there so anti-bot redirects cannot loop and mask connectivity.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	client.mu.RLock(); cookieHeader := client.cookieHeader; client.mu.RUnlock()
 	if cookieHeader == "" {
 		cookies := client.cookies.ToHTTPCookies()
@@ -1064,20 +1077,14 @@ func (p *ClientPool) TestAccount(ctx context.Context, accountID string) (string,
 	if client == nil {
 		return "", fmt.Errorf("Gemini account %q not found", accountID)
 	}
-	if !client.IsHealthy() {
-		return "", fmt.Errorf("Gemini account %q is not healthy (state: %s)", accountID, client.AccountStatus().State)
-	}
-	resp, err := client.GenerateContent(ctx, "Hi, please reply with only the word: OK")
+
+	// An explicit test must be allowed to recover a stale health classification.
+	text, err := accountLivenessProbe(ctx, client)
 	if err != nil {
+		client.setAccountState(AccountStateExpired, err)
 		return "", err
 	}
-	if resp == nil {
-		return "", fmt.Errorf("empty response from account %q", accountID)
-	}
-	text := strings.TrimSpace(resp.Text)
-	if text == "" {
-		return "", fmt.Errorf("empty text in response from account %q", accountID)
-	}
+	client.markValidated()
 	return text, nil
 }
 

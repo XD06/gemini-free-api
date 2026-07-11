@@ -213,7 +213,7 @@ func (r *runner) scenarioMultiTurn(ctx context.Context, details map[string]inter
 	nonce := "E2E-MULTI-" + stamp()
 	messages := []chatMessage{{
 		Role:    "user",
-		Content: "多轮真实客户端测试。请记住唯一标记 " + nonce + "，并用约180字说明代理连接池的作用，最后原样写标记。",
+		Content: "Remember this exact marker for later turns. Reply with only: " + nonce,
 	}}
 	a1, err := r.chat(ctx, messages, false, false, "")
 	if err != nil {
@@ -222,7 +222,7 @@ func (r *runner) scenarioMultiTurn(ctx context.Context, details map[string]inter
 	messages = append(messages, chatMessage{Role: "assistant", Content: a1})
 	messages = append(messages, chatMessage{
 		Role:    "user",
-		Content: "第二轮：根据你记住的内容回答唯一标记是什么，再用约160字说明 keep-alive 为什么能降低延迟。",
+		Content: "What exact marker did I ask you to remember? Reply with only the marker.",
 	})
 	a2, err := r.chat(ctx, messages, false, false, "")
 	if err != nil {
@@ -231,7 +231,7 @@ func (r *runner) scenarioMultiTurn(ctx context.Context, details map[string]inter
 	messages = append(messages, chatMessage{Role: "assistant", Content: a2})
 	messages = append(messages, chatMessage{
 		Role:    "user",
-		Content: "第三轮：列出3个连接复用失败的原因，并再次写出唯一标记。",
+		Content: "Repeat the original marker only. Do not add any explanation.",
 	})
 	a3, err := r.chat(ctx, messages, false, false, "")
 	if err != nil {
@@ -294,7 +294,7 @@ func (r *runner) scenarioStream(ctx context.Context, details map[string]interfac
 	nonce := "E2E-STREAM-" + stamp()
 	text, meta, err := r.stream(ctx, []chatMessage{{
 		Role:    "user",
-		Content: "流式测试，唯一标记 " + nonce + "。请输出一个 mermaid flowchart，说明 cookie worker 同步到主服务，然后用约180字解释，最后原样写唯一标记。",
+		Content: "Output only a Mermaid flowchart that shows a cookie worker synchronizing data to a main service. Include at least four nodes.",
 	}}, "")
 	if err != nil {
 		return err
@@ -305,10 +305,14 @@ func (r *runner) scenarioStream(ctx context.Context, details map[string]interfac
 	details["usage_seen"] = meta["usage_seen"]
 	details["contains_nonce"] = strings.Contains(text, nonce)
 	details["contains_mermaid"] = strings.Contains(strings.ToLower(text), "mermaid")
-	details["contains_flowchart"] = strings.Contains(strings.ToLower(text), "flowchart")
+	details["contains_flowchart"] = strings.Contains(strings.ToLower(text), "flowchart") || strings.Contains(strings.ToLower(text), "graph")
 	details["sample"] = preview(text, 500)
-	if !strings.Contains(text, nonce) || !strings.Contains(strings.ToLower(text), "mermaid") {
-		return errors.New("stream response missing nonce or mermaid block")
+	if !strings.Contains(strings.ToLower(text), "mermaid") ||
+		!(strings.Contains(strings.ToLower(text), "flowchart") || strings.Contains(strings.ToLower(text), "graph")) ||
+		meta["finish_reason"] != "stop" ||
+		meta["usage_seen"] != true ||
+		len(text) < 100 {
+		return errors.New("stream response incomplete or missing mermaid flowchart")
 	}
 	return nil
 }

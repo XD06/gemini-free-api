@@ -212,6 +212,8 @@ type AccountStatus struct {
 func (c *Client) AccountStatus() AccountStatus {
 	c.mu.RLock()
 	healthy := c.healthy
+	proxyURL := c.proxyURL
+	cookieSource := c.cookieSource
 	c.mu.RUnlock()
 
 	c.statusMu.RLock()
@@ -228,17 +230,17 @@ func (c *Client) AccountStatus() AccountStatus {
 		ID:             c.accountID,
 		Healthy:        healthy,
 		State:          state,
-		ProxyURL:       c.proxyURL,
-		CookieSource:   c.cookieSource,
+		ProxyURL:       proxyURL,
+		CookieSource:   cookieSource,
 		LastError:      lastError,
 		LastValidated:  lastValidated,
 		LastCookieSync: lastCookieSync,
 	}
 }
 
+// setAccountState keeps the public health/state fields consistent.
 func (c *Client) setAccountState(state string, err error) {
 	c.statusMu.Lock()
-	defer c.statusMu.Unlock()
 	c.healthState = state
 	if err != nil {
 		c.lastError = err.Error()
@@ -248,7 +250,17 @@ func (c *Client) setAccountState(state string, err error) {
 	if state == AccountStateHealthy {
 		c.lastValidated = time.Now()
 	}
+	c.statusMu.Unlock()
+
+	switch state {
+	case AccountStateHealthy:
+		c.mu.Lock(); c.healthy = true; c.mu.Unlock()
+	case AccountStateExpired, AccountStateNeedsManualLogin:
+		c.mu.Lock(); c.healthy = false; c.mu.Unlock()
+	}
 }
+
+func (c *Client) markValidated() { c.setAccountState(AccountStateHealthy, nil) }
 
 func proxyFunc(proxyURL string) func(*http.Request) (*url.URL, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
@@ -517,7 +529,7 @@ func (c *Client) refreshSessionTokenContext(parent context.Context) error {
 		if len(matches) < 2 {
 			errMsg := "authentication failed: SNlM0e not found"
 			if strings.Contains(body, "Sign in") || strings.Contains(body, "login") {
-				errMsg = "authentication failed: cookies invalid. Please provide __Secure-1PSIDTS in addition to __Secure-1PSID"
+				errMsg = "authentication failed: Cookie pair rejected. __Secure-1PSID may still be valid, but it must be paired with the matching __Secure-1PSIDTS from the same browser session"
 			}
 			c.log.Info(errMsg)
 			return fmt.Errorf("%s", errMsg)
@@ -709,7 +721,7 @@ func selectStartupPSIDTS(configPSIDTS, configSource, cachedPSIDTS string, cacheE
 	configPSIDTS = cleanCookie(configPSIDTS)
 	configSource = strings.TrimSpace(configSource)
 	cachedPSIDTS = cleanCookie(cachedPSIDTS)
-	if configPSIDTS != "" && configSource != "" && configSource != "env" {
+	if configPSIDTS != "" && configSource != "" {
 		return configPSIDTS, configSource, false
 	}
 	if cacheErr == nil && cachedPSIDTS != "" {
@@ -754,7 +766,7 @@ func (c *Client) rotateCookiesOnce(ctx context.Context) error {
 	found := false
 	for _, cookie := range resp.Cookies() { if cookie.Name == "__Secure-1PSIDTS" { c.cookies.mu.Lock(); c.cookies.Secure1PSIDTS = cookie.Value; c.cookies.UpdatedAt = time.Now(); c.cookies.mu.Unlock(); found = true }; c.httpClient.SetCommonCookies(cookie) }
 	if found { if err := c.SaveCachedCookies(); err != nil { return fmt.Errorf("save rotated cookies: %w", err) }; return nil }
-	if psidts == "" { return errors.New("failed to obtain __Secure-1PSIDTS from Google rotation endpoint. Your __Secure-1PSID cookie might be invalid or expired") }
+	if psidts == "" { return errors.New("failed to obtain a matching __Secure-1PSIDTS from Google rotation endpoint. __Secure-1PSID alone cannot authenticate") }
 	return nil
 }
 
@@ -775,6 +787,19 @@ func (c *Client) UpdateCookies(ctx context.Context, secure1PSID, secure1PSIDTS s
 	secure1PSIDTS = cleanCookie(secure1PSIDTS)
 	if secure1PSID == "" {
 		return errors.New("secure_1psid is required")
+	}
+
+	// PSIDTS is bound to the PSID/browser session. Never construct a new pair
+	// from a replacement PSID and an omitted or stale PSIDTS.
+	c.cookies.mu.RLock()
+	currentPSID := c.cookies.Secure1PSID
+	currentPSIDTS := c.cookies.Secure1PSIDTS
+	c.cookies.mu.RUnlock()
+	if secure1PSID != currentPSID && secure1PSIDTS == "" {
+		return errors.New("secure_1psid and secure_1psidts must be updated together when changing secure_1psid")
+	}
+	if secure1PSIDTS == "" {
+		secure1PSIDTS = currentPSIDTS
 	}
 
 	c.statusMu.RLock()
@@ -1044,7 +1069,10 @@ type StreamState struct {
 	HasContent    bool
 }
 
-const defaultStreamFinishIdleTimeout = 1500 * time.Millisecond
+// Do not infer completion from a brief pause by default: Gemini can pause
+// between visible chunks while it continues generating.
+const defaultStreamFinishIdleTimeout = 0
+const minStreamFinishIdleTimeout = 15 * time.Second
 const defaultStreamFirstContentTimeout = 45 * time.Second
 
 
@@ -1612,7 +1640,11 @@ func streamFinishIdleTimeout() time.Duration {
 	if ms == 0 {
 		return 0
 	}
-	return time.Duration(ms) * time.Millisecond
+	timeout := time.Duration(ms) * time.Millisecond
+	if timeout < minStreamFinishIdleTimeout {
+		return minStreamFinishIdleTimeout
+	}
+	return timeout
 }
 
 func streamFirstContentTimeout() time.Duration {
@@ -3295,7 +3327,10 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 							if ok && len(contentParts) > 0 {
 								resText, ok := contentParts[0].(string)
 								if ok {
-									finalResText = resText
+									// Keep the most complete candidate: Gemini can include trailing partial snapshots.
+												if len(resText) >= len(finalResText) {
+													finalResText = resText
+												}
 									found = true
 								}
 							}

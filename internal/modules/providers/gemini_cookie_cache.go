@@ -38,17 +38,17 @@ func applyCookieCache(cfg *configs.Config, accounts []configs.GeminiAccountConfi
 	applied := append([]configs.GeminiAccountConfig(nil), accounts...)
 	for i := range applied {
 		entry, ok := cache.Accounts[applied[i].ID]
-		if !ok || strings.TrimSpace(entry.Secure1PSID) == "" {
-			// Even if no cookies, still apply cached proxy if present.
-			if ok && strings.TrimSpace(entry.ProxyURL) != "" {
-				applied[i].ProxyURL = entry.ProxyURL
-			}
+		if !ok {
 			continue
 		}
-		applied[i].Secure1PSID = entry.Secure1PSID
-		applied[i].Secure1PSIDTS = entry.Secure1PSIDTS
-		applied[i].CookieSource = "cache"
-		if strings.TrimSpace(entry.ProxyURL) != "" {
+		// Explicit environment Cookies are an operator override. A stale local
+		// cache must never silently replace newly supplied credentials.
+		if strings.TrimSpace(applied[i].Secure1PSID) == "" && strings.TrimSpace(entry.Secure1PSID) != "" {
+			applied[i].Secure1PSID = entry.Secure1PSID
+			applied[i].Secure1PSIDTS = entry.Secure1PSIDTS
+			applied[i].CookieSource = "cache"
+		}
+		if strings.TrimSpace(applied[i].ProxyURL) == "" && strings.TrimSpace(entry.ProxyURL) != "" {
 			applied[i].ProxyURL = entry.ProxyURL
 		}
 	}

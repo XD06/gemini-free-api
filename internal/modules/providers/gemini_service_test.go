@@ -95,17 +95,17 @@ func TestRedactDebugHeadersRemovesSensitiveValues(t *testing.T) {
 	}
 }
 
-func TestSelectStartupPSIDTSUsesFreshCacheOverStaleConfig(t *testing.T) {
+func TestSelectStartupPSIDTSPreservesExplicitEnvValue(t *testing.T) {
 	selected, source, clearCache := selectStartupPSIDTS("old-config-ts", "env", "fresh-cached-ts", nil)
 
-	if selected != "fresh-cached-ts" {
-		t.Fatalf("expected cached PSIDTS to win across restart, got %q", selected)
+	if selected != "old-config-ts" {
+		t.Fatalf("expected explicit env PSIDTS to win, got %q", selected)
 	}
-	if source != "cache" {
-		t.Fatalf("expected cache source, got %q", source)
+	if source != "env" {
+		t.Fatalf("expected env source, got %q", source)
 	}
 	if clearCache {
-		t.Fatal("stale config PSIDTS should not clear the fresher runtime cache")
+		t.Fatal("explicit config should not clear the runtime cache")
 	}
 }
 
@@ -802,8 +802,8 @@ func TestStreamFinishIdleTimeoutConfig(t *testing.T) {
 	if got := streamFinishIdleTimeout(); got != defaultStreamFinishIdleTimeout {
 		t.Fatalf("expected default idle timeout %v, got %v", defaultStreamFinishIdleTimeout, got)
 	}
-	if defaultStreamFinishIdleTimeout != 1500*time.Millisecond {
-		t.Fatalf("expected default idle timeout to be responsive, got %v", defaultStreamFinishIdleTimeout)
+	if defaultStreamFinishIdleTimeout != 0 {
+		t.Fatalf("expected idle timeout disabled by default, got %v", defaultStreamFinishIdleTimeout)
 	}
 
 	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "0")
@@ -812,7 +812,11 @@ func TestStreamFinishIdleTimeoutConfig(t *testing.T) {
 	}
 
 	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "2500")
-	if got := streamFinishIdleTimeout(); got != 2500*time.Millisecond {
+	if got := streamFinishIdleTimeout(); got != minStreamFinishIdleTimeout {
+		t.Fatalf("expected configured idle timeout to be clamped, got %v", got)
+	}
+	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "16000")
+	if got := streamFinishIdleTimeout(); got != 16*time.Second {
 		t.Fatalf("expected configured idle timeout, got %v", got)
 	}
 }
@@ -1313,4 +1317,26 @@ func TestAppendStreamTailCapsMemory(t *testing.T) {
 	if !bytes.HasSuffix(buf.Bytes(), []byte("tail")) {
 		t.Fatal("tail missing")
 	}
+}
+
+
+func TestUpdateCookiesRejectsReplacementPSIDWithoutMatchingPSIDTS(t *testing.T) {
+	client := &Client{cookies: &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"}}
+	err := client.UpdateCookies(context.Background(), "new-psid", "")
+	if err == nil || !strings.Contains(err.Error(), "must be updated together") {
+		t.Fatalf("expected mismatched pair rejection, got %v", err)
+	}
+	got := client.GetCookies()
+	if got.Secure1PSID != "old-psid" || got.Secure1PSIDTS != "old-ts" {
+		t.Fatalf("failed update changed active pair: %#v", got)
+	}
+}
+
+func TestParseResponseKeepsMostCompleteCandidate(t *testing.T) {
+	complete := "complete answer with nonce E2E-MULTI-TEST"
+	partial := "complete answer with nonce"
+	client := &Client{log: zap.NewNop()}
+	resp, err := client.parseResponse(buildGenerateResponse(t, complete, "cid") + "\n" + buildGenerateResponse(t, partial, "cid"))
+	if err != nil { t.Fatal(err) }
+	if resp.Text != complete { t.Fatalf("expected complete candidate %q, got %q", complete, resp.Text) }
 }
