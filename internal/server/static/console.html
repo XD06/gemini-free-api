@@ -1889,33 +1889,55 @@ async function saveDrawer() {
   const psidts = document.getElementById('formPSIDTS').value.trim();
   const proxy = document.getElementById('formProxy').value.trim();
 
-  if (!id) { toast('请填写 Account ID', 'err'); return; }
+  if (!id) { toast('\u8bf7\u586b\u5199 Account ID', 'err'); return; }
 
   const btn = document.getElementById('drawerSave');
   const orig = btn.textContent;
-  btn.textContent = '保存中…';
+  btn.textContent = '\u4fdd\u5b58\u4e2d\u2026';
   btn.disabled = true;
+  let proxyUpdated = false;
 
   try {
     if (State.editing === 'add') {
-      if (!psid) { toast('请填写 __Secure-1PSID', 'err'); btn.textContent = orig; btn.disabled = false; return; }
+      if (!psid) { toast('\u8bf7\u586b\u5199 __Secure-1PSID', 'err'); return; }
       await apiAddAccount(id, psid, psidts, proxy);
-      toast('账号 ' + id + ' 已添加', 'ok');
+      toast('\u8d26\u53f7 ' + id + ' \u5df2\u6dfb\u52a0', 'ok');
     } else {
-      // Edit mode: update cookies if PSID provided, then update proxy.
+      const existing = State.accounts.find(a => a.id === id);
+      const oldProxy = existing ? (existing.proxy_url || '') : '';
+      const proxyChanged = proxy !== oldProxy;
+
+      // A replacement proxy must become active before Cookie validation;
+      // otherwise new Cookies are accidentally tested through the broken old proxy.
+      if (proxyChanged) {
+        await apiUpdateProxy(id, proxy);
+        proxyUpdated = true;
+      }
+
       if (psid) {
         await apiUpdateCookies(id, psid, psidts);
-        toast('账号 ' + id + ' Cookie 已保存，正在后台验证…', 'ok');
       }
-      await apiUpdateProxy(id, proxy);
-      if (!psid) toast('账号 ' + id + ' 代理已更新', 'ok');
+
+      if (proxyChanged && psid) {
+        toast('\u8d26\u53f7 ' + id + ' \u4ee3\u7406\u4e0e Cookie \u5df2\u66f4\u65b0', 'ok');
+      } else if (proxyChanged) {
+        toast('\u8d26\u53f7 ' + id + ' \u4ee3\u7406\u5df2\u66f4\u65b0', 'ok');
+      } else if (psid) {
+        toast('\u8d26\u53f7 ' + id + ' Cookie \u5df2\u9a8c\u8bc1\u5e76\u4fdd\u5b58', 'ok');
+      } else {
+        toast('\u6ca1\u6709\u9700\u8981\u4fdd\u5b58\u7684\u53d8\u66f4', 'ok');
+      }
     }
     closeDrawer();
     fetchAccounts();
-    // Auto-refresh after 5s to show validation result.
     setTimeout(() => fetchAccounts(), 5000);
   } catch(e) {
-    toast('保存失败: ' + e.message, 'err');
+    if (proxyUpdated) {
+      toast('\u4ee3\u7406\u5df2\u66f4\u65b0\uff0c\u4f46 Cookie \u4fdd\u5b58\u5931\u8d25: ' + e.message, 'err');
+      fetchAccounts();
+    } else {
+      toast('\u4fdd\u5b58\u5931\u8d25: ' + e.message, 'err');
+    }
   } finally {
     btn.textContent = orig;
     btn.disabled = false;
