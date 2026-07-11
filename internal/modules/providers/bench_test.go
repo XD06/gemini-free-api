@@ -60,16 +60,6 @@ func BenchmarkExtractConversationMetadataFromBuffer(b *testing.B) {
 	}
 }
 
-// BenchmarkRecentBytesCopy measures the recentBytes slicing operation.
-func BenchmarkRecentBytesCopy(b *testing.B) {
-	buf := makeLargeStreamBuffer(500)
-	b.SetBytes(int64(len(buf)))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = recentBytes(buf, maxStreamParseBufferBytes)
-	}
-}
-
 // BenchmarkPruneConversationsLocked measures conversation pruning with
 // a moderate number of entries (1000).
 func BenchmarkPruneConversationsLocked(b *testing.B) {
@@ -87,9 +77,9 @@ func BenchmarkPruneConversationsLocked(b *testing.B) {
 		}
 	}
 	client := &Client{
-		conversations:     conversations,
-		conversationSeen:  conversationSeen,
-		conversationMu:    sync.RWMutex{},
+		conversations:    conversations,
+		conversationSeen: conversationSeen,
+		conversationMu:   sync.RWMutex{},
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -132,4 +122,19 @@ func BenchmarkHasConversationStateRLock(b *testing.B) {
 	}
 }
 
-
+func BenchmarkIncrementalStreamParser(b *testing.B) {
+	buf := makeLargeStreamBuffer(500)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		parser := &streamIncrementalParser{}
+		for start := 0; start < len(buf); start += 16 * 1024 {
+			end := start + 16*1024
+			if end > len(buf) {
+				end = len(buf)
+			}
+			parser.Feed(buf[start:end], end == len(buf), func([]byte, string) bool { return true })
+		}
+	}
+}

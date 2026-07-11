@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"gemini-free-api/internal/commons/configs"
 	models "gemini-free-api/internal/commons/models"
 	utils "gemini-free-api/internal/commons/utils"
 	"gemini-free-api/internal/modules/admin"
@@ -22,12 +23,14 @@ import (
 
 type OpenAIController struct {
 	service *OpenAIService
+	cfg     *configs.Config
 	log     *zap.Logger
 }
 
-func NewOpenAIController(service *OpenAIService) *OpenAIController {
+func NewOpenAIController(service *OpenAIService, cfg *configs.Config) *OpenAIController {
 	return &OpenAIController{
 		service: service,
+		cfg:     cfg,
 		log:     zap.NewNop(),
 	}
 }
@@ -124,6 +127,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
+			ctx = providers.ContextWithRetryBudget(ctx, 4)
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 			ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
@@ -199,6 +203,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	ctx = providers.ContextWithRetryBudget(ctx, 4)
 	ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 	ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
@@ -268,6 +273,7 @@ func (h *OpenAIController) HandleImageGenerations(c fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	ctx = providers.ContextWithRetryBudget(ctx, 4)
 
 	response, err := h.service.CreateImageGeneration(ctx, req)
 	if err != nil {
@@ -288,6 +294,7 @@ func (h *OpenAIController) HandleUploadFile(c fiber.Ctx) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	ctx = providers.ContextWithRetryBudget(ctx, 4)
 	obj, err := h.service.fileStore.saveUploadedFile(ctx, file, c.FormValue("purpose"))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(utils.ErrorToResponse(err, "api_error"))
@@ -340,11 +347,33 @@ func (c *OpenAIController) Register(group fiber.Router) {
 	group.Get("/models", c.HandleModels)
 	group.Post("/chat/completions", c.HandleChatCompletions)
 	group.Post("/images/generations", c.HandleImageGenerations)
-	group.Post("/files", c.HandleUploadFile)
-	group.Get("/files", c.HandleListFiles)
-	group.Get("/files/:file_id", c.HandleGetFile)
-	group.Delete("/files/:file_id", c.HandleDeleteFile)
-	group.Get("/files/:file_id/content", c.HandleFileContent)
+	files := group.Group("/files", c.requireFileToken)
+	files.Post("", c.HandleUploadFile)
+	files.Get("", c.HandleListFiles)
+	files.Get("/:file_id", c.HandleGetFile)
+	files.Delete("/:file_id", c.HandleDeleteFile)
+	files.Get("/:file_id/content", c.HandleFileContent)
+}
+
+func (c *OpenAIController) requireFileToken(ctx fiber.Ctx) error {
+	expected := ""
+	if c.cfg != nil {
+		expected = strings.TrimSpace(c.cfg.Admin.CookieSyncToken)
+	}
+	if expected == "" {
+		return ctx.Status(fiber.StatusForbidden).JSON(utils.ErrorToResponse(fmt.Errorf("COOKIE_SYNC_TOKEN is not configured"), "forbidden"))
+	}
+	token := strings.TrimSpace(ctx.Get("X-Cookie-Sync-Token"))
+	if token == "" {
+		auth := strings.TrimSpace(ctx.Get("Authorization"))
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			token = strings.TrimSpace(auth[len("bearer "):])
+		}
+	}
+	if token != expected {
+		return ctx.Status(fiber.StatusUnauthorized).JSON(utils.ErrorToResponse(fmt.Errorf("invalid file API token"), "unauthorized"))
+	}
+	return ctx.Next()
 }
 
 func trimJSONBOM(body []byte) []byte {

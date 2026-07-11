@@ -97,6 +97,7 @@ func (h *GeminiController) HandleV1BetaGenerateContent(c fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	ctx = providers.ContextWithRetryBudget(ctx, 4)
 	ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 	response, err := h.service.GenerateContent(ctx, model, req)
@@ -169,6 +170,7 @@ func (h *GeminiController) HandleV1BetaStreamGenerateContent(c fiber.Ctx) error 
 	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
+		ctx = providers.ContextWithRetryBudget(ctx, 4)
 		ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 		var firstByteTime time.Time

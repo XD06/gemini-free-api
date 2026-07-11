@@ -108,13 +108,13 @@ func (c *Controller) HandleUpdateCookies(ctx fiber.Ctx) error {
 	}
 
 	if c.log != nil {
-		c.log.Info("admin cookie update accepted, validating in background",
+		c.log.Info("admin cookie update validated",
 			zap.String("account", accountID),
 			zap.String("source", req.Source),
 		)
 		c.logAccountAudit("cookie_sync_ok", accountID, req.Source, "accepted")
 	}
-	return ctx.JSON(fiber.Map{"status": "ok", "account": accountID, "message": "cookies saved, validating in background"})
+	return ctx.JSON(fiber.Map{"status": "ok", "account": accountID, "message": "cookies validated and saved"})
 }
 
 func (c *Controller) HandleRefreshAccount(ctx fiber.Ctx) error {
@@ -342,10 +342,10 @@ func (c *Controller) HandleTestProxy(ctx fiber.Ctx) error {
 		status = "fail"
 	}
 	return ctx.JSON(fiber.Map{
-		"status":     status,
-		"latency":    latency,
-		"http_code":  resp.StatusCode,
-		"proxy_url":  proxyURL,
+		"status":    status,
+		"latency":   latency,
+		"http_code": resp.StatusCode,
+		"proxy_url": proxyURL,
 	})
 }
 

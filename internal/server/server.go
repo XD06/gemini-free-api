@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gemini-free-api/internal/commons/configs"
+	"gemini-free-api/internal/modules/providers"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/cors"
@@ -17,7 +18,7 @@ import (
 )
 
 // New creates a new Fiber app instance
-func NewGeminiFreeAPI(log *zap.Logger, cfg *configs.Config) *fiber.App {
+func NewGeminiFreeAPI(log *zap.Logger, cfg *configs.Config, gemini providers.GeminiClient) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:      "Gemini Free API",
 		ReadTimeout:  10 * time.Second,
@@ -59,6 +60,7 @@ func NewGeminiFreeAPI(log *zap.Logger, cfg *configs.Config) *fiber.App {
 	app.Get("/console", ConsoleUI)
 
 	app.Get("/health", HealthCheck)
+	app.Get("/ready", ReadinessCheck(gemini))
 
 	return app
 }
@@ -68,6 +70,34 @@ func HealthCheck(c fiber.Ctx) error {
 		"status":  "ok",
 		"service": "gemini-free-api",
 	})
+}
+
+func ReadinessCheck(gemini providers.GeminiClient) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		total, healthy := 0, 0
+		state := "unavailable"
+		if manager, ok := gemini.(providers.AccountManager); ok {
+			statuses := manager.ListAccountStatuses()
+			total = len(statuses)
+			for _, account := range statuses {
+				if account.Healthy {
+					healthy++
+				}
+				if account.State == providers.AccountStateRefreshing || account.State == providers.AccountStateUninitialized {
+					state = "initializing"
+				}
+			}
+		}
+		ready := gemini != nil && gemini.IsHealthy()
+		if ready {
+			state = "ready"
+		}
+		status := fiber.StatusServiceUnavailable
+		if ready {
+			status = fiber.StatusOK
+		}
+		return c.Status(status).JSON(fiber.Map{"status": state, "accounts_total": total, "accounts_healthy": healthy})
+	}
 }
 
 // Register404Handler registers the 404 handler for unmatched routes

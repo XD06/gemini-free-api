@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -16,7 +17,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gemini-free-api/internal/commons/models"
@@ -28,7 +31,11 @@ const defaultOpenAIFileStoreDir = "data/openai-files"
 var openAIFileIDPattern = regexp.MustCompile(`^file-[A-Za-z0-9_-]+$`)
 
 type openAIFileStore struct {
-	dir string
+	dir      string
+	maxFile  int64
+	maxTotal int64
+	ttl      time.Duration
+	mu       sync.Mutex
 }
 
 type openAIFileObject struct {
@@ -51,7 +58,14 @@ func newOpenAIFileStore(dir string) *openAIFileStore {
 	if dir == "" {
 		dir = defaultOpenAIFileStoreDir
 	}
-	return &openAIFileStore{dir: dir}
+	store := &openAIFileStore{
+		dir:      dir,
+		maxFile:  envBytes("OPENAI_FILE_MAX_BYTES", 32<<20),
+		maxTotal: envBytes("OPENAI_FILE_STORE_MAX_BYTES", 1<<30),
+		ttl:      time.Duration(envInt64("OPENAI_FILE_TTL_HOURS", 24)) * time.Hour,
+	}
+	_ = store.cleanup()
+	return store
 }
 
 func (s *openAIFileStore) saveUploadedFile(ctx context.Context, header *multipart.FileHeader, purpose string) (openAIFileObject, error) {
@@ -61,6 +75,9 @@ func (s *openAIFileStore) saveUploadedFile(ctx context.Context, header *multipar
 	if header == nil {
 		return openAIFileObject{}, fmt.Errorf("file is required")
 	}
+	if header.Size > s.maxFile {
+		return openAIFileObject{}, fmt.Errorf("file exceeds %d byte limit", s.maxFile)
+	}
 	src, err := header.Open()
 	if err != nil {
 		return openAIFileObject{}, fmt.Errorf("open uploaded file: %w", err)
@@ -69,6 +86,19 @@ func (s *openAIFileStore) saveUploadedFile(ctx context.Context, header *multipar
 
 	if err := os.MkdirAll(s.dir, 0700); err != nil {
 		return openAIFileObject{}, fmt.Errorf("create file store: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(); err != nil {
+		return openAIFileObject{}, err
+	}
+	used, err := s.totalSizeLocked()
+	if err != nil {
+		return openAIFileObject{}, err
+	}
+	if header.Size >= 0 && used+header.Size > s.maxTotal {
+		return openAIFileObject{}, fmt.Errorf("file store exceeds %d byte limit", s.maxTotal)
 	}
 
 	id, err := newOpenAIFileID()
@@ -81,8 +111,14 @@ func (s *openAIFileStore) saveUploadedFile(ctx context.Context, header *multipar
 	if err != nil {
 		return openAIFileObject{}, fmt.Errorf("create stored file: %w", err)
 	}
-	written, copyErr := copyWithContext(ctx, dst, src)
+	written, copyErr := copyWithContext(ctx, dst, io.LimitReader(src, s.maxFile+1))
 	closeErr := dst.Close()
+	if copyErr == nil && written > s.maxFile {
+		copyErr = fmt.Errorf("file exceeds %d byte limit", s.maxFile)
+	}
+	if copyErr == nil && used+written > s.maxTotal {
+		copyErr = fmt.Errorf("file store exceeds %d byte limit", s.maxTotal)
+	}
 	if copyErr != nil {
 		_ = os.Remove(dataPath)
 		return openAIFileObject{}, fmt.Errorf("store uploaded file: %w", copyErr)
@@ -303,6 +339,9 @@ func (s *OpenAIService) inputFileFromAttachment(ctx context.Context, attachment 
 		if err != nil {
 			return providers.InputFile{}, false, fmt.Errorf("decode attachment %q: %w", attachment.Name, err)
 		}
+		if int64(len(data)) > s.fileStore.maxFile {
+			return providers.InputFile{}, false, fmt.Errorf("attachment exceeds %d byte limit", s.fileStore.maxFile)
+		}
 		return providers.InputFile{
 			Name:     attachment.Name,
 			MimeType: attachment.MimeType,
@@ -329,8 +368,7 @@ func fetchAttachmentURL(ctx context.Context, attachment models.Attachment) (prov
 		return providers.InputFile{}, fmt.Errorf("build attachment fetch request: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Do(req)
+	resp, err := newAttachmentHTTPClient().Do(req)
 	if err != nil {
 		return providers.InputFile{}, fmt.Errorf("fetch attachment %q: %w", attachment.URL, err)
 	}
@@ -338,9 +376,13 @@ func fetchAttachmentURL(ctx context.Context, attachment models.Attachment) (prov
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return providers.InputFile{}, fmt.Errorf("fetch attachment %q failed with status %d", attachment.URL, resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+	maxSize := envBytes("OPENAI_FILE_MAX_BYTES", 32<<20)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
 	if err != nil {
 		return providers.InputFile{}, fmt.Errorf("read attachment %q: %w", attachment.URL, err)
+	}
+	if int64(len(data)) > maxSize {
+		return providers.InputFile{}, fmt.Errorf("attachment exceeds %d byte limit", maxSize)
 	}
 	if len(data) == 0 {
 		return providers.InputFile{}, fmt.Errorf("attachment %q is empty", attachment.URL)
@@ -360,6 +402,41 @@ func fetchAttachmentURL(ctx context.Context, attachment models.Attachment) (prov
 		name = filenameFromURL(attachment.URL, mimeType)
 	}
 	return providers.InputFile{Name: name, MimeType: mimeType, Data: data}, nil
+}
+
+func newAttachmentHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, fmt.Errorf("invalid attachment address %q: %w", address, err)
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, fmt.Errorf("resolve attachment host %q: %w", host, err)
+			}
+			for _, candidate := range ips {
+				if isDisallowedAttachmentIP(candidate.IP) {
+					continue
+				}
+				return dialer.DialContext(ctx, network, net.JoinHostPort(candidate.IP.String(), port))
+			}
+			return nil, fmt.Errorf("disallowed attachment host %q", host)
+		},
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many attachment redirects")
+			}
+			_, err := validateAttachmentURL(req.URL.String())
+			return err
+		},
+	}
 }
 
 func validateAttachmentURL(rawURL string) (*url.URL, error) {
@@ -393,13 +470,30 @@ func validateAttachmentURL(rawURL string) (*url.URL, error) {
 }
 
 func isDisallowedAttachmentIP(ip net.IP) bool {
-	return ip == nil ||
-		ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() ||
-		ip.IsMulticast()
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return true
+	}
+	// Go's IsPrivate intentionally excludes shared and benchmark ranges, but
+	// neither is a valid destination for user-supplied remote attachments.
+	for _, network := range attachmentBlockedNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+var attachmentBlockedNetworks = []*net.IPNet{
+	mustParseCIDR("100.64.0.0/10"),
+	mustParseCIDR("198.18.0.0/15"),
+}
+
+func mustParseCIDR(value string) *net.IPNet {
+	_, network, err := net.ParseCIDR(value)
+	if err != nil {
+		panic(err)
+	}
+	return network
 }
 
 func filenameFromURL(rawURL, mimeType string) string {
@@ -447,6 +541,91 @@ func sanitizeStoredFilename(filename string) string {
 		return "file.bin"
 	}
 	return b.String()
+}
+
+func envInt64(name string, fallback int64) int64 {
+	value, err := strconv.ParseInt(strings.TrimSpace(os.Getenv(name)), 10, 64)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+func envBytes(name string, fallback int64) int64 { return envInt64(name, fallback) }
+func (s *openAIFileStore) cleanup() error        { s.mu.Lock(); defer s.mu.Unlock(); return s.cleanupLocked() }
+func (s *openAIFileStore) cleanupLocked() error {
+	entries, err := os.ReadDir(s.dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	metadata := map[string]openAIFileMetadata{}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			id := strings.TrimSuffix(entry.Name(), ".json")
+			if meta, err := s.readMetadata(id); err == nil {
+				metadata[id] = meta
+			} else {
+				_ = os.Remove(filepath.Join(s.dir, entry.Name()))
+			}
+		}
+	}
+	now := time.Now()
+	for id, meta := range metadata {
+		dataPath, err := s.safeStoredDataPath(meta.Path)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(dataPath); os.IsNotExist(err) {
+			path, _ := s.metadataPath(id)
+			_ = os.Remove(path)
+			continue
+		}
+		if s.ttl > 0 && now.Sub(time.Unix(meta.CreatedAt, 0)) > s.ttl {
+			_ = os.Remove(dataPath)
+			path, _ := s.metadataPath(id)
+			_ = os.Remove(path)
+			delete(metadata, id)
+		}
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		matched := false
+		for _, meta := range metadata {
+			if filepath.Clean(meta.Path) == filepath.Clean(filepath.Join(s.dir, entry.Name())) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			_ = os.Remove(filepath.Join(s.dir, entry.Name()))
+		}
+	}
+	return nil
+}
+func (s *openAIFileStore) totalSizeLocked() (int64, error) {
+	entries, err := os.ReadDir(s.dir)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return 0, err
+		}
+		total += info.Size()
+	}
+	return total, nil
 }
 
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {

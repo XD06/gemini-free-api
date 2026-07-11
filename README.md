@@ -25,6 +25,8 @@ go run cmd/server/main.go
 
 服务默认监听 `http://localhost:8787`，API 文档 `http://localhost:8787/docs`。
 
+存活检查：`GET /health`；Gemini 账号就绪检查：`GET /ready`（无健康账号时返回 503）。
+
 ### 基础配置
 
 **获取cookie**：
@@ -70,6 +72,7 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 
 - 账号列表：状态、代理、同步时间、健康度
 - 添加 / 编辑 / 删除账号
+- Cookie 更新会先验证，验证失败时保留原有可用 Cookie
 - 账号测试：发送真实对话消息验证可用性
 - 代理测试：验证代理连通性
 
@@ -141,11 +144,12 @@ curl http://localhost:8787/gemini/v1beta/models/gemini-3.5-flash:streamGenerateC
 
 ```bash
 curl http://localhost:8787/openai/v1/files \
+  -H "Authorization: Bearer $COOKIE_SYNC_TOKEN" \
   -F purpose=assistants \
   -F file=@./note.txt
 ```
 
-返回 `file_id` 后在 messages 中引用：
+文件 API 使用 `COOKIE_SYNC_TOKEN` 鉴权。返回 `file_id` 后在 messages 中引用：
 
 ```json
 {
@@ -325,3 +329,28 @@ go test ./...
 ## 说明
 
 本项目基于[ntthanh2603/gemini-web-to-api](https://github.com/ntthanh2603/gemini-web-to-api) ，后重塑了主要功能，优化了整个请求链路，保留了部分特性。Gemini 网页端结构可能变化，涉及 `f.req`、`x-goog-ext-*`、`c/r/rc/context token` 的行为以抓包和回归测试为准。
+
+
+### 健康检查与 Kubernetes
+
+- `GET /health` 是 liveness，只表示进程存活，适合 Docker Compose，避免 Cookie 暂时失效导致重启循环。
+- `GET /ready` 是 readiness；至少一个 Gemini 账号健康时返回 200，否则返回 503，并仅包含账号总数、健康数和非敏感状态。
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8787
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8787
+```
+
+### 文件存储限制
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `OPENAI_FILE_MAX_BYTES` | `33554432` | 单个上传、Base64 或远程附件最大字节数 |
+| `OPENAI_FILE_STORE_MAX_BYTES` | `1073741824` | `data/openai-files` 总容量上限 |
+| `OPENAI_FILE_TTL_HOURS` | `24` | 文件保留小时数；启动和上传前清理过期及孤立文件 |

@@ -1,10 +1,15 @@
 package openai
 
 import (
+	"context"
+	"mime/multipart"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gemini-free-api/internal/commons/models"
 )
@@ -77,5 +82,69 @@ func TestReadFileContentRejectsMetadataPathOutsideStore(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "outside file store") {
 		t.Fatalf("expected outside store error, got %v", err)
+	}
+}
+
+func TestAttachmentHTTPClientRejectsRedirectToLocalhost(t *testing.T) {
+	client := newAttachmentHTTPClient()
+	request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/private", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.CheckRedirect(request, nil)
+	if err == nil {
+		t.Fatal("expected redirect to localhost to be rejected")
+	}
+	if !strings.Contains(err.Error(), "disallowed attachment host") {
+		t.Fatalf("expected disallowed host error, got %v", err)
+	}
+}
+
+func TestDisallowedAttachmentIPRejectsSharedAddressSpace(t *testing.T) {
+	if !isDisallowedAttachmentIP(net.ParseIP("100.64.0.1")) {
+		t.Fatal("expected carrier-grade NAT address to be rejected")
+	}
+	if isDisallowedAttachmentIP(net.ParseIP("8.8.8.8")) {
+		t.Fatal("expected public address to be allowed")
+	}
+}
+
+func TestFileStoreCleanupRemovesExpiredAndOrphanFiles(t *testing.T) {
+	store := newOpenAIFileStore(t.TempDir())
+	store.ttl = time.Hour
+	if err := os.MkdirAll(store.dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(store.dir, "orphan.bin")
+	if err := os.WriteFile(orphan, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dataPath := filepath.Join(store.dir, "file-old_data.bin")
+	if err := os.WriteFile(dataPath, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := openAIFileMetadata{openAIFileObject: openAIFileObject{ID: "file-old", CreatedAt: time.Now().Add(-2 * time.Hour).Unix(), Filename: "data.bin"}, Path: dataPath}
+	if err := store.writeMetadata(meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("expected orphan removed")
+	}
+	if _, err := os.Stat(dataPath); !os.IsNotExist(err) {
+		t.Fatal("expected expired data removed")
+	}
+}
+
+func TestFileStoreRejectsOversizedCopy(t *testing.T) {
+	store := newOpenAIFileStore(t.TempDir())
+	store.maxFile = 2
+	header := &multipart.FileHeader{Filename: "large.bin", Size: 3}
+	_, err := store.saveUploadedFile(context.Background(), header, "assistants")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected size error, got %v", err)
 	}
 }

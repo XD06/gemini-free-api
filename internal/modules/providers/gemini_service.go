@@ -133,7 +133,7 @@ func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfi
 	}
 
 	client := req.NewClient().
-		SetTimeout(10 * time.Minute).
+		SetTimeout(30 * time.Second).
 		SetCommonHeaders(DefaultHeaders)
 	if account.ProxyURL != "" {
 		client.SetProxyURL(account.ProxyURL)
@@ -335,14 +335,14 @@ func (c *Client) Init(ctx context.Context) error {
 
 	// Get SNlM0e token - first try with provided cookies directly
 	// This is the real "can this cookie talk to Gemini" test
-	err := c.refreshSessionToken()
+	err := c.refreshSessionTokenContext(ctx)
 
 	// If direct SNlM0e fetch fails, try rotation as recovery
 	if err != nil {
 		c.log.Info("Direct session token fetch failed, attempting cookie rotation", zap.Error(err))
-		if rotErr := c.RotateCookies(); rotErr == nil {
+		if rotErr := c.RotateCookiesContext(ctx); rotErr == nil {
 			c.log.Info("Cookie rotation succeeded, retrying session token fetch")
-			err = c.refreshSessionToken()
+			err = c.refreshSessionTokenContext(ctx)
 		} else {
 			c.log.Warn("Cookie rotation also failed", zap.Error(rotErr))
 		}
@@ -384,7 +384,11 @@ func (c *Client) Init(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) refreshSessionToken() error {
+func (c *Client) refreshSessionToken() error { return c.refreshSessionTokenContext(context.Background()) }
+
+func (c *Client) refreshSessionTokenContext(parent context.Context) error {
+	if parent == nil { parent = context.Background() }
+	refreshCtx, cancel := context.WithTimeout(parent, 30*time.Second); defer cancel()
 	c.log.Info("Gemini session token refresh started",
 		zap.String("account", c.accountID),
 		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
@@ -393,7 +397,9 @@ func (c *Client) refreshSessionToken() error {
 	// 1. Initial hit to google.com to get extra cookies (NID, etc)
 	// Reuse the existing httpClient to avoid creating a new transport
 	// (and new TLS connections) on every refresh.
-	resp1, err := c.httpClient.R().Get("https://www.google.com/")
+	preflightCtx, cancelPreflight := context.WithTimeout(refreshCtx, 5*time.Second)
+	resp1, err := c.httpClient.R().SetContext(preflightCtx).Get("https://www.google.com/")
+	cancelPreflight()
 	extraCookies := ""
 	if err == nil {
 		parts := []string{}
@@ -455,7 +461,7 @@ func (c *Client) refreshSessionToken() error {
 		return strings.Join(res, "; ")
 	}
 
-	req1, _ := http.NewRequest("GET", "https://gemini.google.com/?hl=en", nil)
+	req1, _ := http.NewRequestWithContext(refreshCtx, "GET", "https://gemini.google.com/?hl=en", nil)
 	for k, v := range commonHeaders {
 		req1.Header.Set(k, v)
 	}
@@ -470,7 +476,7 @@ func (c *Client) refreshSessionToken() error {
 	}
 
 	// 2. The main INIT hit
-	req2, _ := http.NewRequest("GET", EndpointInit+"?hl=en", nil)
+	req2, _ := http.NewRequestWithContext(refreshCtx, "GET", EndpointInit+"?hl=en", nil)
 	for k, v := range commonHeaders {
 		req2.Header.Set(k, v)
 	}
@@ -669,6 +675,7 @@ func (c *Client) startAutoRefresh() {
 			// Rotation succeeded — also refresh session token to keep SNlM0e/at up to date
 				if sessionErr := c.refreshSessionToken(); sessionErr != nil {
 					c.log.Warn("Cookie rotated but session token refresh failed", zap.Error(sessionErr))
+					c.mu.Lock(); c.healthy = false; c.mu.Unlock()
 					c.setAccountState(AccountStateExpired, sessionErr)
 				} else {
 					c.log.Info("Cookie and session token refreshed successfully")
@@ -714,91 +721,40 @@ func selectStartupPSIDTS(configPSIDTS, configSource, cachedPSIDTS string, cacheE
 	return "", "", false
 }
 
-func (c *Client) RotateCookies() error {
-	c.log.Info("Gemini cookie rotation started",
-		zap.String("account", c.accountID),
-		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
-		zap.String("proxy", redactProxyURL(c.proxyURL)),
-	)
-	var lastErr error
-	backoffs := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+func (c *Client) RotateCookies() error { return c.RotateCookiesContext(context.Background()) }
 
-	for i := 0; i <= 3; i++ {
-		if i > 0 {
-			c.log.Warn(fmt.Sprintf("Retrying cookie rotation (attempt %d/3) after %v due to error: %v", i, backoffs[i-1], lastErr))
-			time.Sleep(backoffs[i-1])
+func (c *Client) RotateCookiesContext(ctx context.Context) error {
+	if ctx == nil { ctx = context.Background() }
+	c.mu.RLock(); proxyURL := c.proxyURL; c.mu.RUnlock()
+	c.log.Info("Gemini cookie rotation started", zap.String("account", c.accountID), zap.Bool("proxy_enabled", proxyURL != ""), zap.String("proxy", redactProxyURL(proxyURL)))
+	var lastErr error
+	backoffs := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	for attempt := 0; attempt <= len(backoffs); attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(backoffs[attempt-1])
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() { select { case <-timer.C: default: } }
+				return ctx.Err()
+			}
 		}
-		err := c.rotateCookiesOnce()
-		if err == nil {
-			return nil
-		}
-		lastErr = err
+		if err := c.rotateCookiesOnce(ctx); err == nil { return nil } else { lastErr = err }
 	}
 	return fmt.Errorf("cookie rotation failed after 3 retries: %w", lastErr)
 }
 
-func (c *Client) rotateCookiesOnce() error {
-	c.cookies.mu.Lock()
-	defer c.cookies.mu.Unlock()
-
-	// Prepare cookies for rotation request
-	// NOTE: We access fields directly instead of using ToHTTPCookies() to avoid recursive locking (deadlock)
-	parts := []string{}
-	if c.cookies.Secure1PSID != "" {
-		parts = append(parts, fmt.Sprintf("__Secure-1PSID=%s", c.cookies.Secure1PSID))
-	}
-	if c.cookies.Secure1PSIDTS != "" {
-		parts = append(parts, fmt.Sprintf("__Secure-1PSIDTS=%s", c.cookies.Secure1PSIDTS))
-	}
-	cookieStr := strings.Join(parts, "; ")
-
-	// Payload must be exactly this string
-	strBody := `[000,"-0000000000000000000"]`
-	req, _ := http.NewRequest("POST", EndpointRotateCookies, strings.NewReader(strBody))
-
-	req.Header.Set("Content-Type", "application/json")
-	// Google often blocks requests with default Go-http-client User-Agent
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Cookie", cookieStr)
-
-	c.log.Debug("Sending rotation request", zap.String("url", EndpointRotateCookies))
-	hClient := c.newHTTPClient(5 * time.Second)
-	resp, err := hClient.Do(req)
-	if err != nil {
-		// Log as Info to avoid scary stacktraces in development mode for expected auth failures
-		c.log.Info("Rotation request failed (network/auth issue)", zap.String("error", err.Error()))
-		return fmt.Errorf("failed to call rotation endpoint: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		c.log.Info("Rotation failed (likely invalid __Secure-1PSID)", zap.Int("status", resp.StatusCode))
-		return fmt.Errorf("rotation failed with status %d", resp.StatusCode)
-	}
-
-	// Extract new PSIDTS from Set-Cookie headers
+func (c *Client) rotateCookiesOnce(ctx context.Context) error {
+	c.cookies.mu.RLock(); psid, psidts := c.cookies.Secure1PSID, c.cookies.Secure1PSIDTS; c.cookies.mu.RUnlock()
+	parts := []string{}; if psid != "" { parts = append(parts, "__Secure-1PSID="+psid) }; if psidts != "" { parts = append(parts, "__Secure-1PSIDTS="+psidts) }
+	req, _ := http.NewRequestWithContext(ctx, "POST", EndpointRotateCookies, strings.NewReader(`[000,"-0000000000000000000"]`))
+	req.Header.Set("Content-Type", "application/json"); req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"); req.Header.Set("Cookie", strings.Join(parts, "; "))
+	resp, err := c.newHTTPClient(5*time.Second).Do(req); if err != nil { return fmt.Errorf("failed to call rotation endpoint: %w", err) }; defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return fmt.Errorf("rotation failed with status %d", resp.StatusCode) }
 	found := false
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "__Secure-1PSIDTS" {
-			c.cookies.Secure1PSIDTS = cookie.Value
-			c.cookies.UpdatedAt = time.Now()
-			found = true
-			// Save the new cookie to cache immediately
-			_ = c.SaveCachedCookies()
-		}
-		// Sync to req/v3 client for future calls
-		c.httpClient.SetCommonCookies(cookie)
-	}
-
-	if found {
-		c.log.Info("Cookie rotated successfully", zap.Time("updated_at", c.cookies.UpdatedAt))
-	} else {
-		if c.cookies.Secure1PSIDTS == "" {
-			return errors.New("failed to obtain __Secure-1PSIDTS from Google rotation endpoint. Your __Secure-1PSID cookie might be invalid or expired")
-		}
-		// Google returns 200 but omits a new cookie when the existing one is still valid — not an error
-		c.log.Debug("No new __Secure-1PSIDTS issued; existing cookie is still valid")
-	}
+	for _, cookie := range resp.Cookies() { if cookie.Name == "__Secure-1PSIDTS" { c.cookies.mu.Lock(); c.cookies.Secure1PSIDTS = cookie.Value; c.cookies.UpdatedAt = time.Now(); c.cookies.mu.Unlock(); found = true }; c.httpClient.SetCommonCookies(cookie) }
+	if found { if err := c.SaveCachedCookies(); err != nil { return fmt.Errorf("save rotated cookies: %w", err) }; return nil }
+	if psidts == "" { return errors.New("failed to obtain __Secure-1PSIDTS from Google rotation endpoint. Your __Secure-1PSID cookie might be invalid or expired") }
 	return nil
 }
 
@@ -839,7 +795,7 @@ func (c *Client) UpdateCookies(ctx context.Context, secure1PSID, secure1PSIDTS s
 	c.cookies.UpdatedAt = time.Now()
 	c.cookies.mu.Unlock()
 
-	if err := c.refreshSessionToken(); err != nil {
+	if err := c.refreshSessionTokenContext(ctx); err != nil {
 		c.cookies.mu.Lock()
 		c.cookies.Secure1PSID = oldPSID
 		c.cookies.Secure1PSIDTS = oldPSIDTS
@@ -905,6 +861,7 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	buildLabel := c.buildLabel
 	sessionID := c.sessionID
 	language := c.language
+	plainClient := c.rawHTTPClient
 	c.mu.RUnlock()
 	if language == "" {
 		language = "en"
@@ -964,8 +921,6 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		maxAttempts = 1
 	}
 
-	// Use rawHTTPClient for connection reuse
-	plainClient := c.rawHTTPClient
 
 	totalStart := time.Now()
 
@@ -1013,40 +968,28 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 			zap.Bool("has_conversation_id", strings.TrimSpace(config.ConversationID) != ""),
 		)
 
+		if err := ConsumeRetryBudget(ctx); err != nil { return nil, err }
 		httpResp, err := plainClient.Do(httpReq)
 		httpDuration := time.Since(httpStart)
 		if err != nil {
-			c.log.Warn("Generate request failed, will retry",
-				zap.Error(err),
-				zap.Duration("http_duration", httpDuration),
-				zap.Int("attempt", attempt),
-			)
+			c.log.Warn("Generate request failed, will retry", zap.Error(err), zap.Duration("http_duration", httpDuration), zap.Int("attempt", attempt))
 			lastErr = err
 			continue
 		}
-		defer httpResp.Body.Close()
-
-		if httpResp.StatusCode != http.StatusOK {
-			bodySnippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, 512))
-			lastErr = fmt.Errorf("generate failed with status: %d", httpResp.StatusCode)
-			c.log.Warn("Generate returned non-200",
-				zap.Int("status", httpResp.StatusCode),
-				zap.String("body_snippet", string(bodySnippet)),
-				zap.Int("attempt", attempt),
-			)
-			if httpResp.StatusCode >= 500 {
-				continue
-			}
+		status := httpResp.StatusCode
+		if status != http.StatusOK {
+			bodySnippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
+			_ = httpResp.Body.Close()
+			lastErr = fmt.Errorf("generate failed with status %d: %s", status, strings.TrimSpace(string(bodySnippet)))
+			c.log.Warn("Generate returned non-200", zap.Int("status", status), zap.String("body_snippet", string(bodySnippet)), zap.Int("attempt", attempt))
+			if isRetryableHTTPStatus(status) { continue }
 			return nil, lastErr
 		}
-
-		respBytes, err := io.ReadAll(httpResp.Body)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read generate response: %w", err)
-			continue
-		}
+		respBytes, readErr := io.ReadAll(httpResp.Body)
+		closeErr := httpResp.Body.Close()
+		if readErr != nil { lastErr = fmt.Errorf("failed to read generate response: %w", readErr); continue }
+		if closeErr != nil { lastErr = fmt.Errorf("close generate response: %w", closeErr); continue }
 		respBody := string(respBytes)
-
 		parseStart := time.Now()
 		result, parseErr := c.parseResponse(respBody)
 		parseDuration := time.Since(parseStart)
@@ -1085,6 +1028,8 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
+func isRetryableHTTPStatus(status int) bool { return status == http.StatusTooManyRequests || status >= 500 }
+
 type StreamCallback func(deltaText string) bool
 
 type StreamEventCallback func(event StreamEvent) bool
@@ -1099,14 +1044,9 @@ type StreamState struct {
 	HasContent    bool
 }
 
-const maxStreamParseBufferBytes = 512 * 1024
 const defaultStreamFinishIdleTimeout = 1500 * time.Millisecond
 const defaultStreamFirstContentTimeout = 45 * time.Second
 
-// streamParseMinIntervalBytes limits how often the full parse buffer is
-// re-scanned for text deltas. Without this, every 16 KB chunk triggers a
-// full O(n) scan of up to 512 KB, making long responses O(n²) in CPU.
-const streamParseMinIntervalBytes = 8 * 1024
 
 func (c *Client) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
 	state := &StreamState{}
@@ -1160,6 +1100,41 @@ func (c *Client) GenerateContentStream(ctx context.Context, prompt string, onChu
 	}, options...)
 }
 
+const maxStreamTailBytes = 128 * 1024
+func appendStreamTail(buf *bytes.Buffer, data []byte) {
+	if len(data) >= maxStreamTailBytes { buf.Reset(); _, _ = buf.Write(data[len(data)-maxStreamTailBytes:]); return }
+	if buf.Len()+len(data) > maxStreamTailBytes { keep:=maxStreamTailBytes-len(data); tail:=append([]byte(nil),buf.Bytes()[buf.Len()-keep:]...); buf.Reset(); _,_=buf.Write(tail) }
+	_, _ = buf.Write(data)
+}
+
+type streamIncrementalParser struct {
+	pending  []byte
+	lastText string
+}
+
+func (p *streamIncrementalParser) Feed(data []byte, final bool, visit func([]byte, string) bool) bool {
+	p.pending = append(p.pending, data...)
+	end := bytes.LastIndexByte(p.pending, '\n')
+	if end >= 0 {
+		complete := bytes.TrimSpace(p.pending[:end])
+		p.pending = append(p.pending[:0], p.pending[end+1:]...)
+		if len(complete) > 0 && !p.parseLine(complete, visit) { return false }
+	}
+	if final && len(bytes.TrimSpace(p.pending)) > 0 {
+		complete := bytes.TrimSpace(p.pending); p.pending = nil
+		return p.parseLine(complete, visit)
+	}
+	return true
+}
+
+func (p *streamIncrementalParser) parseLine(line []byte, visit func([]byte, string) bool) bool {
+	text := extractStreamTextFromBuffer(line)
+	if text == "" { text = extractTextFromBuffer(line) }
+	delta := streamTextDelta(p.lastText, text)
+	if delta != "" || (text != "" && strings.HasPrefix(text, p.lastText)) { p.lastText = text }
+	return visit(line, delta)
+}
+
 func (c *Client) generateContentStreamInternal(ctx context.Context, prompt string, onEvent func(buffer []byte, deltaText string) bool, options ...GenerateOption) error {
 	config := &GenerateConfig{}
 	for _, opt := range options {
@@ -1183,6 +1158,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	buildLabel := c.buildLabel
 	sessionID := c.sessionID
 	language := c.language
+	streamClient := c.rawHTTPClient
 	c.mu.RUnlock()
 	if language == "" {
 		language = "en"
@@ -1296,7 +1272,8 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		)
 
 		requestStart := time.Now()
-		httpResp, err := c.rawHTTPClient.Do(httpReq)
+		if err := ConsumeRetryBudget(ctx); err != nil { return err }
+		httpResp, err := streamClient.Do(httpReq)
 		if err != nil {
 			lastStreamErr = fmt.Errorf("stream request failed: %w", err)
 			if debugCapture != nil {
@@ -1325,7 +1302,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 			} else {
 				lastStreamErr = fmt.Errorf("stream returned status %d", httpResp.StatusCode)
 			}
-			if httpResp.StatusCode >= 500 {
+			if isRetryableHTTPStatus(httpResp.StatusCode) {
 				if debugCapture != nil {
 					debugCapture.Close()
 				}
@@ -1341,11 +1318,13 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		var lastText string
 		var lastContentAt time.Time
 		var buf bytes.Buffer
-		var lastParseLen int
+		parser := &streamIncrementalParser{}
 		continuityChecked := expectedConversationCID == ""
 		metadataStored := false
+		streamMetadata := map[string]any{}
 		finalizeStreamConversation := func() error {
-			metadata := extractConversationMetadataFromBuffer(buf.Bytes())
+			metadata := streamMetadata
+			if len(metadata) == 0 { metadata = extractConversationMetadataFromBuffer(buf.Bytes()) }
 			if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
 				return err
 			}
@@ -1379,6 +1358,11 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 
 		var idleTimer *time.Timer
 		var firstContentTimer *time.Timer
+		cleanupStream := func() {
+			stopReader(); _ = httpResp.Body.Close()
+			if idleTimer != nil { idleTimer.Stop() }
+			if firstContentTimer != nil { firstContentTimer.Stop() }
+		}
 
 	readLoop:
 		for {
@@ -1391,6 +1375,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 					zap.Int("final_text_len", len(lastText)),
 				)
 				if err := finalizeStreamConversation(); err != nil {
+					cleanupStream()
 					return err
 				}
 				stopReader()
@@ -1445,6 +1430,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 				zap.Int("final_text_len", len(lastText)),
 			)
 			if err := finalizeStreamConversation(); err != nil {
+				cleanupStream()
 				return err
 			}
 			stopReader()
@@ -1476,76 +1462,38 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		if len(result.data) > 0 {
 			if !firstByteLogged {
 				firstByteLogged = true
-				logTrace("gemini first upstream bytes received",
-					zap.Int("chunk_bytes", len(result.data)),
-					zap.Duration("ttfb", time.Since(requestStart)),
-				)
+				logTrace("gemini first upstream bytes received", zap.Int("chunk_bytes", len(result.data)), zap.Duration("ttfb", time.Since(requestStart)))
 			}
-			buf.Write(result.data)
-			if debugStreamFile != nil {
-				_, _ = debugStreamFile.Write(result.data)
-			}
-			if debugCapture != nil {
-				debugCapture.WriteRaw(result.data, time.Since(requestStart))
-			}
+			appendStreamTail(&buf, result.data)
+			if debugStreamFile != nil { _, _ = debugStreamFile.Write(result.data) }
+			if debugCapture != nil { debugCapture.WriteRaw(result.data, time.Since(requestStart)) }
 			entryTrace.CaptureChunk(result.data, time.Since(requestStart))
+		}
+		var parserErr error
+		if !parser.Feed(result.data, result.err != nil, func(parseBuffer []byte, delta string) bool {
 			if !continuityChecked || !metadataStored {
-				metadata := extractConversationMetadataFromBuffer(buf.Bytes())
+				metadata := extractConversationMetadataFromBuffer(parseBuffer)
+				streamMetadata = mergeConversationMetadata(streamMetadata, metadata)
 				if cid, _ := metadata["cid"].(string); cid != "" {
 					if !continuityChecked {
-						if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
-							return err
-						}
+						if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil { parserErr = err; return false }
 						continuityChecked = true
 					}
-					if !metadataStored {
-						c.updateConversation(config.ConversationID, metadata)
-						metadataStored = true
-					}
+					if !metadataStored { c.updateConversation(config.ConversationID, metadata); metadataStored = true }
 				}
 			}
-			parseBuffer := recentBytes(buf.Bytes(), maxStreamParseBufferBytes)
-			if !onEvent(parseBuffer, "") {
-				return nil
-			}
+			if !onEvent(parseBuffer, "") { return false }
+			if delta == "" { return true }
+			lastText = parser.lastText
+			if !firstTextLogged { firstTextLogged = true; logTrace("gemini first parsed text emitted", zap.Int("delta_len", len(delta)), zap.Duration("parse_ttfb", time.Since(requestStart))) }
+			if !onEvent(parseBuffer, delta) { return false }
+			lastContentAt = time.Now()
+			return true
+		}) {
+			cleanupStream()
+			if parserErr != nil { return parserErr }
+			return nil
 		}
-		parseBuffer := recentBytes(buf.Bytes(), maxStreamParseBufferBytes)
-		// Throttle re-parsing: only attempt text extraction when enough new
-		// bytes have accumulated since the last attempt, or when the stream
-		// has ended (result.err != nil). This avoids O(n²) re-scans of the
-		// full buffer on every 16 KB chunk for long responses.
-		shouldParse := buf.Len()-lastParseLen >= streamParseMinIntervalBytes || result.err != nil
-		if !shouldParse {
-			if result.err != nil {
-				break readLoop
-			}
-			continue
-		}
-		lastParseLen = buf.Len()
-		text := extractStreamTextFromBuffer(parseBuffer)
-		if text == "" {
-			text = extractTextFromBuffer(parseBuffer)
-		}
-		if text != "" && text != lastText {
-			delta := streamTextDelta(lastText, text)
-			if delta != "" || strings.HasPrefix(text, lastText) {
-				lastText = text
-			}
-			if delta != "" {
-				if !firstTextLogged {
-					firstTextLogged = true
-					logTrace("gemini first parsed text emitted",
-						zap.Int("delta_len", len(delta)),
-						zap.Duration("parse_ttfb", time.Since(requestStart)),
-					)
-				}
-				if !onEvent(parseBuffer, delta) {
-					return nil
-				}
-				lastContentAt = time.Now()
-			}
-		}
-
 		if result.err != nil {
 			if result.err != io.EOF {
 				lastStreamErr = fmt.Errorf("stream read: %w", result.err)
@@ -1764,12 +1712,6 @@ func streamTextDelta(previous, current string) string {
 	return ""
 }
 
-func recentBytes(data []byte, limit int) []byte {
-	if limit <= 0 || len(data) <= limit {
-		return data
-	}
-	return data[len(data)-limit:]
-}
 
 func extractStreamTextFromBuffer(data []byte) string {
 	s := string(data)
@@ -2174,7 +2116,7 @@ func (c *Client) RefreshAccount(ctx context.Context, accountID string) error {
 		return fmt.Errorf("Gemini account %q not found", accountID)
 	}
 	c.setAccountState(AccountStateRefreshing, nil)
-	if err := c.RotateCookies(); err != nil {
+	if err := c.RotateCookiesContext(ctx); err != nil {
 		c.setAccountState(AccountStateExpired, err)
 		return err
 	}

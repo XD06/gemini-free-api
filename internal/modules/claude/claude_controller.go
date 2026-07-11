@@ -114,6 +114,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 		c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
+			ctx = providers.ContextWithRetryBudget(ctx, 4)
 			ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 			var firstByteTime time.Time
@@ -170,6 +171,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 	// Non-streaming mode
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	ctx = providers.ContextWithRetryBudget(ctx, 4)
 	ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
 	response, err := h.service.GenerateMessage(ctx, req)

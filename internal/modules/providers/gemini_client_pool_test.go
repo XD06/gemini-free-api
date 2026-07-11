@@ -3,11 +3,17 @@ package providers
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"gemini-free-api/internal/commons/configs"
+
+	"github.com/imroc/req/v3"
+	"go.uber.org/zap"
 )
 
 func TestClientPoolRotatesOnlyForNewConversations(t *testing.T) {
@@ -218,7 +224,7 @@ func TestBackgroundRefreshDoesNotMarkExpiredAccountHealthyWithoutExternalCookies
 		conversationTo: make(map[string]string),
 		refreshing:     make(map[string]bool),
 		activeIndex:    -1,
-		internalRefresh: func(client *Client) error {
+		internalRefresh: func(context.Context, *Client) error {
 			return nil
 		},
 	}
@@ -237,4 +243,117 @@ func TestBackgroundRefreshDoesNotMarkExpiredAccountHealthyWithoutExternalCookies
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("expected account to require external cookies, got %#v", main.AccountStatus())
+}
+
+func TestBoundConversationMovesOffUnhealthyAccount(t *testing.T) {
+	main := &Client{accountID: "main", healthy: false}
+	backup := &Client{accountID: "backup", healthy: true}
+	pool := &ClientPool{
+		clients:          []*Client{main, backup},
+		clientsByID:      map[string]*Client{"main": main, "backup": backup},
+		stayByID:         map[string]time.Duration{"main": time.Hour, "backup": time.Hour},
+		conversationTo:   map[string]string{"thread": "main"},
+		conversationSeen: map[string]time.Time{"thread": time.Now()},
+		activeIndex:      0,
+		activeUntil:      time.Now().Add(time.Hour),
+	}
+
+	selected, err := pool.clientForOptions(context.Background(), WithConversationID("thread"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected != backup {
+		t.Fatalf("expected unhealthy binding to move to backup, got %q", selected.accountID)
+	}
+	if got := pool.conversationTo["thread"]; got != "backup" {
+		t.Fatalf("expected binding updated to backup, got %q", got)
+	}
+}
+
+func TestUpdateAccountCookiesKeepsOldCookiesWhenValidationFails(t *testing.T) {
+	oldPSID, oldTS := "old-psid", "old-ts"
+	client := &Client{
+		accountID:  "main",
+		cookies:    &CookieStore{Secure1PSID: oldPSID, Secure1PSIDTS: oldTS},
+		httpClient: req.NewClient().SetTimeout(time.Second),
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("no session token")), Request: req}, nil
+		})},
+		log: zap.NewNop(),
+	}
+	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}}
+
+	err := pool.UpdateAccountCookies(context.Background(), "main", "bad-psid", "bad-ts")
+	if err == nil {
+		t.Fatal("expected invalid cookies to fail validation")
+	}
+	got := client.GetCookies()
+	if got.Secure1PSID != oldPSID || got.Secure1PSIDTS != oldTS {
+		t.Fatalf("expected old cookies preserved, got %#v", got)
+	}
+}
+
+func TestHasConversationStateDoesNotRebindUnhealthyOwner(t *testing.T) {
+	main := &Client{
+		accountID:     "main",
+		healthy:       false,
+		conversations: map[string]*SessionMetadata{"thread": {ConversationID: "provider-thread"}},
+	}
+	pool := &ClientPool{
+		clients:          []*Client{main},
+		clientsByID:      map[string]*Client{"main": main},
+		conversationTo:   map[string]string{"thread": "main"},
+		conversationSeen: map[string]time.Time{"thread": time.Now()},
+	}
+	if pool.HasConversationState("thread") {
+		t.Fatal("expected unhealthy conversation owner to be unavailable")
+	}
+	if _, ok := pool.conversationTo["thread"]; ok {
+		t.Fatal("expected unhealthy conversation binding to remain removed")
+	}
+}
+
+func TestNewConversationDoesNotCountAsExistingProviderState(t *testing.T) {
+	client := &Client{conversations: make(map[string]*SessionMetadata)}
+	if hasConversationStateOption(client, WithConversationID("new-thread")) {
+		t.Fatal("expected a new conversation id to remain eligible for failover")
+	}
+	client.conversations["existing-thread"] = &SessionMetadata{ConversationID: "provider-thread"}
+	if !hasConversationStateOption(client, WithConversationID("existing-thread")) {
+		t.Fatal("expected established provider state to require history-aware fallback")
+	}
+}
+
+func TestUpdateAccountProxyDoesNotCommitFailedCandidate(t *testing.T) {
+	oldRaw := &http.Client{}
+	client := &Client{accountID: "main", proxyURL: "http://old", cookies: &CookieStore{Secure1PSID: "cookie"}, httpClient: req.NewClient(), rawHTTPClient: oldRaw}
+	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}, cfg: &configs.Config{}}
+	original := validateProxyClient
+	validateProxyClient = func(context.Context, *http.Client, string) error { return errors.New("unreachable") }
+	defer func() { validateProxyClient = original }()
+
+	if err := pool.UpdateAccountProxy(context.Background(), "main", "http://new"); err == nil {
+		t.Fatal("expected validation error")
+	}
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	if client.proxyURL != "http://old" || client.rawHTTPClient != oldRaw {
+		t.Fatalf("failed candidate was committed: proxy=%q", client.proxyURL)
+	}
+}
+
+func TestUpdateAccountProxyCopiesCookiesToCandidate(t *testing.T) {
+	client := &Client{accountID: "main", cookies: &CookieStore{Secure1PSID: "cookie", Secure1PSIDTS: "ts"}, httpClient: req.NewClient(), rawHTTPClient: &http.Client{}}
+	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}, cfg: &configs.Config{}}
+	original := validateProxyClient
+	var gotCookieHeader string
+	validateProxyClient = func(_ context.Context, _ *http.Client, header string) error { gotCookieHeader = header; return nil }
+	defer func() { validateProxyClient = original }()
+
+	if err := pool.UpdateAccountProxy(context.Background(), "main", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCookieHeader, "__Secure-1PSID=cookie") || !strings.Contains(gotCookieHeader, "__Secure-1PSIDTS=ts") {
+		t.Fatalf("expected current auth cookies copied to candidate validation, got %q", gotCookieHeader)
+	}
 }

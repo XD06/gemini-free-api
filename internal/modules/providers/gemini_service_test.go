@@ -1,16 +1,21 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/imroc/req/v3"
 	"go.uber.org/zap"
 )
 
@@ -1168,5 +1173,144 @@ func TestCheckConversationContinuityDoesNotFlagMatchingCid(t *testing.T) {
 	}
 	if client.IsConversationUntrusted("thread-z") {
 		t.Fatal("expected conversation NOT flagged untrusted when cid matches")
+	}
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	mu     sync.Mutex
+	closed bool
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *trackingReadCloser) isClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
+}
+
+func TestGenerateContentStreamClosesBodyWhenConsumerStops(t *testing.T) {
+	body := &trackingReadCloser{Reader: strings.NewReader("chunk")}
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+		maxRetries:    1,
+	}
+
+	err := client.generateContentStreamInternal(context.Background(), "hello", func([]byte, string) bool {
+		return false
+	}, WithModel("gemini-3.5-flash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !body.isClosed() {
+		t.Fatal("expected upstream response body to be closed when consumer stops")
+	}
+}
+
+func TestStreamIncrementalParserHandlesSplitLines(t *testing.T) {
+	first := buildStreamLine(t, []interface{}{nil, []interface{}{"c", "r"}, nil, nil, []interface{}{[]interface{}{"rc", []interface{}{"Hello"}, nil, nil, nil, nil, true}}})
+	second := buildStreamLine(t, []interface{}{nil, []interface{}{"c", "r"}, nil, nil, []interface{}{[]interface{}{"rc", []interface{}{"Hello world"}, nil, nil, nil, nil, true}}})
+	data := []byte(first + "\n" + second + "\n")
+	parser := &streamIncrementalParser{}
+	var deltas []string
+	for _, chunk := range [][]byte{data[:7], data[7:31], data[31:]} {
+		if !parser.Feed(chunk, false, func(_ []byte, delta string) bool {
+			if delta != "" {
+				deltas = append(deltas, delta)
+			}
+			return true
+		}) {
+			t.Fatal("unexpected stop")
+		}
+	}
+	if got := strings.Join(deltas, ""); got != "Hello world" {
+		t.Fatalf("expected cumulative text, got %q (%#v)", got, deltas)
+	}
+}
+
+func TestRotateCookiesContextStopsDuringBackoff(t *testing.T) {
+	client := &Client{
+		accountID:  "test",
+		proxyURL:   "http://127.0.0.1:1",
+		cookies:    &CookieStore{Secure1PSID: "bad"},
+		httpClient: req.NewClient(),
+		log:        zap.NewNop(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err := client.RotateCookiesContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("canceled rotation took too long: %v", time.Since(start))
+	}
+}
+
+func TestIncrementalParserReplaysSanitizedRealStreamFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/stream_fixture.raw.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantText := extractStreamTextFromBuffer(data)
+	wantMetadata := extractConversationMetadataFromBuffer(data)
+	if wantText != "你好，世界" || wantMetadata["cid"] != "c_fixture" {
+		t.Fatalf("invalid fixture: text=%q metadata=%#v", wantText, wantMetadata)
+	}
+
+	for _, chunkSize := range []int{1, 7, 31, 1024} {
+		parser := &streamIncrementalParser{}
+		var text strings.Builder
+		metadata := map[string]any{}
+		for start := 0; start < len(data); start += chunkSize {
+			end := start + chunkSize
+			if end > len(data) {
+				end = len(data)
+			}
+			ok := parser.Feed(data[start:end], end == len(data), func(entry []byte, delta string) bool {
+				text.WriteString(delta)
+				metadata = mergeConversationMetadata(metadata, extractConversationMetadataFromBuffer(entry))
+				return true
+			})
+			if !ok {
+				t.Fatalf("chunk size %d stopped unexpectedly", chunkSize)
+			}
+		}
+		if text.String() != wantText {
+			t.Fatalf("chunk size %d: got text %q, want %q", chunkSize, text.String(), wantText)
+		}
+		if metadata["cid"] != wantMetadata["cid"] || metadata["context_token"] != wantMetadata["context_token"] {
+			t.Fatalf("chunk size %d: metadata=%#v want=%#v", chunkSize, metadata, wantMetadata)
+		}
+	}
+}
+
+func TestAppendStreamTailCapsMemory(t *testing.T) {
+	var buf bytes.Buffer
+	appendStreamTail(&buf, bytes.Repeat([]byte("a"), maxStreamTailBytes))
+	appendStreamTail(&buf, []byte("tail"))
+	if buf.Len() != maxStreamTailBytes {
+		t.Fatalf("got %d", buf.Len())
+	}
+	if !bytes.HasSuffix(buf.Bytes(), []byte("tail")) {
+		t.Fatal("tail missing")
 	}
 }

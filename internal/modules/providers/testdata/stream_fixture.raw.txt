@@ -1,0 +1,8 @@
+)]}'
+
+118
+[["wrb.fr",null,"[null,[\"c_fixture\",\"r_fixture\"],{\"18\":\"r_fixture\",\"21\":[\"token_fixture\"],\"44\":true}]"]]
+123
+[["wrb.fr",null,"[null,[\"c_fixture\",\"r_fixture\"],null,null,[[\"rc_fixture\",[\"你好\"],null,null,null,null,true]]]"]]
+132
+[["wrb.fr",null,"[null,[\"c_fixture\",\"r_fixture\"],null,null,[[\"rc_fixture\",[\"你好，世界\"],null,null,null,null,true]]]"]]
