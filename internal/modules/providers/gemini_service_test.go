@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
@@ -731,6 +733,30 @@ func TestExtractStreamStateIncludesAllStructuredThinkingSignals(t *testing.T) {
 	}
 }
 
+func TestExtractStreamStateReadsCurrentThinkingSummaryWithoutStructuredMetadata(t *testing.T) {
+	currentSummary := "**Analyzing the Goal**\n\nI've clarified the task and selected a proof strategy."
+	candidate := buildCandidateWithThinking("rc_1", "", currentSummary)
+	candidate[37] = []interface{}{
+		[]interface{}{currentSummary},
+		[]interface{}{
+			[]interface{}{"Analyzing the Goal", "Structured UI description must not be emitted as reasoning."},
+		},
+	}
+	line := buildStreamLine(t,
+		[]interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{candidate}},
+	)
+
+	state := ExtractStreamState([]byte(line))
+	if !containsString(state.ThinkingTexts, currentSummary) {
+		t.Fatalf("expected current thinking summary in %#v", state.ThinkingTexts)
+	}
+	for _, unexpected := range []string{"Analyzing the Goal", "Structured UI description must not be emitted as reasoning."} {
+		if containsString(state.ThinkingTexts, unexpected) {
+			t.Fatalf("structured metadata %q leaked into thinking: %#v", unexpected, state.ThinkingTexts)
+		}
+	}
+}
+
 func TestExtractStreamStateIgnoresTopicTitleField11(t *testing.T) {
 	line := buildStreamLine(t,
 		[]interface{}{nil, []interface{}{"c_1", "r_1"}, map[string]interface{}{
@@ -812,8 +838,8 @@ func TestStreamFinishIdleTimeoutConfig(t *testing.T) {
 	}
 
 	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "2500")
-	if got := streamFinishIdleTimeout(); got != minStreamFinishIdleTimeout {
-		t.Fatalf("expected configured idle timeout to be clamped, got %v", got)
+	if got := streamFinishIdleTimeout(); got != 2500*time.Millisecond {
+		t.Fatalf("expected configured idle timeout without an implicit clamp, got %v", got)
 	}
 	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "16000")
 	if got := streamFinishIdleTimeout(); got != 16*time.Second {
@@ -821,23 +847,44 @@ func TestStreamFinishIdleTimeoutConfig(t *testing.T) {
 	}
 }
 
-func TestStreamFirstContentTimeoutConfig(t *testing.T) {
+func TestStreamFirstActivityTimeoutConfig(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "")
 	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "")
-	if got := streamFirstContentTimeout(); got != defaultStreamFirstContentTimeout {
-		t.Fatalf("expected default first content timeout %v, got %v", defaultStreamFirstContentTimeout, got)
+	if got := streamFirstActivityTimeout(); got != defaultStreamFirstActivityTimeout {
+		t.Fatalf("expected default first activity timeout %v, got %v", defaultStreamFirstActivityTimeout, got)
 	}
-	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "0")
-	if got := streamFirstContentTimeout(); got != 0 {
-		t.Fatalf("expected disabled first content timeout, got %v", got)
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "0")
+	if got := streamFirstActivityTimeout(); got != 0 {
+		t.Fatalf("expected disabled first activity timeout, got %v", got)
 	}
-	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "2500")
-	if got := streamFirstContentTimeout(); got != 2500*time.Millisecond {
-		t.Fatalf("expected configured first content timeout, got %v", got)
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "2500")
+	if got := streamFirstActivityTimeout(); got != 2500*time.Millisecond {
+		t.Fatalf("expected configured first activity timeout, got %v", got)
+	}
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "")
+	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "3000")
+	if got := streamFirstActivityTimeout(); got != 3*time.Second {
+		t.Fatalf("expected legacy first content timeout fallback, got %v", got)
 	}
 }
 
-func TestGenerateContentStreamForOpenAITimesOutBeforeFirstContent(t *testing.T) {
-	t.Setenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS", "1")
+func TestStreamProgressIdleTimeoutConfig(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS", "")
+	if got := streamProgressIdleTimeout(); got != defaultStreamProgressIdleTimeout {
+		t.Fatalf("expected default progress idle timeout %v, got %v", defaultStreamProgressIdleTimeout, got)
+	}
+	t.Setenv("GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS", "0")
+	if got := streamProgressIdleTimeout(); got != 0 {
+		t.Fatalf("expected disabled progress idle timeout, got %v", got)
+	}
+	t.Setenv("GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS", "2500")
+	if got := streamProgressIdleTimeout(); got != 2500*time.Millisecond {
+		t.Fatalf("expected configured progress idle timeout, got %v", got)
+	}
+}
+
+func TestGenerateContentStreamForOpenAITimesOutBeforeFirstActivity(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "1")
 	client := &Client{
 		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -863,11 +910,288 @@ func TestGenerateContentStreamForOpenAITimesOutBeforeFirstContent(t *testing.T) 
 		t.Fatalf("expected no stream events, got %#v", event)
 		return false
 	}, WithModel("gemini-3.5-flash"))
-	if err == nil || !strings.Contains(err.Error(), "first content timeout") {
-		t.Fatalf("expected first content timeout error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "upstream result unknown") || !strings.Contains(err.Error(), "first activity timeout") {
+		t.Fatalf("expected first activity timeout error, got %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("expected fast timeout, took %v", elapsed)
+	}
+}
+
+func TestGenerateContentStreamForOpenAIReasoningCancelsFirstActivityTimeout(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "10")
+	reader, writer := io.Pipe()
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: reader, Request: req}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+		maxRetries:    1,
+	}
+	thinkingLine := buildStreamLine(t, []interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{
+		buildCandidateWithThinking("rc_1", "", "正在分析问题"),
+	}})
+	contentLine := buildStreamLine(t, []interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{
+		buildCandidateWithThinking("rc_1", "完成", "正在分析问题"),
+	}})
+	go func() {
+		_, _ = io.WriteString(writer, thinkingLine+"\n")
+		time.Sleep(40 * time.Millisecond)
+		_, _ = io.WriteString(writer, contentLine+"\n")
+		_ = writer.Close()
+	}()
+
+	var reasoning, content strings.Builder
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(event StreamEvent) bool {
+		switch event.Kind {
+		case "thinking_text":
+			reasoning.WriteString(event.Delta)
+		case "content_delta":
+			content.WriteString(event.Delta)
+		}
+		return true
+	}, WithModel("gemini-3.5-flash"))
+	if err != nil {
+		t.Fatalf("reasoning should keep the stream alive: %v", err)
+	}
+	if reasoning.String() == "" || content.String() != "完成" {
+		t.Fatalf("unexpected events: reasoning=%q content=%q", reasoning.String(), content.String())
+	}
+}
+
+func TestGenerateContentStreamForOpenAIDoesNotRetryAfterReasoning(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "100")
+	thinkingLine := buildStreamLine(t, []interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{
+		buildCandidateWithThinking("rc_1", "", "已经向客户端输出的思考"),
+	}})
+	calls := 0
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(&errAfterReader{data: []byte(thinkingLine + "\n"), err: io.ErrUnexpectedEOF}),
+				Request:    req,
+			}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+		maxRetries:    3,
+	}
+	reasoningEvents := 0
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(event StreamEvent) bool {
+		if event.Kind == "thinking_text" {
+			reasoningEvents++
+		}
+		return true
+	}, WithModel("gemini-3.5-flash"))
+	if err == nil {
+		t.Fatal("expected interrupted stream error")
+	}
+	if calls != 1 || reasoningEvents != 1 {
+		t.Fatalf("expected no transparent retry after reasoning, calls=%d reasoning_events=%d", calls, reasoningEvents)
+	}
+}
+
+func TestGenerateContentStreamForOpenAITimesOutWhenReasoningStalls(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "100")
+	t.Setenv("GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS", "5")
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	calls := 0
+	client := &Client{
+		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: reader, Request: req}, nil
+		})},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+		maxRetries:    3,
+	}
+	thinkingLine := buildStreamLine(t, []interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{
+		buildCandidateWithThinking("rc_1", "", "开始思考后上游停住"),
+	}})
+	go func() {
+		_, _ = io.WriteString(writer, thinkingLine+"\n")
+	}()
+
+	reasoningEvents := 0
+	start := time.Now()
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(event StreamEvent) bool {
+		if event.Kind == "thinking_text" {
+			reasoningEvents++
+		}
+		return true
+	}, WithModel("gemini-3.5-flash"))
+	if err == nil || !strings.Contains(err.Error(), "upstream result unknown") || !strings.Contains(err.Error(), "progress idle timeout") {
+		t.Fatalf("expected progress idle timeout, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected fast progress idle timeout, took %v", elapsed)
+	}
+	if calls != 1 || reasoningEvents != 1 {
+		t.Fatalf("expected one request and one reasoning event, calls=%d reasoning_events=%d", calls, reasoningEvents)
+	}
+}
+
+func TestGenerateContentStreamForOpenAIRetriesDefinitelyUnsentRequestOnce(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "0")
+	contentLine := buildStreamLine(t, []interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{
+		buildCandidateWithThinking("rc_1", "重试成功", ""),
+	}})
+	terminalLine := `[["e",17,null,null,1234]]`
+	calls := 0
+	client := newStreamTestClient(3, func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("dial tcp: connection refused")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(contentLine + "\n" + terminalLine + "\n")), Request: req}, nil
+	})
+	ctx, timings := ContextWithStreamTimings(context.Background())
+	var content strings.Builder
+	err := client.GenerateContentStreamForOpenAI(ctx, "你好", func(event StreamEvent) bool {
+		if event.Kind == "content_delta" {
+			content.WriteString(event.Delta)
+		}
+		return true
+	}, WithModel("gemini-3.5-flash"))
+	if err != nil {
+		t.Fatalf("expected retry to recover the stream: %v", err)
+	}
+	if calls != 2 || content.String() != "重试成功" {
+		t.Fatalf("unexpected retry result: calls=%d content=%q", calls, content.String())
+	}
+	snapshot := timings.Snapshot()
+	if snapshot.RetryCount != 1 || snapshot.CompletionSource != "terminal_entry" {
+		t.Fatalf("unexpected timing snapshot: %#v", snapshot)
+	}
+}
+
+func TestGenerateContentStreamForOpenAIDoesNotRetryTransportErrorAfterWrite(t *testing.T) {
+	calls := 0
+	client := newStreamTestClient(3, func(req *http.Request) (*http.Response, error) {
+		calls++
+		if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.WroteRequest != nil {
+			trace.WroteRequest(httptrace.WroteRequestInfo{})
+		}
+		return nil, errors.New("connection reset after request write")
+	})
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(StreamEvent) bool {
+		return true
+	}, WithModel("gemini-3.5-flash"))
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("expected transport error, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("request written to upstream must not retry, got %d calls", calls)
+	}
+}
+
+func TestGenerateContentStreamForOpenAIDoesNotRetryConversationTimeout(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "1")
+	calls := 0
+	client := newStreamTestClient(3, func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(&slowEOFReader{delay: 50 * time.Millisecond}),
+			Request:    req,
+		}, nil
+	})
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "继续", func(StreamEvent) bool {
+		return true
+	}, WithModel("gemini-3.5-flash"), WithConversationID("existing-thread"))
+	if err == nil || !strings.Contains(err.Error(), "upstream result unknown") || !strings.Contains(err.Error(), "first activity timeout") {
+		t.Fatalf("expected first activity timeout, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected no transparent retry for a conversation, got %d calls", calls)
+	}
+}
+
+func TestGenerateContentStreamForOpenAIDoesNotRetryNewConversationTimeout(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "1")
+	calls := 0
+	client := newStreamTestClient(3, func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(&slowEOFReader{delay: 50 * time.Millisecond}),
+			Request:    req,
+		}, nil
+	})
+	err := client.GenerateContentStreamForOpenAI(context.Background(), "你好", func(StreamEvent) bool {
+		return true
+	}, WithModel("gemini-3.5-flash"))
+	if err == nil || !strings.Contains(err.Error(), "first activity timeout") {
+		t.Fatalf("expected first activity timeout, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("timeout after dispatch must not retry, got %d calls", calls)
+	}
+}
+
+func TestGenerateContentStreamForOpenAIStopsAtTerminalEntry(t *testing.T) {
+	t.Setenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS", "100")
+	t.Setenv("GEMINI_STREAM_FINISH_IDLE_MS", "0")
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	client := newStreamTestClient(1, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: reader, Request: req}, nil
+	})
+	contentLine := buildStreamLine(t, []interface{}{nil, []interface{}{"c_1", "r_1"}, nil, nil, []interface{}{
+		buildCandidateWithThinking("rc_1", "立即结束", ""),
+	}})
+	go func() {
+		_, _ = io.WriteString(writer, contentLine+"\n"+`[["e",17,null,null,1234]]`+"\n")
+	}()
+	ctx, timings := ContextWithStreamTimings(context.Background())
+	start := time.Now()
+	err := client.GenerateContentStreamForOpenAI(ctx, "你好", func(StreamEvent) bool { return true }, WithModel("gemini-3.5-flash"))
+	if err != nil {
+		t.Fatalf("expected terminal entry success: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected terminal entry to close promptly, took %v", elapsed)
+	}
+	if snapshot := timings.Snapshot(); snapshot.CompletionSource != "terminal_entry" {
+		t.Fatalf("expected terminal completion source, got %#v", snapshot)
+	}
+}
+
+func TestHasStreamTerminalEntry(t *testing.T) {
+	raw := "137\n" + buildStreamLine(t, []interface{}{nil, []interface{}{"c", "r"}, map[string]interface{}{"44": true}}) + "\n28\n" + `[["e",17,null,null,1234]]`
+	if !hasStreamTerminalEntry([]byte(raw)) {
+		t.Fatal("expected transport terminal entry to be detected")
+	}
+	if hasStreamTerminalEntry([]byte(buildStreamLine(t, []interface{}{nil, []interface{}{"c", "r"}, map[string]interface{}{"44": true}}))) {
+		t.Fatal("ordinary wrb.fr metadata must not be treated as terminal")
 	}
 }
 
@@ -1036,6 +1360,22 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func newStreamTestClient(maxRetries int, transport roundTripFunc) *Client {
+	return &Client{
+		rawHTTPClient: &http.Client{Transport: transport},
+		at:            "test-at",
+		cookieHeader:  "SID=test",
+		buildLabel:    "test-build",
+		sessionID:     "test-session",
+		language:      "zh-CN",
+		log:           zap.NewNop(),
+		cachedModels:  []ModelInfo{{ID: "fbb127bbb056c959"}},
+		cachedAliases: map[string]string{"gemini-3.5-flash": "fbb127bbb056c959"},
+		conversations: make(map[string]*SessionMetadata),
+		maxRetries:    maxRetries,
+	}
 }
 
 type errAfterReader struct {
@@ -1217,8 +1557,8 @@ func TestGenerateContentStreamClosesBodyWhenConsumerStops(t *testing.T) {
 		maxRetries:    1,
 	}
 
-	err := client.generateContentStreamInternal(context.Background(), "hello", func([]byte, string) bool {
-		return false
+	err := client.generateContentStreamInternal(context.Background(), "hello", func([]byte, string) streamVisitResult {
+		return streamVisitResult{}
 	}, WithModel("gemini-3.5-flash"))
 	if err != nil {
 		t.Fatal(err)
@@ -1266,6 +1606,31 @@ func TestRotateCookiesContextStopsDuringBackoff(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("canceled rotation took too long: %v", time.Since(start))
+	}
+}
+
+func TestRotateCookiesRequiresReplacementPSIDTS(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	previousEndpoint := endpointRotateCookies
+	endpointRotateCookies = server.URL
+	defer func() { endpointRotateCookies = previousEndpoint }()
+
+	client := &Client{
+		accountID: "test",
+		cookies: &CookieStore{
+			Secure1PSID:   "existing-psid",
+			Secure1PSIDTS: "stale-ts",
+		},
+		httpClient: req.NewClient(),
+		log:        zap.NewNop(),
+	}
+	err := client.rotateCookiesOnce(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "without issuing a replacement") {
+		t.Fatalf("expected missing replacement error, got %v", err)
 	}
 }
 
@@ -1319,7 +1684,6 @@ func TestAppendStreamTailCapsMemory(t *testing.T) {
 	}
 }
 
-
 func TestUpdateCookiesRejectsReplacementPSIDWithoutMatchingPSIDTS(t *testing.T) {
 	client := &Client{cookies: &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"}}
 	err := client.UpdateCookies(context.Background(), "new-psid", "")
@@ -1337,30 +1701,37 @@ func TestParseResponseKeepsMostCompleteCandidate(t *testing.T) {
 	partial := "complete answer with nonce"
 	client := &Client{log: zap.NewNop()}
 	resp, err := client.parseResponse(buildGenerateResponse(t, complete, "cid") + "\n" + buildGenerateResponse(t, partial, "cid"))
-	if err != nil { t.Fatal(err) }
-	if resp.Text != complete { t.Fatalf("expected complete candidate %q, got %q", complete, resp.Text) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Text != complete {
+		t.Fatalf("expected complete candidate %q, got %q", complete, resp.Text)
+	}
 }
-
 
 func TestGoogleChallengeErrorClassifiesSorryRedirect(t *testing.T) {
 	request, _ := http.NewRequest(http.MethodGet, "https://gemini.google.com/app?hl=en", nil)
 	resp := &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://www.google.com/sorry/index?continue=x"}}, Request: request}
 	err := googleChallengeError(resp)
-	if err == nil || !strings.Contains(err.Error(), "proxy egress IP") { t.Fatalf("expected actionable Google challenge error, got %v", err) }
+	if err == nil || !strings.Contains(err.Error(), "proxy egress IP") {
+		t.Fatalf("expected actionable Google challenge error, got %v", err)
+	}
 }
 
 func TestGeminiHTTPClientsStopAtRedirectResponse(t *testing.T) {
 	client := &Client{}
 	httpClient := client.newHTTPClient(time.Second)
 	request, _ := http.NewRequest(http.MethodGet, "https://example.com", nil)
-	if err := httpClient.CheckRedirect(request, nil); !errors.Is(err, http.ErrUseLastResponse) { t.Fatalf("expected redirect policy to stop, got %v", err) }
+	if err := httpClient.CheckRedirect(request, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("expected redirect policy to stop, got %v", err)
+	}
 }
 
 func TestUpdateCookiesStopsOnGoogleChallengeAndRollsBack(t *testing.T) {
 	calls := 0
 	client := &Client{
-		accountID: "test",
-		cookies: &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"},
+		accountID:  "test",
+		cookies:    &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"},
 		httpClient: req.NewClient(),
 		rawHTTPClient: &http.Client{
 			Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -1372,7 +1743,13 @@ func TestUpdateCookiesStopsOnGoogleChallengeAndRollsBack(t *testing.T) {
 		log: zap.NewNop(),
 	}
 	err := client.UpdateCookies(context.Background(), "new-psid", "new-ts")
-	if err == nil || !strings.Contains(err.Error(), "proxy egress IP") { t.Fatalf("expected actionable proxy challenge error, got %v", err) }
-	if calls != 2 { t.Fatalf("expected one request per validation step, not a redirect loop; got %d requests", calls) }
-	if got := client.GetCookies(); got.Secure1PSID != "old-psid" || got.Secure1PSIDTS != "old-ts" { t.Fatalf("expected failed update to roll back cookies, got %#v", got) }
+	if err == nil || !strings.Contains(err.Error(), "proxy egress IP") {
+		t.Fatalf("expected actionable proxy challenge error, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected one request per validation step, not a redirect loop; got %d requests", calls)
+	}
+	if got := client.GetCookies(); got.Secure1PSID != "old-psid" || got.Secure1PSIDTS != "old-ts" {
+		t.Fatalf("expected failed update to roll back cookies, got %#v", got)
+	}
 }

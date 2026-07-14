@@ -26,9 +26,10 @@ Keep these boundaries intact. The provider should not emit OpenAI DTOs. The Open
 
 - No `tools` field means no tool bridge. Pure chat should stay the fastest path.
 - Existing provider conversations must stay bound to their original account.
-- Tool planning should use temporary Gemini context so tool schema does not pollute the main Gemini Web conversation.
+- Tool planning intentionally uses the main Gemini conversation so tool decisions, tool results, and final answers stay in one upstream topic.
 - Debug captures must redact cookies and auth headers.
-- Server-side context fallback prevents blank responses, but it cannot guarantee the same Gemini Web record after fallback.
+- Retry once only when the HTTP request was confirmed not written upstream. Timeouts, empty streams, read failures, and visible reasoning/content must not be transparently retried.
+- Rebuild from full OpenAI history only for explicit conversation rejection such as Bard `1097` or a conversation continuity mismatch; record that migration because it creates a new Gemini Web topic.
 
 ## Before Editing
 

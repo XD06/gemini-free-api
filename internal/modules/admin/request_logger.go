@@ -7,19 +7,26 @@ import (
 
 // RequestRecord represents a single API request record
 type RequestRecord struct {
-	ID              string    `json:"id"`
-	Timestamp       time.Time `json:"timestamp"`
-	AccountID       string    `json:"account_id"`
-	Model           string    `json:"model"`
-	Stream          bool      `json:"stream"`
-	Status          string    `json:"status"` // "success", "error", "pending"
-	ErrorMessage    string    `json:"error_message,omitempty"`
-	Duration        int64     `json:"duration_ms"`        // request duration in milliseconds
-	FirstByteLatency int64  `json:"first_byte_ms"`      // time to first byte in milliseconds
-	TokensInput     int       `json:"tokens_input,omitempty"`
-	TokensOutput    int       `json:"tokens_output,omitempty"`
-	UserAgent       string    `json:"user_agent,omitempty"`
-	RequestPath     string    `json:"request_path"`
+	ID               string    `json:"id"`
+	Timestamp        time.Time `json:"timestamp"`
+	AccountID        string    `json:"account_id"`
+	Protocol         string    `json:"protocol,omitempty"`
+	Model            string    `json:"model"`
+	ThinkingLevel    string    `json:"thinking_level,omitempty"`
+	Stream           bool      `json:"stream"`
+	Status           string    `json:"status"` // "success", "error", "pending"
+	ErrorMessage     string    `json:"error_message,omitempty"`
+	Duration         int64     `json:"duration_ms"`   // request duration in milliseconds
+	FirstByteLatency int64     `json:"first_byte_ms"` // time to first byte in milliseconds
+	FirstReasoning   int64     `json:"first_reasoning_ms,omitempty"`
+	FirstContent     int64     `json:"first_content_ms,omitempty"`
+	TailClose        int64     `json:"tail_close_ms,omitempty"`
+	CompletionSource string    `json:"completion_source,omitempty"`
+	StreamRetries    int       `json:"stream_retries,omitempty"`
+	TokensInput      int       `json:"tokens_input,omitempty"`
+	TokensOutput     int       `json:"tokens_output,omitempty"`
+	UserAgent        string    `json:"user_agent,omitempty"`
+	RequestPath      string    `json:"request_path"`
 }
 
 // RequestLogger stores recent API requests in a ring buffer

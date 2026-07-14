@@ -78,7 +78,7 @@ type ServerConfig struct {
 const (
 	defaultServerPort            = "8787"
 	defaultGeminiRefreshInterval = 2
-	defaultGeminiMaxRetries      = 3
+	defaultGeminiMaxRetries      = 2
 	defaultLogLevel              = "info"
 )
 

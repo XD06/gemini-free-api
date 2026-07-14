@@ -39,20 +39,20 @@ type AccountManager interface {
 }
 
 type ClientPool struct {
-	mu              sync.Mutex
-	clients         []*Client
-	clientsByID     map[string]*Client
-	stayByID        map[string]time.Duration
-	conversationTo  map[string]string
+	mu               sync.Mutex
+	clients          []*Client
+	clientsByID      map[string]*Client
+	stayByID         map[string]time.Duration
+	conversationTo   map[string]string
 	conversationSeen map[string]time.Time // when each conversation binding was last used
-	refreshing      map[string]bool
-	externalRefresh cookieRefreshFunc
-	internalRefresh func(context.Context, *Client) error
-	activeIndex     int
-	activeUntil     time.Time
-	statePath       string
-	cfg             *configs.Config
-	log             *zap.Logger
+	refreshing       map[string]bool
+	externalRefresh  cookieRefreshFunc
+	internalRefresh  func(context.Context, *Client) error
+	activeIndex      int
+	activeUntil      time.Time
+	statePath        string
+	cfg              *configs.Config
+	log              *zap.Logger
 }
 
 type cookieRefreshFunc func(ctx context.Context, accountID string) error
@@ -64,10 +64,16 @@ var validateProxyURL = EndpointInit + "?hl=en"
 // It is replaceable by focused pool tests.
 var accountLivenessProbe = func(ctx context.Context, client *Client) (string, error) {
 	resp, err := client.GenerateContent(ctx, "Hi, please reply with only the word: OK")
-	if err != nil { return "", err }
-	if resp == nil { return "", fmt.Errorf("empty response from account %q", client.accountID) }
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("empty response from account %q", client.accountID)
+	}
 	text := strings.TrimSpace(resp.Text)
-	if text == "" { return "", fmt.Errorf("empty text in response from account %q", client.accountID) }
+	if text == "" {
+		return "", fmt.Errorf("empty text in response from account %q", client.accountID)
+	}
 	return text, nil
 }
 
@@ -84,18 +90,18 @@ func NewClientPool(cfg *configs.Config, log *zap.Logger) *ClientPool {
 	accounts = orderedAccounts(accounts)
 
 	pool := &ClientPool{
-		clients:         make([]*Client, 0, len(accounts)),
-		clientsByID:     make(map[string]*Client),
-		stayByID:        make(map[string]time.Duration),
-		conversationTo:  make(map[string]string),
+		clients:          make([]*Client, 0, len(accounts)),
+		clientsByID:      make(map[string]*Client),
+		stayByID:         make(map[string]time.Duration),
+		conversationTo:   make(map[string]string),
 		conversationSeen: make(map[string]time.Time),
-		refreshing:      make(map[string]bool),
-		externalRefresh: newExternalCookieRefresher(cfg, log),
-		internalRefresh: refreshClientSessionInPlace,
-		activeIndex:     -1,
-		statePath:       cfg.Gemini.AccountStatePath,
-		cfg:             cfg,
-		log:             log,
+		refreshing:       make(map[string]bool),
+		externalRefresh:  newExternalCookieRefresher(cfg, log),
+		internalRefresh:  refreshClientSessionInPlace,
+		activeIndex:      -1,
+		statePath:        cfg.Gemini.AccountStatePath,
+		cfg:              cfg,
+		log:              log,
 	}
 	for _, account := range accounts {
 		client := NewClientForAccount(cfg, account, log)
@@ -128,8 +134,13 @@ func orderedAccounts(accounts []configs.GeminiAccountConfig) []configs.GeminiAcc
 }
 
 func (p *ClientPool) Init(ctx context.Context) error {
-	if len(p.clients) == 0 { return fmt.Errorf("no Gemini accounts configured") }
-	type initResult struct { client *Client; err error }
+	if len(p.clients) == 0 {
+		return fmt.Errorf("no Gemini accounts configured")
+	}
+	type initResult struct {
+		client *Client
+		err    error
+	}
 	results := make(chan initResult, len(p.clients))
 	sem := make(chan struct{}, min(4, len(p.clients)))
 	var wg sync.WaitGroup
@@ -137,44 +148,102 @@ func (p *ClientPool) Init(ctx context.Context) error {
 		wg.Add(1)
 		go func(client *Client) {
 			defer wg.Done()
-			select { case sem <- struct{}{}: defer func(){ <-sem }(); case <-ctx.Done(): results <- initResult{client, ctx.Err()}; return }
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results <- initResult{client, ctx.Err()}
+				return
+			}
+			if !p.beginAccountRefresh(client.accountID) {
+				results <- initResult{client, p.waitForClientRefresh(ctx, client)}
+				return
+			}
+			defer p.endAccountRefresh(client.accountID)
 			results <- initResult{client, client.Init(ctx)}
 		}(client)
 	}
-	wg.Wait(); close(results)
-	var lastErr error; healthy := 0
+	wg.Wait()
+	close(results)
+	var lastErr error
+	healthy := 0
 	for result := range results {
-		if result.err == nil { healthy++; continue }
+		if result.err == nil {
+			healthy++
+			continue
+		}
 		lastErr = result.err
-		if p.log != nil { p.log.Error("Gemini account initialization failed", zap.String("account", result.client.accountID), zap.Error(result.err)) }
+		if p.log != nil {
+			p.log.Error("Gemini account initialization failed", zap.String("account", result.client.accountID), zap.Error(result.err))
+		}
 	}
-	if healthy == 0 { p.refreshInvalidClientsAsync("init_no_healthy"); return lastErr }
-	p.mu.Lock(); p.activeIndex = -1
-	if !p.restoreActiveLocked(time.Now()) { _, _ = p.selectActiveLocked(time.Now(), true) }
-	p.mu.Unlock(); return nil
+	if healthy == 0 {
+		p.refreshInvalidClientsAsync("init_no_healthy")
+		return lastErr
+	}
+	p.mu.Lock()
+	p.activeIndex = -1
+	if !p.restoreActiveLocked(time.Now()) {
+		_, _ = p.selectActiveLocked(time.Now(), true)
+	}
+	p.mu.Unlock()
+	return nil
 }
 
 func (p *ClientPool) GenerateContent(ctx context.Context, prompt string, options ...GenerateOption) (*Response, error) {
-	client, err := p.clientForOptions(ctx, options...); if err != nil { return nil, err }
-	response, err := client.GenerateContent(ctx, prompt, options...); if err == nil { return response, nil }
+	client, err := p.clientForOptions(ctx, options...)
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.GenerateContent(ctx, prompt, options...)
+	if err == nil {
+		return response, nil
+	}
 	hadConversationState := hasConversationStateOption(client, options...)
 	p.markClientError(client, err)
-	if hadConversationState || !isAuthOrSessionError(err) || ctx.Err() != nil { return nil, err }
-	backup, selectErr := p.clientForOptions(ctx, options...); if selectErr != nil || backup == client { return nil, err }
-	response, err = backup.GenerateContent(ctx, prompt, options...); if err != nil { p.markClientError(backup, err) }
+	if hadConversationState || !isAuthOrSessionError(err) || ctx.Err() != nil {
+		return nil, err
+	}
+	backup, selectErr := p.clientForOptions(ctx, options...)
+	if selectErr != nil || backup == client {
+		return nil, err
+	}
+	response, err = backup.GenerateContent(ctx, prompt, options...)
+	if err != nil {
+		p.markClientError(backup, err)
+	}
 	return response, err
 }
 
 func (p *ClientPool) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
-	client, err := p.clientForOptions(ctx, options...); if err != nil { return err }
+	client, err := p.clientForOptions(ctx, options...)
+	if err != nil {
+		return err
+	}
 	emitted := false
-	wrapped := func(event StreamEvent) bool { if event.Delta != "" { emitted = true }; return onEvent(event) }
-	err = client.GenerateContentStreamForOpenAI(ctx, prompt, wrapped, options...); if err == nil { return nil }
+	wrapped := func(event StreamEvent) bool {
+		if event.Delta != "" {
+			emitted = true
+		}
+		return onEvent(event)
+	}
+	err = client.GenerateContentStreamForOpenAI(ctx, prompt, wrapped, options...)
+	if err == nil {
+		return nil
+	}
 	hadConversationState := hasConversationStateOption(client, options...)
 	p.markClientError(client, err)
-	if emitted || hadConversationState || !isAuthOrSessionError(err) || ctx.Err() != nil { return err }
-	backup, selectErr := p.clientForOptions(ctx, options...); if selectErr != nil || backup == client { return err }
-	err = backup.GenerateContentStreamForOpenAI(ctx, prompt, onEvent, options...); if err != nil { p.markClientError(backup, err) }
+	if emitted || hadConversationState || !isAuthOrSessionError(err) || ctx.Err() != nil {
+		return err
+	}
+	backup, selectErr := p.clientForOptions(ctx, options...)
+	if selectErr != nil || backup == client {
+		return err
+	}
+	err = backup.GenerateContentStreamForOpenAI(ctx, prompt, onEvent, options...)
+	if err != nil {
+		p.markClientError(backup, err)
+	}
 	return err
 }
 
@@ -242,6 +311,7 @@ func (p *ClientPool) ListAccountStatuses() []AccountStatus {
 }
 
 func (p *ClientPool) UpdateAccountCookies(ctx context.Context, accountID, secure1PSID, secure1PSIDTS string) error {
+	_ = ctx
 	client := p.clientByID(accountID)
 	if client == nil {
 		return fmt.Errorf("Gemini account %q not found", accountID)
@@ -253,28 +323,86 @@ func (p *ClientPool) UpdateAccountCookies(ctx context.Context, accountID, secure
 		return fmt.Errorf("secure_1psid is required")
 	}
 
-	if err := client.UpdateCookies(ctx, secure1PSID, secure1PSIDTS); err != nil { return err }
-	client.mu.Lock(); client.cookieSource = "console"; client.mu.Unlock()
-	if client.cookieCache {
-		client.mu.RLock(); proxyURL := client.proxyURL; client.mu.RUnlock()
-		if err := saveAccountCookieCache(client.cookieCachePath, accountID, secure1PSID, secure1PSIDTS, proxyURL, "console"); err != nil { return fmt.Errorf("persist updated cookies: %w", err) }
+	if !p.beginAccountRefresh(accountID) {
+		return refreshInProgressError(AccountStateRefreshing)
 	}
+	if err := client.StageCookiesForValidation(secure1PSID, secure1PSIDTS, "console"); err != nil {
+		p.endAccountRefresh(accountID)
+		return err
+	}
+
+	go p.validateStagedAccountCookies(client)
 	return nil
+}
+
+func (p *ClientPool) validateStagedAccountCookies(client *Client) {
+	defer p.endAccountRefresh(client.accountID)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	refresh := p.internalRefresh
+	if refresh == nil {
+		refresh = refreshClientSessionInPlace
+	}
+	if err := refresh(ctx, client); err != nil {
+		operationErr := accountOperationError(err, client.AccountStatus().State, AccountErrorNotInitialized)
+		client.setAccountState(accountFailureState(operationErr), operationErr)
+		if p.log != nil {
+			p.log.Warn("saved Gemini cookies failed background validation", zap.String("account", client.accountID), zap.Error(operationErr))
+			p.logAccountAudit("cookie_validation_failed", client, "console", "saved_cookie_pair_rejected")
+		}
+		return
+	}
+	client.markValidated()
+	if p.log != nil {
+		p.log.Info("saved Gemini cookies passed background validation", zap.String("account", client.accountID))
+		p.logAccountAudit("cookie_validation_succeeded", client, "console", "saved_cookie_pair_accepted")
+	}
 }
 
 func (p *ClientPool) RefreshAccount(ctx context.Context, accountID string) error {
 	client := p.clientByID(accountID)
 	if client == nil {
-		return fmt.Errorf("Gemini account %q not found", accountID)
+		return accountNotFoundError(accountID)
 	}
 
-	// Console refresh revalidates the live generation path. Google can omit the
-	// legacy SNlM0e bootstrap token while an existing conversation still works;
-	// forcing Cookie rotation here used to report that healthy account as expired.
+	if !p.beginAccountRefresh(client.accountID) {
+		return p.waitForClientRefresh(ctx, client)
+	}
+	defer p.endAccountRefresh(client.accountID)
+
+	// Preserve the cheap live-path validation for an already initialized account.
+	// Only recover the session when the probe reports an auth/session failure.
 	client.setAccountState(AccountStateRefreshing, nil)
+	if client.sessionInitialized() {
+		if _, err := accountLivenessProbe(ctx, client); err == nil {
+			client.markValidated()
+			return nil
+		} else if !isAuthOrSessionError(err) {
+			operationErr := accountOperationError(err, AccountStateExpired, AccountErrorGenerationProbeFail)
+			client.setAccountState(accountFailureState(operationErr), operationErr)
+			return operationErr
+		}
+	}
+
+	refresh := p.internalRefresh
+	if refresh == nil {
+		refresh = refreshClientSessionInPlace
+	}
+	if err := refresh(ctx, client); err != nil {
+		operationErr := accountOperationError(err, client.AccountStatus().State, AccountErrorNotInitialized)
+		client.setAccountState(accountFailureState(operationErr), operationErr)
+		return operationErr
+	}
+	if !client.sessionInitialized() {
+		operationErr := accountStatusError(client, AccountErrorNotInitialized)
+		client.setAccountState(accountFailureState(operationErr), operationErr)
+		return operationErr
+	}
 	if _, err := accountLivenessProbe(ctx, client); err != nil {
-		client.setAccountState(AccountStateExpired, err)
-		return err
+		operationErr := accountOperationError(err, AccountStateExpired, AccountErrorGenerationProbeFail)
+		client.setAccountState(accountFailureState(operationErr), operationErr)
+		return operationErr
 	}
 	client.markValidated()
 	return nil
@@ -307,13 +435,26 @@ func (p *ClientPool) ListModels() []ModelInfo {
 }
 
 func (p *ClientPool) HasConversationState(id string) bool {
-	id = strings.TrimSpace(id); if id == "" { return false }
-	p.mu.Lock(); accountID := p.conversationTo[id]; p.mu.Unlock()
-	if accountID != "" {
-		if client := p.clientsByID[accountID]; client != nil && client.IsHealthy() { return client.HasConversationState(id) }
-		p.unbindConversation(id); return false
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
 	}
-	for _, client := range p.clients { if client.IsHealthy() && client.HasConversationState(id) { p.bindConversation(id, client.accountID); return true } }
+	p.mu.Lock()
+	accountID := p.conversationTo[id]
+	p.mu.Unlock()
+	if accountID != "" {
+		if client := p.clientsByID[accountID]; client != nil && client.IsHealthy() {
+			return client.HasConversationState(id)
+		}
+		p.unbindConversation(id)
+		return false
+	}
+	for _, client := range p.clients {
+		if client.IsHealthy() && client.HasConversationState(id) {
+			p.bindConversation(id, client.accountID)
+			return true
+		}
+	}
 	return false
 }
 
@@ -445,10 +586,43 @@ func refreshClientSessionInPlace(ctx context.Context, client *Client) error {
 	if client == nil {
 		return fmt.Errorf("nil Gemini account")
 	}
-	if err := client.RotateCookiesContext(ctx); err != nil {
-		return err
+	// Match initialization: first try the current pair directly. Rotating first
+	// can hide a perfectly usable session or make a mismatched pair harder to
+	// diagnose.
+	directErr := client.refreshSessionTokenContext(ctx)
+	if directErr == nil {
+		return nil
 	}
-	return client.refreshSessionToken()
+	if err := client.RotateCookiesContext(ctx); err != nil {
+		return fmt.Errorf("session initialization failed: %w; cookie rotation failed: %v", directErr, err)
+	}
+	return client.refreshSessionTokenContext(ctx)
+}
+
+func (p *ClientPool) beginAccountRefresh(accountID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.refreshing == nil {
+		p.refreshing = make(map[string]bool)
+	}
+	if p.refreshing[accountID] {
+		return false
+	}
+	p.refreshing[accountID] = true
+	return true
+}
+
+func (p *ClientPool) endAccountRefresh(accountID string) {
+	p.mu.Lock()
+	delete(p.refreshing, accountID)
+	p.mu.Unlock()
+}
+
+func (p *ClientPool) accountRefreshInProgress(accountID string) bool {
+	p.mu.Lock()
+	inProgress := p.refreshing != nil && p.refreshing[accountID]
+	p.mu.Unlock()
+	return inProgress
 }
 
 func clientRequiresExternalCookieRefresh(client *Client) bool {
@@ -492,12 +666,19 @@ func (p *ClientPool) clientForOptions(ctx context.Context, options ...GenerateOp
 		if accountID := p.conversationTo[config.ConversationID]; accountID != "" {
 			client := p.clientsByID[accountID]
 			if client != nil && client.IsHealthy() {
-				if p.conversationSeen == nil { p.conversationSeen = make(map[string]time.Time) }
+				if p.conversationSeen == nil {
+					p.conversationSeen = make(map[string]time.Time)
+				}
 				p.conversationSeen[config.ConversationID] = time.Now()
 				p.logAccountAudit("conversation_reused", client, config.ConversationID, "bound_conversation")
-				p.mu.Unlock(); if holder := AccountIDFromContext(ctx); holder != nil { holder.Set(client.accountID) }; return client, nil
+				p.mu.Unlock()
+				if holder := AccountIDFromContext(ctx); holder != nil {
+					holder.Set(client.accountID)
+				}
+				return client, nil
 			}
-			delete(p.conversationTo, config.ConversationID); delete(p.conversationSeen, config.ConversationID)
+			delete(p.conversationTo, config.ConversationID)
+			delete(p.conversationSeen, config.ConversationID)
 		}
 	}
 
@@ -688,7 +869,7 @@ func (p *ClientPool) waitForClientRefresh(ctx context.Context, client *Client) e
 	if client == nil {
 		return fmt.Errorf("nil Gemini account")
 	}
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if client.IsHealthy() {
@@ -701,7 +882,7 @@ func (p *ClientPool) waitForClientRefresh(ctx context.Context, client *Client) e
 			if client.IsHealthy() {
 				return nil
 			}
-			return fmt.Errorf("external cookie refresh finished but account %q is still unhealthy", client.accountID)
+			return accountStatusError(client, AccountErrorNotInitialized)
 		}
 		select {
 		case <-ctx.Done():
@@ -1027,22 +1208,34 @@ func validateProxyCandidate(ctx context.Context, client *http.Client, cookieHead
 	validateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(validateCtx, http.MethodGet, validateProxyURL, nil)
-	if err != nil { return err }
-	if cookieHeader != "" { request.Header.Set("Cookie", cookieHeader) }
+	if err != nil {
+		return err
+	}
+	if cookieHeader != "" {
+		request.Header.Set("Cookie", cookieHeader)
+	}
 	response, err := client.Do(request)
-	if err != nil { return fmt.Errorf("validate proxy: %w", err) }
+	if err != nil {
+		return fmt.Errorf("validate proxy: %w", err)
+	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 400 { return fmt.Errorf("validate proxy: status %d", response.StatusCode) }
+	if response.StatusCode < 200 || response.StatusCode >= 400 {
+		return fmt.Errorf("validate proxy: status %d", response.StatusCode)
+	}
 	return nil
 }
 
 func (p *ClientPool) UpdateAccountProxy(ctx context.Context, accountID, proxyURL string) error {
 	_ = ctx
 	client := p.clientByID(accountID)
-	if client == nil { return fmt.Errorf("account %q not found", accountID) }
+	if client == nil {
+		return fmt.Errorf("account %q not found", accountID)
+	}
 	proxyURL = strings.TrimSpace(proxyURL)
 	newReqClient := req.NewClient().SetTimeout(30 * time.Second).SetCommonHeaders(DefaultHeaders)
-	if proxyURL != "" { newReqClient.SetProxyURL(proxyURL) }
+	if proxyURL != "" {
+		newReqClient.SetProxyURL(proxyURL)
+	}
 	newReqClient.SetCommonCookies(client.cookies.ToHTTPCookies()...)
 	newTransport := &http.Transport{Proxy: proxyFunc(proxyURL), MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 15 * time.Second, ForceAttemptHTTP2: true}
 	newRawClient := &http.Client{
@@ -1051,22 +1244,37 @@ func (p *ClientPool) UpdateAccountProxy(ctx context.Context, accountID, proxyURL
 		// Stop there so anti-bot redirects cannot loop and mask connectivity.
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	client.mu.RLock(); cookieHeader := client.cookieHeader; client.mu.RUnlock()
+	client.mu.RLock()
+	cookieHeader := client.cookieHeader
+	client.mu.RUnlock()
 	if cookieHeader == "" {
 		cookies := client.cookies.ToHTTPCookies()
 		parts := make([]string, 0, len(cookies))
-		for _, cookie := range cookies { parts = append(parts, cookie.Name+"="+cookie.Value) }
+		for _, cookie := range cookies {
+			parts = append(parts, cookie.Name+"="+cookie.Value)
+		}
 		cookieHeader = strings.Join(parts, "; ")
 	}
-	if err := validateProxyClient(ctx, newRawClient, cookieHeader); err != nil { newRawClient.CloseIdleConnections(); return err }
+	if err := validateProxyClient(ctx, newRawClient, cookieHeader); err != nil {
+		newRawClient.CloseIdleConnections()
+		return err
+	}
 
 	client.mu.Lock()
 	oldRawClient := client.rawHTTPClient
 	client.proxyURL, client.httpClient, client.rawHTTPClient = proxyURL, newReqClient, newRawClient
 	client.mu.Unlock()
-	if oldRawClient != nil { oldRawClient.CloseIdleConnections() }
-	if p.cfg.Gemini.CookieCache { if err := saveAccountProxyCache(p.cfg.Gemini.CookieCachePath, accountID, proxyURL); err != nil { return err } }
-	if p.log != nil { p.log.Info("Gemini account proxy updated via console", zap.String("account", accountID), zap.String("proxy", redactProxyURL(proxyURL))) }
+	if oldRawClient != nil {
+		oldRawClient.CloseIdleConnections()
+	}
+	if p.cfg.Gemini.CookieCache {
+		if err := saveAccountProxyCache(p.cfg.Gemini.CookieCachePath, accountID, proxyURL); err != nil {
+			return err
+		}
+	}
+	if p.log != nil {
+		p.log.Info("Gemini account proxy updated via console", zap.String("account", accountID), zap.String("proxy", redactProxyURL(proxyURL)))
+	}
 	return nil
 }
 
@@ -1075,20 +1283,34 @@ func (p *ClientPool) UpdateAccountProxy(ctx context.Context, accountID, proxyURL
 func (p *ClientPool) TestAccount(ctx context.Context, accountID string) (string, error) {
 	client := p.clientByID(accountID)
 	if client == nil {
-		return "", fmt.Errorf("Gemini account %q not found", accountID)
+		return "", accountNotFoundError(accountID)
+	}
+	if p.accountRefreshInProgress(client.accountID) {
+		return "", refreshInProgressError(AccountStateRefreshing)
+	}
+	if !client.sessionInitialized() {
+		return "", accountStatusError(client, AccountErrorNotInitialized)
 	}
 
-	// An explicit test must be allowed to recover a stale health classification.
+	// Testing is deliberately read-only with respect to account cookies. It may
+	// recover a stale health classification, but session recovery belongs to the
+	// explicit refresh operation.
 	text, err := accountLivenessProbe(ctx, client)
 	if err != nil {
-		client.setAccountState(AccountStateExpired, err)
-		return "", err
+		operationErr := accountOperationError(err, AccountStateExpired, AccountErrorGenerationProbeFail)
+		client.setAccountState(accountFailureState(operationErr), operationErr)
+		return "", operationErr
 	}
 	client.markValidated()
 	return text, nil
 }
 
-func (p *ClientPool) unbindConversation(id string) { p.mu.Lock(); delete(p.conversationTo, id); delete(p.conversationSeen, id); p.mu.Unlock() }
+func (p *ClientPool) unbindConversation(id string) {
+	p.mu.Lock()
+	delete(p.conversationTo, id)
+	delete(p.conversationSeen, id)
+	p.mu.Unlock()
+}
 
 func (p *ClientPool) bindConversation(conversationID, accountID string) {
 	if conversationID == "" || accountID == "" {

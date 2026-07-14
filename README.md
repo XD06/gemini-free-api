@@ -307,6 +307,12 @@ curl -X POST http://localhost:8787/admin/accounts \
 # 测试账号
 curl -X POST http://localhost:8787/admin/accounts/acc1/test -H "Authorization: Bearer $TOKEN"
 
+# 保存 Cookie（202 表示已落盘，账号状态会在后台完成验证）
+curl -X POST http://localhost:8787/admin/accounts/acc1/cookies \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"secure_1psid":"...","secure_1psidts":"...","source":"console"}'
+
 # 测试代理
 curl -X POST http://localhost:8787/admin/proxy-test \
   -H "Content-Type: application/json" \
@@ -325,6 +331,7 @@ go test ./...
 - [技术细节](docs/technical-details.md) — 多轮上下文、工具桥接、Cookie 快速同步与 Worker、容错策略、排错开关、环境变量完整列表
 - [Core Bridge Handoff](docs/core-bridge-handoff.md) — 核心边界和改动入口
 - [Stream Pipeline](docs/openai-gemini-stream-pipeline.md) — 完整流程说明
+- [上游协议漂移排查手册](docs/upstream-protocol-drift-runbook.md) — Thinking 字段校准、Chrome 抓包、分层诊断和敏感数据清理
 
 ## 说明
 

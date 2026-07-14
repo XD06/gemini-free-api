@@ -153,6 +153,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 				ID:               requestID,
 				Timestamp:        startTime,
+				Protocol:         "claude",
 				Model:            req.Model,
 				Stream:           true,
 				AccountID:        accountHolder.Get(),
@@ -182,6 +183,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 			ID:               requestID,
 			Timestamp:        startTime,
+			Protocol:         "claude",
 			Model:            req.Model,
 			Stream:           false,
 			AccountID:        accountHolder.Get(),
@@ -201,6 +203,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 		ID:               requestID,
 		Timestamp:        startTime,
+		Protocol:         "claude",
 		Model:            req.Model,
 		Stream:           false,
 		AccountID:        accountHolder.Get(),

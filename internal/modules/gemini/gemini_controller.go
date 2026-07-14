@@ -111,6 +111,7 @@ func (h *GeminiController) HandleV1BetaGenerateContent(c fiber.Ctx) error {
 		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 			ID:               requestID,
 			Timestamp:        startTime,
+			Protocol:         "gemini",
 			Model:            model,
 			Stream:           false,
 			AccountID:        accountHolder.Get(),
@@ -127,6 +128,7 @@ func (h *GeminiController) HandleV1BetaGenerateContent(c fiber.Ctx) error {
 	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 		ID:               requestID,
 		Timestamp:        startTime,
+		Protocol:         "gemini",
 		Model:            model,
 		Stream:           false,
 		AccountID:        accountHolder.Get(),
@@ -202,6 +204,7 @@ func (h *GeminiController) HandleV1BetaStreamGenerateContent(c fiber.Ctx) error 
 		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 			ID:               requestID,
 			Timestamp:        startTime,
+			Protocol:         "gemini",
 			Model:            model,
 			Stream:           true,
 			AccountID:        accountHolder.Get(),

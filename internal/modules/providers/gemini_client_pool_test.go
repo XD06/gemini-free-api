@@ -3,7 +3,6 @@ package providers
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -87,6 +86,117 @@ func TestClientPoolSkipsUnhealthyActiveAccount(t *testing.T) {
 	}
 	if selected.accountID != "backup" {
 		t.Fatalf("expected unhealthy main to be skipped, got %q", selected.accountID)
+	}
+}
+
+func TestUpdateAccountCookiesPersistsBeforeBackgroundValidation(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "accounts.json")
+	validationStarted := make(chan struct{})
+	validationRelease := make(chan struct{})
+	client := &Client{
+		accountID:       "main",
+		cookieSource:    "env",
+		cookieCache:     true,
+		cookieCachePath: cachePath,
+		httpClient:      req.NewClient(),
+		cookies:         &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"},
+		at:              "old-session-token",
+		cookieHeader:    "old-cookie-header",
+		healthy:         true,
+		healthState:     AccountStateHealthy,
+		log:             zap.NewNop(),
+	}
+	pool := &ClientPool{
+		clients:     []*Client{client},
+		clientsByID: map[string]*Client{"main": client},
+		refreshing:  make(map[string]bool),
+		internalRefresh: func(context.Context, *Client) error {
+			close(validationStarted)
+			<-validationRelease
+			return nil
+		},
+	}
+
+	started := time.Now()
+	if err := pool.UpdateAccountCookies(context.Background(), "main", "new-psid", "new-ts"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("save waited for network validation: %v", elapsed)
+	}
+	select {
+	case <-validationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background validation did not start")
+	}
+	status := client.AccountStatus()
+	if status.State != AccountStateRefreshing || status.Healthy {
+		t.Fatalf("expected saved pair to be pending validation, got %#v", status)
+	}
+	if client.sessionInitialized() {
+		t.Fatal("staging new cookies must clear the previous session token")
+	}
+	cached, err := readCookieCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cached.Accounts["main"]
+	if !ok || entry.Secure1PSID != "new-psid" || entry.Secure1PSIDTS != "new-ts" {
+		t.Fatalf("new pair was not persisted before validation: %#v", cached.Accounts)
+	}
+
+	close(validationRelease)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if client.AccountStatus().State == AccountStateHealthy && !pool.accountRefreshInProgress("main") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("validation did not complete: %#v", client.AccountStatus())
+}
+
+func TestUpdateAccountCookiesKeepsSavedPairWhenValidationFails(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "accounts.json")
+	validationDone := make(chan struct{})
+	client := &Client{
+		accountID:       "main",
+		cookieCache:     true,
+		cookieCachePath: cachePath,
+		httpClient:      req.NewClient(),
+		cookies:         &CookieStore{Secure1PSID: "old-psid", Secure1PSIDTS: "old-ts"},
+		healthy:         true,
+		healthState:     AccountStateHealthy,
+		log:             zap.NewNop(),
+	}
+	pool := &ClientPool{
+		clients:     []*Client{client},
+		clientsByID: map[string]*Client{"main": client},
+		refreshing:  make(map[string]bool),
+		internalRefresh: func(context.Context, *Client) error {
+			defer close(validationDone)
+			return errors.New("upstream rejected staged cookies")
+		},
+	}
+
+	if err := pool.UpdateAccountCookies(context.Background(), "main", "new-psid", "new-ts"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-validationDone:
+	case <-time.After(time.Second):
+		t.Fatal("background validation did not finish")
+	}
+	deadline := time.Now().Add(time.Second)
+	for pool.accountRefreshInProgress("main") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := client.GetCookies()
+	if got.Secure1PSID != "new-psid" || got.Secure1PSIDTS != "new-ts" {
+		t.Fatalf("failed validation rolled back the saved pair: %#v", got)
+	}
+	if status := client.AccountStatus(); status.State == AccountStateHealthy || status.LastError == "" {
+		t.Fatalf("expected visible validation failure, got %#v", status)
 	}
 }
 
@@ -271,29 +381,6 @@ func TestBoundConversationMovesOffUnhealthyAccount(t *testing.T) {
 	}
 }
 
-func TestUpdateAccountCookiesKeepsOldCookiesWhenValidationFails(t *testing.T) {
-	oldPSID, oldTS := "old-psid", "old-ts"
-	client := &Client{
-		accountID:  "main",
-		cookies:    &CookieStore{Secure1PSID: oldPSID, Secure1PSIDTS: oldTS},
-		httpClient: req.NewClient().SetTimeout(time.Second),
-		rawHTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("no session token")), Request: req}, nil
-		})},
-		log: zap.NewNop(),
-	}
-	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}}
-
-	err := pool.UpdateAccountCookies(context.Background(), "main", "bad-psid", "bad-ts")
-	if err == nil {
-		t.Fatal("expected invalid cookies to fail validation")
-	}
-	got := client.GetCookies()
-	if got.Secure1PSID != oldPSID || got.Secure1PSIDTS != oldTS {
-		t.Fatalf("expected old cookies preserved, got %#v", got)
-	}
-}
-
 func TestHasConversationStateDoesNotRebindUnhealthyOwner(t *testing.T) {
 	main := &Client{
 		accountID:     "main",
@@ -359,7 +446,6 @@ func TestUpdateAccountProxyCopiesCookiesToCandidate(t *testing.T) {
 	}
 }
 
-
 func TestValidateProxyCandidateAcceptsChallengeRedirect(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/sorry", http.StatusFound)
@@ -377,26 +463,174 @@ func TestValidateProxyCandidateAcceptsChallengeRedirect(t *testing.T) {
 }
 
 func TestAccountTestAndRefreshUseLiveProbeToRestoreHealth(t *testing.T) {
-	client := &Client{accountID: "main", healthy: false, healthState: AccountStateExpired}
-	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}}
+	client := &Client{accountID: "main", at: "session-token", healthy: false, healthState: AccountStateExpired}
+	pool := &ClientPool{clients: []*Client{client}, clientsByID: map[string]*Client{"main": client}, refreshing: make(map[string]bool)}
 	original := accountLivenessProbe
 	accountLivenessProbe = func(context.Context, *Client) (string, error) { return "OK", nil }
 	defer func() { accountLivenessProbe = original }()
 
 	text, err := pool.TestAccount(context.Background(), "main")
-	if err != nil || text != "OK" { t.Fatalf("test result = %q, %v", text, err) }
+	if err != nil || text != "OK" {
+		t.Fatalf("test result = %q, %v", text, err)
+	}
 	status := client.AccountStatus()
-	if !status.Healthy || status.State != AccountStateHealthy { t.Fatalf("test did not restore health: %#v", status) }
+	if !status.Healthy || status.State != AccountStateHealthy {
+		t.Fatalf("test did not restore health: %#v", status)
+	}
 
 	client.setAccountState(AccountStateExpired, errors.New("stale bootstrap"))
-	if err := pool.RefreshAccount(context.Background(), "main"); err != nil { t.Fatal(err) }
+	if err := pool.RefreshAccount(context.Background(), "main"); err != nil {
+		t.Fatal(err)
+	}
 	status = client.AccountStatus()
-	if !status.Healthy || status.State != AccountStateHealthy { t.Fatalf("refresh did not restore health: %#v", status) }
+	if !status.Healthy || status.State != AccountStateHealthy {
+		t.Fatalf("refresh did not restore health: %#v", status)
+	}
+}
+
+func TestAccountTestReturnsInitializationReasonWithoutProbe(t *testing.T) {
+	client := &Client{accountID: "main"}
+	client.setAccountState(AccountStateNeedsManualLogin, errors.New("authentication failed: Cookie pair rejected. __Secure-1PSID must match __Secure-1PSIDTS"))
+	pool := &ClientPool{
+		clients:     []*Client{client},
+		clientsByID: map[string]*Client{"main": client},
+		refreshing:  make(map[string]bool),
+	}
+	original := accountLivenessProbe
+	probeCalled := false
+	accountLivenessProbe = func(context.Context, *Client) (string, error) {
+		probeCalled = true
+		return "", errors.New("probe should not run")
+	}
+	defer func() { accountLivenessProbe = original }()
+
+	_, err := pool.TestAccount(context.Background(), "main")
+	if probeCalled {
+		t.Fatal("uninitialized account test must not run the generation probe")
+	}
+	var operationErr *AccountOperationError
+	if !errors.As(err, &operationErr) {
+		t.Fatalf("expected AccountOperationError, got %T: %v", err, err)
+	}
+	if operationErr.Code != AccountErrorCookiePairMismatch || operationErr.State != AccountStateNeedsManualLogin || operationErr.Retryable {
+		t.Fatalf("unexpected operation error: %#v", operationErr)
+	}
+}
+
+func TestRefreshUninitializedAccountRecoversSessionBeforeProbe(t *testing.T) {
+	client := &Client{accountID: "main", healthState: AccountStateUninitialized}
+	pool := &ClientPool{
+		clients:     []*Client{client},
+		clientsByID: map[string]*Client{"main": client},
+		refreshing:  make(map[string]bool),
+	}
+	recoveryCalls := 0
+	pool.internalRefresh = func(_ context.Context, got *Client) error {
+		recoveryCalls++
+		got.mu.Lock()
+		got.at = "recovered-session"
+		got.mu.Unlock()
+		return nil
+	}
+	original := accountLivenessProbe
+	probeCalls := 0
+	accountLivenessProbe = func(_ context.Context, got *Client) (string, error) {
+		probeCalls++
+		if !got.sessionInitialized() {
+			t.Fatal("probe ran before session recovery")
+		}
+		return "OK", nil
+	}
+	defer func() { accountLivenessProbe = original }()
+
+	if err := pool.RefreshAccount(context.Background(), "main"); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryCalls != 1 || probeCalls != 1 {
+		t.Fatalf("expected one recovery and one probe, got recovery=%d probe=%d", recoveryCalls, probeCalls)
+	}
+	if status := client.AccountStatus(); !status.Healthy || status.State != AccountStateHealthy {
+		t.Fatalf("unexpected recovered status: %#v", status)
+	}
+}
+
+func TestRefreshInitializedAccountSkipsSessionRecoveryWhenProbeSucceeds(t *testing.T) {
+	client := &Client{accountID: "main", at: "live-session", healthy: true, healthState: AccountStateHealthy}
+	pool := &ClientPool{
+		clients:     []*Client{client},
+		clientsByID: map[string]*Client{"main": client},
+		refreshing:  make(map[string]bool),
+	}
+	recoveryCalled := false
+	pool.internalRefresh = func(context.Context, *Client) error {
+		recoveryCalled = true
+		return nil
+	}
+	original := accountLivenessProbe
+	accountLivenessProbe = func(context.Context, *Client) (string, error) { return "OK", nil }
+	defer func() { accountLivenessProbe = original }()
+
+	if err := pool.RefreshAccount(context.Background(), "main"); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryCalled {
+		t.Fatal("healthy initialized account should not rotate or refresh its session after a successful probe")
+	}
+}
+
+func TestConcurrentAccountRefreshesShareOneRecovery(t *testing.T) {
+	client := &Client{accountID: "main", healthState: AccountStateUninitialized}
+	pool := &ClientPool{
+		clients:     []*Client{client},
+		clientsByID: map[string]*Client{"main": client},
+		refreshing:  make(map[string]bool),
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	recoveryCalls := 0
+	pool.internalRefresh = func(_ context.Context, got *Client) error {
+		recoveryCalls++
+		close(started)
+		<-release
+		got.mu.Lock()
+		got.at = "shared-session"
+		got.mu.Unlock()
+		return nil
+	}
+	original := accountLivenessProbe
+	probeCalls := 0
+	accountLivenessProbe = func(context.Context, *Client) (string, error) {
+		probeCalls++
+		return "OK", nil
+	}
+	defer func() { accountLivenessProbe = original }()
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- pool.RefreshAccount(context.Background(), "main") }()
+	<-started
+	go func() { secondDone <- pool.RefreshAccount(context.Background(), "main") }()
+	// Give the second call time to observe the in-flight refresh before the
+	// first recovery is released.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first refresh failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("joined refresh failed: %v", err)
+	}
+	if recoveryCalls != 1 || probeCalls != 1 {
+		t.Fatalf("expected one shared recovery/probe, got recovery=%d probe=%d", recoveryCalls, probeCalls)
+	}
 }
 
 func TestTerminalAccountStateIsNeverHealthy(t *testing.T) {
 	client := &Client{healthy: true}
 	client.setAccountState(AccountStateExpired, errors.New("failed"))
 	status := client.AccountStatus()
-	if status.Healthy || status.State != AccountStateExpired { t.Fatalf("inconsistent terminal status: %#v", status) }
+	if status.Healthy || status.State != AccountStateExpired {
+		t.Fatalf("inconsistent terminal status: %#v", status)
+	}
 }

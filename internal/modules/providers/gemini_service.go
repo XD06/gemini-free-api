@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -255,9 +256,13 @@ func (c *Client) setAccountState(state string, err error) {
 
 	switch state {
 	case AccountStateHealthy:
-		c.mu.Lock(); c.healthy = true; c.mu.Unlock()
+		c.mu.Lock()
+		c.healthy = true
+		c.mu.Unlock()
 	case AccountStateExpired, AccountStateNeedsManualLogin:
-		c.mu.Lock(); c.healthy = false; c.mu.Unlock()
+		c.mu.Lock()
+		c.healthy = false
+		c.mu.Unlock()
 	}
 }
 
@@ -303,13 +308,21 @@ func (c *Client) nextRequestID() string {
 func stopGoogleRedirects(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 
 func googleChallengeError(resp *http.Response) error {
-	if resp == nil { return nil }
+	if resp == nil {
+		return nil
+	}
 	urls := []string{}
-	if resp.Request != nil && resp.Request.URL != nil { urls = append(urls, resp.Request.URL.String()) }
-	if location := strings.TrimSpace(resp.Header.Get("Location")); location != "" { urls = append(urls, location) }
+	if resp.Request != nil && resp.Request.URL != nil {
+		urls = append(urls, resp.Request.URL.String())
+	}
+	if location := strings.TrimSpace(resp.Header.Get("Location")); location != "" {
+		urls = append(urls, location)
+	}
 	for _, rawURL := range urls {
 		parsed, err := url.Parse(rawURL)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		host := strings.ToLower(parsed.Hostname())
 		if (host == "google.com" || strings.HasSuffix(host, ".google.com")) && strings.HasPrefix(parsed.Path, "/sorry/") {
 			return errors.New("Gemini access blocked by a Google challenge page; the configured proxy egress IP is restricted, so Cookie validity could not be checked. Change or rotate the proxy exit and retry")
@@ -416,11 +429,16 @@ func (c *Client) Init(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) refreshSessionToken() error { return c.refreshSessionTokenContext(context.Background()) }
+func (c *Client) refreshSessionToken() error {
+	return c.refreshSessionTokenContext(context.Background())
+}
 
 func (c *Client) refreshSessionTokenContext(parent context.Context) error {
-	if parent == nil { parent = context.Background() }
-	refreshCtx, cancel := context.WithTimeout(parent, 30*time.Second); defer cancel()
+	if parent == nil {
+		parent = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
 	c.log.Info("Gemini session token refresh started",
 		zap.String("account", c.accountID),
 		zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
@@ -706,11 +724,13 @@ func (c *Client) startAutoRefresh() {
 					c.mu.Unlock()
 					c.setAccountState(AccountStateHealthy, nil)
 				}
-		} else {
-			// Rotation succeeded — also refresh session token to keep SNlM0e/at up to date
+			} else {
+				// Rotation succeeded — also refresh session token to keep SNlM0e/at up to date
 				if sessionErr := c.refreshSessionToken(); sessionErr != nil {
 					c.log.Warn("Cookie rotated but session token refresh failed", zap.Error(sessionErr))
-					c.mu.Lock(); c.healthy = false; c.mu.Unlock()
+					c.mu.Lock()
+					c.healthy = false
+					c.mu.Unlock()
 					c.setAccountState(AccountStateExpired, sessionErr)
 				} else {
 					c.log.Info("Cookie and session token refreshed successfully")
@@ -759,8 +779,12 @@ func selectStartupPSIDTS(configPSIDTS, configSource, cachedPSIDTS string, cacheE
 func (c *Client) RotateCookies() error { return c.RotateCookiesContext(context.Background()) }
 
 func (c *Client) RotateCookiesContext(ctx context.Context) error {
-	if ctx == nil { ctx = context.Background() }
-	c.mu.RLock(); proxyURL := c.proxyURL; c.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.RLock()
+	proxyURL := c.proxyURL
+	c.mu.RUnlock()
 	c.log.Info("Gemini cookie rotation started", zap.String("account", c.accountID), zap.Bool("proxy_enabled", proxyURL != ""), zap.String("proxy", redactProxyURL(proxyURL)))
 	var lastErr error
 	backoffs := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
@@ -770,27 +794,68 @@ func (c *Client) RotateCookiesContext(ctx context.Context) error {
 			select {
 			case <-timer.C:
 			case <-ctx.Done():
-				if !timer.Stop() { select { case <-timer.C: default: } }
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				return ctx.Err()
 			}
 		}
-		if err := c.rotateCookiesOnce(ctx); err == nil { return nil } else { lastErr = err }
+		if err := c.rotateCookiesOnce(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
 	}
 	return fmt.Errorf("cookie rotation failed after 3 retries: %w", lastErr)
 }
 
 func (c *Client) rotateCookiesOnce(ctx context.Context) error {
-	c.cookies.mu.RLock(); psid, psidts := c.cookies.Secure1PSID, c.cookies.Secure1PSIDTS; c.cookies.mu.RUnlock()
-	parts := []string{}; if psid != "" { parts = append(parts, "__Secure-1PSID="+psid) }; if psidts != "" { parts = append(parts, "__Secure-1PSIDTS="+psidts) }
-	req, _ := http.NewRequestWithContext(ctx, "POST", EndpointRotateCookies, strings.NewReader(`[000,"-0000000000000000000"]`))
-	req.Header.Set("Content-Type", "application/json"); req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"); req.Header.Set("Cookie", strings.Join(parts, "; "))
-	resp, err := c.newHTTPClient(5*time.Second).Do(req); if err != nil { return fmt.Errorf("failed to call rotation endpoint: %w", err) }; defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK { return fmt.Errorf("rotation failed with status %d", resp.StatusCode) }
+	c.cookies.mu.RLock()
+	psid, psidts := c.cookies.Secure1PSID, c.cookies.Secure1PSIDTS
+	c.cookies.mu.RUnlock()
+	parts := []string{}
+	if psid != "" {
+		parts = append(parts, "__Secure-1PSID="+psid)
+	}
+	if psidts != "" {
+		parts = append(parts, "__Secure-1PSIDTS="+psidts)
+	}
+	req, _ := http.NewRequestWithContext(ctx, "POST", endpointRotateCookies, strings.NewReader(`[000,"-0000000000000000000"]`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Cookie", strings.Join(parts, "; "))
+	resp, err := c.newHTTPClient(5 * time.Second).Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to call rotation endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rotation failed with status %d", resp.StatusCode)
+	}
 	found := false
-	for _, cookie := range resp.Cookies() { if cookie.Name == "__Secure-1PSIDTS" { c.cookies.mu.Lock(); c.cookies.Secure1PSIDTS = cookie.Value; c.cookies.UpdatedAt = time.Now(); c.cookies.mu.Unlock(); found = true }; c.httpClient.SetCommonCookies(cookie) }
-	if found { if err := c.SaveCachedCookies(); err != nil { return fmt.Errorf("save rotated cookies: %w", err) }; return nil }
-	if psidts == "" { return errors.New("failed to obtain a matching __Secure-1PSIDTS from Google rotation endpoint. __Secure-1PSID alone cannot authenticate") }
-	return nil
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "__Secure-1PSIDTS" {
+			c.cookies.mu.Lock()
+			c.cookies.Secure1PSIDTS = cookie.Value
+			c.cookies.UpdatedAt = time.Now()
+			c.cookies.mu.Unlock()
+			found = true
+		}
+		c.httpClient.SetCommonCookies(cookie)
+	}
+	if found {
+		if err := c.SaveCachedCookies(); err != nil {
+			return fmt.Errorf("save rotated cookies: %w", err)
+		}
+		return nil
+	}
+	if psidts == "" {
+		return errors.New("failed to obtain a matching __Secure-1PSIDTS from Google rotation endpoint. __Secure-1PSID alone cannot authenticate")
+	}
+	return errors.New("Google rotation returned 200 without issuing a replacement __Secure-1PSIDTS; the existing cookie pair was not refreshed")
 }
 
 func (c *Client) GetCookies() *CookieStore {
@@ -883,6 +948,67 @@ func (c *Client) UpdateCookies(ctx context.Context, secure1PSID, secure1PSIDTS s
 	return nil
 }
 
+// StageCookiesForValidation makes a console-supplied cookie pair authoritative
+// before network validation. The admin UI can acknowledge durable storage
+// immediately while account health is resolved in the background.
+func (c *Client) StageCookiesForValidation(secure1PSID, secure1PSIDTS, source string) error {
+	secure1PSID = cleanCookie(secure1PSID)
+	secure1PSIDTS = cleanCookie(secure1PSIDTS)
+	if secure1PSID == "" {
+		return errors.New("secure_1psid is required")
+	}
+
+	c.cookies.mu.RLock()
+	currentPSID := c.cookies.Secure1PSID
+	currentPSIDTS := c.cookies.Secure1PSIDTS
+	c.cookies.mu.RUnlock()
+	if secure1PSID != currentPSID && secure1PSIDTS == "" {
+		return errors.New("secure_1psid and secure_1psidts must be updated together when changing secure_1psid")
+	}
+	if secure1PSIDTS == "" {
+		secure1PSIDTS = currentPSIDTS
+	}
+
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "console"
+	}
+	c.mu.RLock()
+	proxyURL := c.proxyURL
+	c.mu.RUnlock()
+	if c.cookieCache {
+		if err := saveAccountCookieCache(c.cookieCachePath, c.accountID, secure1PSID, secure1PSIDTS, proxyURL, source); err != nil {
+			return fmt.Errorf("persist updated cookies: %w", err)
+		}
+	}
+
+	now := time.Now()
+	c.cookies.mu.Lock()
+	c.cookies.Secure1PSID = secure1PSID
+	c.cookies.Secure1PSIDTS = secure1PSIDTS
+	c.cookies.UpdatedAt = now
+	c.cookies.mu.Unlock()
+	c.httpClient.SetCommonCookies(c.cookies.ToHTTPCookies()...)
+
+	// The old SNlM0e belongs to the previous pair. Clearing it prevents a
+	// staged pair from appearing healthy while background validation is pending.
+	c.mu.Lock()
+	c.cookieSource = source
+	c.at = ""
+	c.cookieHeader = ""
+	c.pushID = ""
+	c.buildLabel = ""
+	c.sessionID = ""
+	c.healthy = false
+	c.mu.Unlock()
+	c.statusMu.Lock()
+	c.healthState = AccountStateRefreshing
+	c.lastError = ""
+	c.lastCookieSync = now
+	c.statusMu.Unlock()
+	return nil
+}
+
 func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...GenerateOption) (*Response, error) {
 	config := &GenerateConfig{}
 	for _, opt := range options {
@@ -968,7 +1094,9 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
-
+	if maxAttempts > 2 {
+		maxAttempts = 2
+	}
 
 	totalStart := time.Now()
 
@@ -1006,6 +1134,12 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
+		var requestWritten atomic.Bool
+		httpReq = httpReq.WithContext(httptrace.WithClientTrace(httpReq.Context(), &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) {
+				requestWritten.Store(true)
+			},
+		}))
 		c.log.Info("Gemini generate request prepared",
 			zap.String("account", c.accountID),
 			zap.Bool("proxy_enabled", strings.TrimSpace(c.proxyURL) != ""),
@@ -1016,13 +1150,18 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 			zap.Bool("has_conversation_id", strings.TrimSpace(config.ConversationID) != ""),
 		)
 
-		if err := ConsumeRetryBudget(ctx); err != nil { return nil, err }
+		if err := ConsumeRetryBudget(ctx); err != nil {
+			return nil, err
+		}
 		httpResp, err := plainClient.Do(httpReq)
 		httpDuration := time.Since(httpStart)
 		if err != nil {
-			c.log.Warn("Generate request failed, will retry", zap.Error(err), zap.Duration("http_duration", httpDuration), zap.Int("attempt", attempt))
-			lastErr = err
-			continue
+			lastErr = fmt.Errorf("generate request failed: %w", err)
+			if !requestWritten.Load() && attempt < maxAttempts {
+				c.log.Warn("Generate request failed before dispatch, will retry once", zap.Error(err), zap.Duration("http_duration", httpDuration), zap.Int("attempt", attempt))
+				continue
+			}
+			return nil, lastErr
 		}
 		status := httpResp.StatusCode
 		if status != http.StatusOK {
@@ -1030,25 +1169,23 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 			_ = httpResp.Body.Close()
 			lastErr = fmt.Errorf("generate failed with status %d: %s", status, strings.TrimSpace(string(bodySnippet)))
 			c.log.Warn("Generate returned non-200", zap.Int("status", status), zap.String("body_snippet", string(bodySnippet)), zap.Int("attempt", attempt))
-			if isRetryableHTTPStatus(status) { continue }
 			return nil, lastErr
 		}
 		respBytes, readErr := io.ReadAll(httpResp.Body)
 		closeErr := httpResp.Body.Close()
-		if readErr != nil { lastErr = fmt.Errorf("failed to read generate response: %w", readErr); continue }
-		if closeErr != nil { lastErr = fmt.Errorf("close generate response: %w", closeErr); continue }
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read generate response: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close generate response: %w", closeErr)
+		}
 		respBody := string(respBytes)
 		parseStart := time.Now()
 		result, parseErr := c.parseResponse(respBody)
 		parseDuration := time.Since(parseStart)
 
 		if parseErr != nil {
-			lastErr = parseErr
-			c.log.Warn("Failed to parse response, will retry",
-				zap.Error(parseErr),
-				zap.Int("attempt", attempt),
-			)
-			continue
+			return nil, parseErr
 		}
 		if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, result.Metadata, false); err != nil {
 			return nil, err
@@ -1076,8 +1213,6 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
-func isRetryableHTTPStatus(status int) bool { return status == http.StatusTooManyRequests || status >= 500 }
-
 type StreamCallback func(deltaText string) bool
 
 type StreamEventCallback func(event StreamEvent) bool
@@ -1085,6 +1220,11 @@ type StreamEventCallback func(event StreamEvent) bool
 type StreamEvent struct {
 	Kind  string
 	Delta string
+}
+
+type streamVisitResult struct {
+	continueReading bool
+	madeProgress    bool
 }
 
 type StreamState struct {
@@ -1095,31 +1235,37 @@ type StreamState struct {
 // Do not infer completion from a brief pause by default: Gemini can pause
 // between visible chunks while it continues generating.
 const defaultStreamFinishIdleTimeout = 0
-const minStreamFinishIdleTimeout = 15 * time.Second
-const defaultStreamFirstContentTimeout = 45 * time.Second
-
+const defaultStreamFirstActivityTimeout = 15 * time.Second
+const defaultStreamProgressIdleTimeout = 30 * time.Second
 
 func (c *Client) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
 	state := &StreamState{}
-	return c.generateContentStreamInternal(ctx, prompt, func(buffer []byte, deltaText string) bool {
+	return c.generateContentStreamInternal(ctx, prompt, func(buffer []byte, deltaText string) streamVisitResult {
 		if deltaText != "" {
 			state.HasContent = true
-			return onEvent(StreamEvent{Kind: "content_delta", Delta: deltaText})
+			markStreamContent(ctx)
+			return streamVisitResult{
+				continueReading: onEvent(StreamEvent{Kind: "content_delta", Delta: deltaText}),
+				madeProgress:    true,
+			}
 		}
 		if state.HasContent {
-			return true
+			return streamVisitResult{continueReading: true}
 		}
 		nextState := ExtractStreamState(buffer)
+		madeProgress := false
 		for _, text := range nextState.ThinkingTexts {
 			delta := nextThinkingDelta(state, text)
 			if delta == "" {
 				continue
 			}
+			madeProgress = true
+			markStreamReasoning(ctx)
 			if !onEvent(StreamEvent{Kind: "thinking_text", Delta: delta}) {
-				return false
+				return streamVisitResult{madeProgress: true}
 			}
 		}
-		return true
+		return streamVisitResult{continueReading: true, madeProgress: madeProgress}
 	}, options...)
 }
 
@@ -1143,18 +1289,28 @@ func nextThinkingDelta(state *StreamState, text string) string {
 }
 
 func (c *Client) GenerateContentStream(ctx context.Context, prompt string, onChunk StreamCallback, options ...GenerateOption) error {
-	return c.generateContentStreamInternal(ctx, prompt, func(_ []byte, deltaText string) bool {
+	return c.generateContentStreamInternal(ctx, prompt, func(_ []byte, deltaText string) streamVisitResult {
 		if deltaText == "" {
-			return true
+			return streamVisitResult{continueReading: true}
 		}
-		return onChunk(deltaText)
+		return streamVisitResult{continueReading: onChunk(deltaText), madeProgress: true}
 	}, options...)
 }
 
 const maxStreamTailBytes = 128 * 1024
+
 func appendStreamTail(buf *bytes.Buffer, data []byte) {
-	if len(data) >= maxStreamTailBytes { buf.Reset(); _, _ = buf.Write(data[len(data)-maxStreamTailBytes:]); return }
-	if buf.Len()+len(data) > maxStreamTailBytes { keep:=maxStreamTailBytes-len(data); tail:=append([]byte(nil),buf.Bytes()[buf.Len()-keep:]...); buf.Reset(); _,_=buf.Write(tail) }
+	if len(data) >= maxStreamTailBytes {
+		buf.Reset()
+		_, _ = buf.Write(data[len(data)-maxStreamTailBytes:])
+		return
+	}
+	if buf.Len()+len(data) > maxStreamTailBytes {
+		keep := maxStreamTailBytes - len(data)
+		tail := append([]byte(nil), buf.Bytes()[buf.Len()-keep:]...)
+		buf.Reset()
+		_, _ = buf.Write(tail)
+	}
 	_, _ = buf.Write(data)
 }
 
@@ -1169,10 +1325,13 @@ func (p *streamIncrementalParser) Feed(data []byte, final bool, visit func([]byt
 	if end >= 0 {
 		complete := bytes.TrimSpace(p.pending[:end])
 		p.pending = append(p.pending[:0], p.pending[end+1:]...)
-		if len(complete) > 0 && !p.parseLine(complete, visit) { return false }
+		if len(complete) > 0 && !p.parseLine(complete, visit) {
+			return false
+		}
 	}
 	if final && len(bytes.TrimSpace(p.pending)) > 0 {
-		complete := bytes.TrimSpace(p.pending); p.pending = nil
+		complete := bytes.TrimSpace(p.pending)
+		p.pending = nil
 		return p.parseLine(complete, visit)
 	}
 	return true
@@ -1180,13 +1339,17 @@ func (p *streamIncrementalParser) Feed(data []byte, final bool, visit func([]byt
 
 func (p *streamIncrementalParser) parseLine(line []byte, visit func([]byte, string) bool) bool {
 	text := extractStreamTextFromBuffer(line)
-	if text == "" { text = extractTextFromBuffer(line) }
+	if text == "" {
+		text = extractTextFromBuffer(line)
+	}
 	delta := streamTextDelta(p.lastText, text)
-	if delta != "" || (text != "" && strings.HasPrefix(text, p.lastText)) { p.lastText = text }
+	if delta != "" || (text != "" && strings.HasPrefix(text, p.lastText)) {
+		p.lastText = text
+	}
 	return visit(line, delta)
 }
 
-func (c *Client) generateContentStreamInternal(ctx context.Context, prompt string, onEvent func(buffer []byte, deltaText string) bool, options ...GenerateOption) error {
+func (c *Client) generateContentStreamInternal(ctx context.Context, prompt string, onEvent func(buffer []byte, deltaText string) streamVisitResult, options ...GenerateOption) error {
 	config := &GenerateConfig{}
 	for _, opt := range options {
 		opt(config)
@@ -1247,10 +1410,14 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
+	if maxAttempts > 2 {
+		maxAttempts = 2
+	}
 
 	var lastStreamErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
+			markStreamRetry(ctx)
 			backoff := time.Duration(1<<uint(attempt-2)) * time.Second
 			c.log.Warn("Retrying stream request",
 				zap.Int("attempt", attempt),
@@ -1306,6 +1473,12 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
+		var requestWritten atomic.Bool
+		httpReq = httpReq.WithContext(httptrace.WithClientTrace(httpReq.Context(), &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) {
+				requestWritten.Store(true)
+			},
+		}))
 		debugCapture := newStreamDebugCapture(requestID, resolvedModelID, c.log)
 		if debugCapture != nil {
 			debugCapture.DumpRequest(generateURL, formBody, httpReq.Header)
@@ -1323,14 +1496,19 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		)
 
 		requestStart := time.Now()
-		if err := ConsumeRetryBudget(ctx); err != nil { return err }
+		if err := ConsumeRetryBudget(ctx); err != nil {
+			return err
+		}
 		httpResp, err := streamClient.Do(httpReq)
 		if err != nil {
 			lastStreamErr = fmt.Errorf("stream request failed: %w", err)
 			if debugCapture != nil {
 				debugCapture.Close()
 			}
-			continue
+			if !requestWritten.Load() && attempt < maxAttempts {
+				continue
+			}
+			return lastStreamErr
 		}
 
 		logTrace("gemini upstream response headers received",
@@ -1353,16 +1531,10 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 			} else {
 				lastStreamErr = fmt.Errorf("stream returned status %d", httpResp.StatusCode)
 			}
-			if isRetryableHTTPStatus(httpResp.StatusCode) {
-				if debugCapture != nil {
-					debugCapture.Close()
-				}
-				continue
-			}
 			if debugCapture != nil {
 				debugCapture.Close()
 			}
-			break // 4xx errors: no point retrying
+			return lastStreamErr
 		}
 
 		// --- Stream reading loop ---
@@ -1370,12 +1542,15 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		var lastContentAt time.Time
 		var buf bytes.Buffer
 		parser := &streamIncrementalParser{}
+		terminalObserved := false
 		continuityChecked := expectedConversationCID == ""
 		metadataStored := false
 		streamMetadata := map[string]any{}
 		finalizeStreamConversation := func() error {
 			metadata := streamMetadata
-			if len(metadata) == 0 { metadata = extractConversationMetadataFromBuffer(buf.Bytes()) }
+			if len(metadata) == 0 {
+				metadata = extractConversationMetadataFromBuffer(buf.Bytes())
+			}
 			if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
 				return err
 			}
@@ -1383,8 +1558,11 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 			return nil
 		}
 		finishIdleTimeout := streamFinishIdleTimeout()
-		firstContentTimeout := streamFirstContentTimeout()
-		firstContentDeadline := time.Now().Add(firstContentTimeout)
+		firstActivityTimeout := streamFirstActivityTimeout()
+		progressIdleTimeout := streamProgressIdleTimeout()
+		firstActivityDeadline := requestStart.Add(firstActivityTimeout)
+		firstActivityObserved := false
+		var lastProgressAt time.Time
 		firstByteLogged := false
 		firstTextLogged := false
 		entryTrace := newStreamEntryTrace(20)
@@ -1408,19 +1586,88 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		go readStreamChunks(readCtx, httpResp.Body, readCh)
 
 		var idleTimer *time.Timer
-		var firstContentTimer *time.Timer
+		var firstActivityTimer *time.Timer
 		cleanupStream := func() {
-			stopReader(); _ = httpResp.Body.Close()
-			if idleTimer != nil { idleTimer.Stop() }
-			if firstContentTimer != nil { firstContentTimer.Stop() }
+			stopReader()
+			_ = httpResp.Body.Close()
+			if idleTimer != nil {
+				idleTimer.Stop()
+			}
+			if firstActivityTimer != nil {
+				firstActivityTimer.Stop()
+			}
 		}
 
 	readLoop:
 		for {
 			var idleCh <-chan time.Time
-			var firstContentCh <-chan time.Time
+			var firstActivityCh <-chan time.Time
 			if timeout, ok := streamFinishIdleRemaining(lastText, lastContentAt, finishIdleTimeout); ok {
 				if timeout <= 0 {
+					logTrace("gemini stream finish idle timeout reached",
+						zap.Duration("idle_timeout", finishIdleTimeout),
+						zap.Int("final_text_len", len(lastText)),
+					)
+					if err := finalizeStreamConversation(); err != nil {
+						cleanupStream()
+						return err
+					}
+					stopReader()
+					_ = httpResp.Body.Close()
+					markStreamCompletion(ctx, "idle_fallback", lastContentAt)
+					return nil
+				}
+				if idleTimer == nil {
+					idleTimer = time.NewTimer(timeout)
+				} else {
+					idleTimer.Reset(timeout)
+				}
+				idleCh = idleTimer.C
+			}
+			activityTimeout := time.Duration(0)
+			activityDeadline := time.Time{}
+			activityTimeoutLabel := ""
+			if !firstActivityObserved {
+				activityTimeout = firstActivityTimeout
+				activityDeadline = firstActivityDeadline
+				activityTimeoutLabel = "first activity"
+			} else if lastText == "" && !lastProgressAt.IsZero() {
+				activityTimeout = progressIdleTimeout
+				activityDeadline = lastProgressAt.Add(progressIdleTimeout)
+				activityTimeoutLabel = "progress idle"
+			}
+			if activityTimeout > 0 {
+				remaining := time.Until(activityDeadline)
+				if remaining <= 0 {
+					logTrace("gemini stream activity timeout reached",
+						zap.String("phase", activityTimeoutLabel),
+						zap.Duration("activity_timeout", activityTimeout),
+						zap.Int("response_bytes", buf.Len()),
+					)
+					timeoutErr := fmt.Errorf("gemini stream %s timeout after %s", activityTimeoutLabel, activityTimeout)
+					cleanupStream()
+					return upstreamResultUnknown(timeoutErr)
+				}
+				firstActivityCh = resetStreamTimer(&firstActivityTimer, remaining)
+			}
+
+			var result streamReadResult
+			select {
+			case readResult, ok := <-readCh:
+				if !ok {
+					break readLoop
+				}
+				if idleTimer != nil {
+					idleTimer.Stop()
+				}
+				if firstActivityTimer != nil {
+					firstActivityTimer.Stop()
+				}
+				result = readResult
+			case <-idleCh:
+				if firstActivityTimer != nil {
+					firstActivityTimer.Stop()
+				}
 				logTrace("gemini stream finish idle timeout reached",
 					zap.Duration("idle_timeout", finishIdleTimeout),
 					zap.Int("final_text_len", len(lastText)),
@@ -1431,184 +1678,171 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 				}
 				stopReader()
 				_ = httpResp.Body.Close()
+				markStreamCompletion(ctx, "idle_fallback", lastContentAt)
 				return nil
-			}
-			if idleTimer == nil {
-				idleTimer = time.NewTimer(timeout)
-			} else {
-				idleTimer.Reset(timeout)
-			}
-			idleCh = idleTimer.C
-		}
-		if lastText == "" && firstContentTimeout > 0 {
-			remaining := time.Until(firstContentDeadline)
-			if remaining <= 0 {
-				logTrace("gemini stream first content timeout reached",
-					zap.Duration("first_content_timeout", firstContentTimeout),
-					zap.Int("response_bytes", buf.Len()),
-				)
-				stopReader()
-				_ = httpResp.Body.Close()
-				return fmt.Errorf("gemini stream first content timeout after %s", firstContentTimeout)
-			}
-			if firstContentTimer == nil {
-				firstContentTimer = time.NewTimer(remaining)
-			} else {
-				firstContentTimer.Reset(remaining)
-			}
-			firstContentCh = firstContentTimer.C
-		}
-
-		var result streamReadResult
-		select {
-		case readResult, ok := <-readCh:
-			if !ok {
-				break readLoop
-			}
-			if idleTimer != nil {
-				idleTimer.Stop()
-			}
-			if firstContentTimer != nil {
-				firstContentTimer.Stop()
-			}
-			result = readResult
-		case <-idleCh:
-			if firstContentTimer != nil {
-				firstContentTimer.Stop()
-			}
-			logTrace("gemini stream finish idle timeout reached",
-				zap.Duration("idle_timeout", finishIdleTimeout),
-				zap.Int("final_text_len", len(lastText)),
-			)
-			if err := finalizeStreamConversation(); err != nil {
-				cleanupStream()
-				return err
-			}
-			stopReader()
-			_ = httpResp.Body.Close()
-			return nil
-		case <-firstContentCh:
-			if idleTimer != nil {
-				idleTimer.Stop()
-			}
-			logTrace("gemini stream first content timeout reached",
-				zap.Duration("first_content_timeout", firstContentTimeout),
-				zap.Int("response_bytes", buf.Len()),
-			)
-			stopReader()
-			_ = httpResp.Body.Close()
-			return fmt.Errorf("gemini stream first content timeout after %s", firstContentTimeout)
-		case <-ctx.Done():
-			if idleTimer != nil {
-				idleTimer.Stop()
-			}
-			if firstContentTimer != nil {
-				firstContentTimer.Stop()
-			}
-			stopReader()
-			_ = httpResp.Body.Close()
-			return ctx.Err()
-		}
-
-		if len(result.data) > 0 {
-			if !firstByteLogged {
-				firstByteLogged = true
-				logTrace("gemini first upstream bytes received", zap.Int("chunk_bytes", len(result.data)), zap.Duration("ttfb", time.Since(requestStart)))
-			}
-			appendStreamTail(&buf, result.data)
-			if debugStreamFile != nil { _, _ = debugStreamFile.Write(result.data) }
-			if debugCapture != nil { debugCapture.WriteRaw(result.data, time.Since(requestStart)) }
-			entryTrace.CaptureChunk(result.data, time.Since(requestStart))
-		}
-		var parserErr error
-		if !parser.Feed(result.data, result.err != nil, func(parseBuffer []byte, delta string) bool {
-			if !continuityChecked || !metadataStored {
-				metadata := extractConversationMetadataFromBuffer(parseBuffer)
-				streamMetadata = mergeConversationMetadata(streamMetadata, metadata)
-				if cid, _ := metadata["cid"].(string); cid != "" {
-					if !continuityChecked {
-						if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil { parserErr = err; return false }
-						continuityChecked = true
-					}
-					if !metadataStored { c.updateConversation(config.ConversationID, metadata); metadataStored = true }
-				}
-			}
-			if !onEvent(parseBuffer, "") { return false }
-			if delta == "" { return true }
-			lastText = parser.lastText
-			if !firstTextLogged { firstTextLogged = true; logTrace("gemini first parsed text emitted", zap.Int("delta_len", len(delta)), zap.Duration("parse_ttfb", time.Since(requestStart))) }
-			if !onEvent(parseBuffer, delta) { return false }
-			lastContentAt = time.Now()
-			return true
-		}) {
-			cleanupStream()
-			if parserErr != nil { return parserErr }
-			return nil
-		}
-		if result.err != nil {
-			if result.err != io.EOF {
-				lastStreamErr = fmt.Errorf("stream read: %w", result.err)
-				stopReader()
-				httpResp.Body.Close()
+			case <-firstActivityCh:
 				if idleTimer != nil {
 					idleTimer.Stop()
 				}
-				if firstContentTimer != nil {
-					firstContentTimer.Stop()
+				logTrace("gemini stream activity timeout reached",
+					zap.String("phase", activityTimeoutLabel),
+					zap.Duration("activity_timeout", activityTimeout),
+					zap.Int("response_bytes", buf.Len()),
+				)
+				timeoutErr := fmt.Errorf("gemini stream %s timeout after %s", activityTimeoutLabel, activityTimeout)
+				cleanupStream()
+				return upstreamResultUnknown(timeoutErr)
+			case <-ctx.Done():
+				if idleTimer != nil {
+					idleTimer.Stop()
 				}
-				if lastText == "" && attempt < maxAttempts {
-					break readLoop // retry
+				if firstActivityTimer != nil {
+					firstActivityTimer.Stop()
 				}
+				stopReader()
+				_ = httpResp.Body.Close()
+				return ctx.Err()
+			}
+
+			if len(result.data) > 0 {
+				if !firstByteLogged {
+					firstByteLogged = true
+					markStreamUpstreamBytes(ctx)
+					logTrace("gemini first upstream bytes received", zap.Int("chunk_bytes", len(result.data)), zap.Duration("ttfb", time.Since(requestStart)))
+				}
+				appendStreamTail(&buf, result.data)
+				if debugStreamFile != nil {
+					_, _ = debugStreamFile.Write(result.data)
+				}
+				if debugCapture != nil {
+					debugCapture.WriteRaw(result.data, time.Since(requestStart))
+				}
+				entryTrace.CaptureChunk(result.data, time.Since(requestStart))
+			}
+			var parserErr error
+			if !parser.Feed(result.data, result.err != nil, func(parseBuffer []byte, delta string) bool {
+				if hasStreamTerminalEntry(parseBuffer) {
+					terminalObserved = true
+				}
+				if !continuityChecked || !metadataStored {
+					metadata := extractConversationMetadataFromBuffer(parseBuffer)
+					streamMetadata = mergeConversationMetadata(streamMetadata, metadata)
+					if cid, _ := metadata["cid"].(string); cid != "" {
+						if !continuityChecked {
+							if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
+								parserErr = err
+								return false
+							}
+							continuityChecked = true
+						}
+						if !metadataStored {
+							c.updateConversation(config.ConversationID, metadata)
+							metadataStored = true
+						}
+					}
+				}
+				visit := onEvent(parseBuffer, "")
+				if visit.madeProgress {
+					firstActivityObserved = true
+					lastProgressAt = time.Now()
+				}
+				if !visit.continueReading {
+					return false
+				}
+				if delta == "" {
+					return true
+				}
+				lastText = parser.lastText
+				if !firstTextLogged {
+					firstTextLogged = true
+					logTrace("gemini first parsed text emitted", zap.Int("delta_len", len(delta)), zap.Duration("parse_ttfb", time.Since(requestStart)))
+				}
+				visit = onEvent(parseBuffer, delta)
+				if visit.madeProgress {
+					firstActivityObserved = true
+					lastProgressAt = time.Now()
+				}
+				if !visit.continueReading {
+					return false
+				}
+				lastContentAt = time.Now()
+				return true
+			}) {
+				cleanupStream()
+				if parserErr != nil {
+					return parserErr
+				}
+				return nil
+			}
+			if terminalObserved {
+				if lastText == "" {
+					cleanupStream()
+					if code := extractBardErrorCode(buf.Bytes()); code != "" {
+						return fmt.Errorf("gemini bard error %s", code)
+					}
+					return fmt.Errorf("gemini stream terminated without parsed content")
+				}
+				logTrace("gemini stream terminal entry received",
+					zap.Duration("tail_close", time.Since(lastContentAt)),
+					zap.Int("final_text_len", len(lastText)),
+				)
+				markStreamCompletion(ctx, "terminal_entry", lastContentAt)
+				if err := finalizeStreamConversation(); err != nil {
+					cleanupStream()
+					return err
+				}
+				cleanupStream()
+				return nil
+			}
+			if result.err != nil {
+				if result.err != io.EOF {
+					lastStreamErr = fmt.Errorf("stream read: %w", result.err)
+					stopReader()
+					httpResp.Body.Close()
+					if idleTimer != nil {
+						idleTimer.Stop()
+					}
+					if firstActivityTimer != nil {
+						firstActivityTimer.Stop()
+					}
+					return lastStreamErr
+				}
+				break readLoop
+			}
+		}
+		// Clean up reader and response for this attempt
+		stopReader()
+		httpResp.Body.Close()
+		if idleTimer != nil {
+			idleTimer.Stop()
+		}
+		if firstActivityTimer != nil {
+			firstActivityTimer.Stop()
+		}
+		entryTrace.Flush(time.Since(requestStart))
+		if debugCapture != nil {
+			debugCapture.DumpOrderedEntries(buf.Bytes())
+		}
+		maybeDumpStreamEntryTrace(entryTrace)
+		logTrace("gemini stream completed",
+			zap.Int("response_bytes", buf.Len()),
+			zap.Int("final_text_len", len(lastText)),
+		)
+		if lastText == "" {
+			if code := extractBardErrorCode(buf.Bytes()); code != "" {
+				lastStreamErr = fmt.Errorf("gemini bard error %s", code)
+				c.markConversationUntrusted(config.ConversationID)
 				return lastStreamErr
 			}
-			break readLoop
-		}
-	}
-	// Clean up reader and response for this attempt
-	stopReader()
-	httpResp.Body.Close()
-	if idleTimer != nil {
-		idleTimer.Stop()
-	}
-	if firstContentTimer != nil {
-		firstContentTimer.Stop()
-	}
-	entryTrace.Flush(time.Since(requestStart))
-	if debugCapture != nil {
-		debugCapture.DumpOrderedEntries(buf.Bytes())
-	}
-	maybeDumpStreamEntryTrace(entryTrace)
-	logTrace("gemini stream completed",
-		zap.Int("response_bytes", buf.Len()),
-		zap.Int("final_text_len", len(lastText)),
-	)
-	if lastText == "" {
-		if code := extractBardErrorCode(buf.Bytes()); code != "" {
-			lastStreamErr = fmt.Errorf("gemini bard error %s", code)
-			if attempt < maxAttempts {
-				c.log.Warn("Stream returned bard error, will retry",
-					zap.String("code", code),
-					zap.Int("attempt", attempt),
-				)
-				continue
-			}
-			c.markConversationUntrusted(config.ConversationID)
+			lastStreamErr = fmt.Errorf("gemini stream completed without parsed content")
 			return lastStreamErr
 		}
-		lastStreamErr = fmt.Errorf("gemini stream completed without parsed content")
-		if attempt < maxAttempts {
-			c.log.Warn("Stream completed without content, will retry",
-				zap.Int("attempt", attempt),
-			)
-			continue
+		// Success
+		markStreamCompletion(ctx, "eof", lastContentAt)
+		if attempt > 1 {
+			c.log.Info("Stream succeeded after retry", zap.Int("attempt", attempt))
 		}
-		return lastStreamErr
-	}
-	// Success
-	if attempt > 1 {
-		c.log.Info("Stream succeeded after retry", zap.Int("attempt", attempt))
-	}
-	return finalizeStreamConversation()
+		return finalizeStreamConversation()
 	} // end retry loop
 
 	c.log.Error("Stream failed after all attempts",
@@ -1651,6 +1885,13 @@ func readStreamChunks(ctx context.Context, body io.Reader, out chan<- streamRead
 	}
 }
 
+func upstreamResultUnknown(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("upstream result unknown; request was not retried: %w", err)
+}
+
 func streamFinishIdleTimeout() time.Duration {
 	value := strings.TrimSpace(os.Getenv("GEMINI_STREAM_FINISH_IDLE_MS"))
 	if value == "" {
@@ -1663,26 +1904,56 @@ func streamFinishIdleTimeout() time.Duration {
 	if ms == 0 {
 		return 0
 	}
-	timeout := time.Duration(ms) * time.Millisecond
-	if timeout < minStreamFinishIdleTimeout {
-		return minStreamFinishIdleTimeout
-	}
-	return timeout
+	return time.Duration(ms) * time.Millisecond
 }
 
-func streamFirstContentTimeout() time.Duration {
-	value := strings.TrimSpace(os.Getenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS"))
+func streamFirstActivityTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS"))
 	if value == "" {
-		return defaultStreamFirstContentTimeout
+		// Backward compatibility for existing deployments.
+		value = strings.TrimSpace(os.Getenv("GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS"))
+	}
+	if value == "" {
+		return defaultStreamFirstActivityTimeout
 	}
 	ms, err := strconv.Atoi(value)
 	if err != nil || ms < 0 {
-		return defaultStreamFirstContentTimeout
+		return defaultStreamFirstActivityTimeout
 	}
 	if ms == 0 {
 		return 0
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func streamProgressIdleTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS"))
+	if value == "" {
+		return defaultStreamProgressIdleTimeout
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms < 0 {
+		return defaultStreamProgressIdleTimeout
+	}
+	if ms == 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func resetStreamTimer(timer **time.Timer, timeout time.Duration) <-chan time.Time {
+	if *timer == nil {
+		*timer = time.NewTimer(timeout)
+		return (*timer).C
+	}
+	if !(*timer).Stop() {
+		select {
+		case <-(*timer).C:
+		default:
+		}
+	}
+	(*timer).Reset(timeout)
+	return (*timer).C
 }
 
 func streamFinishIdleRemaining(lastText string, lastContentAt time.Time, timeout time.Duration) (time.Duration, bool) {
@@ -1766,7 +2037,6 @@ func streamTextDelta(previous, current string) string {
 	}
 	return ""
 }
-
 
 func extractStreamTextFromBuffer(data []byte) string {
 	s := string(data)
@@ -2157,11 +2427,25 @@ func (c *Client) ListAccountStatuses() []AccountStatus {
 }
 
 func (c *Client) UpdateAccountCookies(ctx context.Context, accountID, secure1PSID, secure1PSIDTS string) error {
+	_ = ctx
 	accountID = strings.TrimSpace(accountID)
 	if accountID != "" && accountID != c.accountID {
 		return fmt.Errorf("Gemini account %q not found", accountID)
 	}
-	return c.UpdateCookies(ctx, secure1PSID, secure1PSIDTS)
+	if err := c.StageCookiesForValidation(secure1PSID, secure1PSIDTS, "console"); err != nil {
+		return err
+	}
+	go func() {
+		validationCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := refreshClientSessionInPlace(validationCtx, c); err != nil {
+			operationErr := accountOperationError(err, c.AccountStatus().State, AccountErrorNotInitialized)
+			c.setAccountState(accountFailureState(operationErr), operationErr)
+			return
+		}
+		c.markValidated()
+	}()
+	return nil
 }
 
 func (c *Client) RefreshAccount(ctx context.Context, accountID string) error {
@@ -2869,6 +3153,24 @@ func decodeStreamEntryArrays(payload string) ([]interface{}, error) {
 	return outer, nil
 }
 
+func hasStreamTerminalEntry(data []byte) bool {
+	entries, err := decodeStreamEntryArrays(strings.TrimSpace(string(data)))
+	if err != nil {
+		return false
+	}
+	for _, rawEntry := range entries {
+		entry, ok := rawEntry.([]interface{})
+		if !ok || len(entry) == 0 {
+			continue
+		}
+		kind, _ := entry[0].(string)
+		if kind == "e" {
+			return true
+		}
+	}
+	return false
+}
+
 func extractStreamJSONDocuments(payload string) []string {
 	var docs []string
 	for _, line := range strings.Split(payload, "\n") {
@@ -3351,9 +3653,9 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 								resText, ok := contentParts[0].(string)
 								if ok {
 									// Keep the most complete candidate: Gemini can include trailing partial snapshots.
-												if len(resText) >= len(finalResText) {
-													finalResText = resText
-												}
+									if len(resText) >= len(finalResText) {
+										finalResText = resText
+									}
 									found = true
 								}
 							}
@@ -3610,6 +3912,8 @@ const (
 	EndpointUpload        = "https://content-push.googleapis.com/upload"
 	EndpointBatchExec     = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
 )
+
+var endpointRotateCookies = EndpointRotateCookies
 
 var DefaultHeaders = map[string]string{
 	"Content-Type":  "application/x-www-form-urlencoded;charset=utf-8",

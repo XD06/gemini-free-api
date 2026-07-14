@@ -65,7 +65,9 @@ Important helpers:
 | `transcriptFingerprint` | Hash normalized OpenAI history for automatic context matching |
 | `fallbackOptionsWithFreshConversation` | Allocate a new provider conversation when server-side context fails |
 
-When context reuse works, only the latest user text is sent to Gemini Web and `providers.WithConversationID` carries the internal provider conversation ID. When reuse fails before any content is emitted, the service falls back to a stateless prompt built from the full OpenAI history.
+When context reuse works, only the latest user text is sent to Gemini Web and `providers.WithConversationID` carries the internal provider conversation ID. A generic timeout or empty response does not rebuild the conversation because Google may already have appended the turn. Only an explicit conversation rejection such as Bard `1097` or a conversation continuity mismatch migrates to a fresh provider conversation built from the full OpenAI history.
+
+The service keeps an in-process recovery transcript for each active provider conversation. This allows explicit `conversation_id` clients that send only the newest message to rebuild the known history during an approved migration. The recovery transcript has the same 12-hour/1000-entry memory bounds as context matching and is not persisted across process restarts.
 
 ### Provider Options
 
@@ -130,6 +132,14 @@ Debug capture hooks live here:
 
 Request debug headers are redacted before being written. Do not remove that redaction; raw cookies must not be committed or shared.
 
+Header redaction is not sufficient by itself: the request URL and trace logs can still contain the Gemini Web `at` query token. Treat every capture under `GEMINI_DEBUG_STREAM_DIR` as sensitive, sanitize URL query values as well as headers and bodies, and never commit raw captures.
+
+### Thinking Protocol Baseline
+
+As verified on 2026-07-13, `x-goog-ext-525001261-jspb[15]` is `1` for Standard and `2` for Extended. The cumulative thinking summary is currently read from `payload[4][0][37][0][0]`. A sibling at `[37][1]` may contain structured web UI metadata and must not be recursively flattened into reasoning text.
+
+The current Gemini Web `f.req` inner array has been observed at 92 elements, while this project can still produce thinking with its older 81-element shape. Array length alone is therefore not evidence of a breaking change. Use single-variable browser captures and the [upstream protocol drift runbook](upstream-protocol-drift-runbook.md) before changing the request template or parser.
+
 ### Upstream Parsing
 
 The provider reads the HTTP response body in `readStreamChunks`, appending all bytes to a buffer. On each chunk it:
@@ -142,11 +152,17 @@ The provider reads the HTTP response body in `readStreamChunks`, appending all b
 - computes the delta with `streamTextDelta`
 - calls the service callback with the delta
 
-`GenerateContentStreamForOpenAI` also calls `ExtractStreamState(buffer)` before content starts to emit `thinking_text` deltas. Once normal content has appeared, thinking extraction stops.
+`GenerateContentStreamForOpenAI` also calls `ExtractStreamState(buffer)` before content starts to emit `thinking_text` deltas. Once normal content has appeared, thinking extraction stops. A reasoning delta counts as visible stream progress, so Extended thinking is not mistaken for an empty stream while it is still active.
 
 ### Finish and Error Detection
 
-Gemini Web can leave the HTTP stream open after visible text is done. The provider uses `GEMINI_STREAM_FINISH_IDLE_MS` to close after a period with no new content. Default is currently configured in `.env.example` as `1000` ms for daily use.
+Gemini Web normally emits a transport `e` entry after its final `wrb.fr` payload. The provider treats that entry as authoritative completion and closes immediately instead of waiting for HTTP EOF. `GEMINI_STREAM_FINISH_IDLE_MS` is an exact-value fallback only when the terminal entry is missing; it has no implicit minimum.
+
+`GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS` separately limits a stream that has emitted neither reasoning nor answer content; its default is 15 seconds. Reaching this timeout means the upstream result is unknown: the request is ended without appending the same turn again or migrating the conversation. Once reasoning starts, `GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS` applies as a rolling 30-second guard until answer content appears, and no retry is allowed after visible output. The legacy `GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS` name is still accepted.
+
+The provider retries at most once only when Go's HTTP trace confirms that the request was not written to the upstream connection. HTTP responses, response-read failures, empty streams, parse failures, and activity timeouts all happen after dispatch and are not retried transparently.
+
+Request timing records distinguish upstream TTFB, first reasoning, first content, tail close latency, completion source (`terminal_entry`, `idle_fallback`, or `eof`), and retry count. These fields are available in the console request detail and CSV export.
 
 If the upstream stream ends with no parsed text, `extractBardErrorCode` checks the raw buffer for `BardErrorInfo [code]`. The provider returns errors like:
 
@@ -155,7 +171,7 @@ gemini bard error 1097
 gemini bard error 1060
 ```
 
-The OpenAI service can use these errors to decide whether to retry or fall back before any content has been sent to the client.
+The OpenAI service uses explicit conversation errors to decide whether a provider conversation must be migrated. Generic transport and timeout errors are returned without changing the conversation binding.
 
 ## Account Pool Layer
 
@@ -186,7 +202,7 @@ When active, the service replaces the normal user prompt with `buildToolBridgePr
 
 The prompt contains bridge instructions, the required JSON schema `{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}`, tool-choice constraints, all allowed tool definitions from `req.Tools`, and compact recent conversation context from `buildToolPlanningPrompt`.
 
-The tool planner normally runs in a temporary Gemini call without `providers.WithConversationID`. This avoids appending tool schema to the main Gemini Web conversation record.
+Tool planning intentionally runs in the main Gemini conversation. The first tool-enabled turn writes the bridge protocol and available tool definitions into that record; later turns reuse the same provider conversation and normally send only the latest user request. This keeps the tool decision, tool result, and final answer in one Gemini topic.
 
 ### Streaming Decision
 
@@ -227,19 +243,21 @@ For non-tool requests, or tool-auto requests classified as normal text, provider
 1. The service immediately emits a role chunk: `{"choices":[{"delta":{"role":"assistant"}}]}`.
 2. Provider `thinking_text` becomes OpenAI `delta.reasoning_content`.
 3. Provider `content_delta` becomes OpenAI `delta.content`.
-4. After provider completion, the service remembers the request context with `rememberRequestContext(contextPlan)` unless it emitted tool calls.
+4. After provider completion, the service remembers the request context with `rememberRequestContext(contextPlan)`. Tool-call turns also retain the request-prefix mapping so the following `role: tool` request can return to the same provider conversation.
 5. The final chunk sets `finish_reason` to `stop` or `tool_calls`.
 6. If `stream_options.include_usage` is set, an extra usage chunk is emitted after the finish chunk.
 
 ## Failure and Fallback Rules
 
-The most important fallback is inside `CreateChatCompletionStream`:
+The recovery rules inside `CreateChatCompletionStream` are intentionally narrow:
 
-- if a server-side context continuation fails before any content was emitted and `shouldRetrySameProviderContext(err)` allows it, the service retries once against the same provider context
-- if it still fails before content, the service forgets the provider conversation and retries with a full-history stateless prompt and a fresh provider conversation ID
-- this fallback is disabled for active tool-bridge planning because tool planning intentionally uses temporary context
+- a request confirmed not written to Google may be retried once by the provider
+- first-activity timeout, progress-idle timeout, empty stream, read failure, or generic upstream error is returned without retry or migration
+- once reasoning or content is observed, transparent retry and migration are disabled
+- Bard `1097` or a conversation continuity mismatch migrates once to a fresh provider conversation using the full OpenAI history
+- tool planning follows the same rules and remains attached to the main provider conversation
 
-This protects the client from blank responses, but it weakens the guarantee that a Gemini Web page shows one continuous record.
+These rules prioritize one continuous Gemini Web record and avoid appending the same user turn or tool result twice when the upstream outcome is uncertain.
 
 ## Where to Change Things
 
@@ -262,7 +280,7 @@ Before changing this pipeline, read the tests around these cases:
   - auto tools can stream normal text
   - bridge JSON emits OpenAI `tool_calls`
   - tool-result answers skip re-planning
-  - temporary tool bridge does not append schema to provider conversation
+  - tool bridge planning and tool results stay on the main provider conversation
   - Markdown-wrapped URL arguments are sanitized
 - `internal/modules/providers/gemini_service_test.go`
   - Gemini stream request shape

@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -108,13 +109,18 @@ func (c *Controller) HandleUpdateCookies(ctx fiber.Ctx) error {
 	}
 
 	if c.log != nil {
-		c.log.Info("admin cookie update validated",
+		c.log.Info("admin cookie update saved",
 			zap.String("account", accountID),
 			zap.String("source", req.Source),
 		)
-		c.logAccountAudit("cookie_sync_ok", accountID, req.Source, "accepted")
+		c.logAccountAudit("cookie_sync_saved", accountID, req.Source, "validation_pending")
 	}
-	return ctx.JSON(fiber.Map{"status": "ok", "account": accountID, "message": "cookies validated and saved"})
+	return ctx.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"status":     "saved",
+		"validation": "pending",
+		"account":    accountID,
+		"message":    "cookies saved; validation is running in the background",
+	})
 }
 
 func (c *Controller) HandleRefreshAccount(ctx fiber.Ctx) error {
@@ -132,7 +138,7 @@ func (c *Controller) HandleRefreshAccount(ctx fiber.Ctx) error {
 		if c.log != nil {
 			c.logAccountAudit("manual_refresh_failed", accountID, "", "admin_refresh_failed")
 		}
-		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(err, "refresh_failed"))
+		return writeAccountOperationError(ctx, err, "refresh_failed")
 	}
 	if c.log != nil {
 		c.logAccountAudit("manual_refresh_ok", accountID, "", "admin_refresh")
@@ -263,7 +269,7 @@ func (c *Controller) HandleTestAccount(ctx fiber.Ctx) error {
 			)
 			c.logAccountAudit("account_test_failed", accountID, "console", "test_failed")
 		}
-		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(err, "account_test_failed"))
+		return writeAccountOperationError(ctx, err, "account_test_failed")
 	}
 	if c.log != nil {
 		c.log.Info("admin account test succeeded",
@@ -283,6 +289,53 @@ func (c *Controller) HandleTestAccount(ctx fiber.Ctx) error {
 		"latency": latency,
 		"reply":   displayText,
 	})
+}
+
+type accountOperationErrorBody struct {
+	Message   string `json:"message"`
+	Type      string `json:"type"`
+	Code      string `json:"code"`
+	State     string `json:"state,omitempty"`
+	Retryable bool   `json:"retryable"`
+	Action    string `json:"action,omitempty"`
+}
+
+type accountOperationErrorEnvelope struct {
+	Error accountOperationErrorBody `json:"error"`
+}
+
+func writeAccountOperationError(ctx fiber.Ctx, err error, errorType string) error {
+	var operationErr *providers.AccountOperationError
+	if !errors.As(err, &operationErr) {
+		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(err, errorType))
+	}
+
+	status := fiber.StatusBadRequest
+	switch operationErr.Code {
+	case providers.AccountErrorNotFound:
+		status = fiber.StatusNotFound
+	case providers.AccountErrorRefreshInProgress:
+		status = fiber.StatusConflict
+	case providers.AccountErrorNotInitialized,
+		providers.AccountErrorCookiePairMismatch,
+		providers.AccountErrorCookieExpired:
+		status = fiber.StatusUnprocessableEntity
+	case providers.AccountErrorUpstreamTimeout:
+		status = fiber.StatusGatewayTimeout
+	case providers.AccountErrorProxyUnreachable,
+		providers.AccountErrorUpstreamChallenge,
+		providers.AccountErrorGenerationProbeFail:
+		status = fiber.StatusServiceUnavailable
+	}
+
+	return ctx.Status(status).JSON(accountOperationErrorEnvelope{Error: accountOperationErrorBody{
+		Message:   operationErr.Error(),
+		Type:      errorType,
+		Code:      operationErr.Code,
+		State:     operationErr.State,
+		Retryable: operationErr.Retryable,
+		Action:    operationErr.Action,
+	}})
 }
 
 type proxyTestRequest struct {

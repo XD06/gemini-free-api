@@ -128,6 +128,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			ctx = providers.ContextWithRetryBudget(ctx, 4)
+			ctx, streamTimings := providers.ContextWithStreamTimings(ctx)
 			ctx = context.WithValue(ctx, openAIRequestIDContextKey{}, requestID)
 			ctx, accountHolder := providers.ContextWithAccountID(ctx)
 
@@ -161,8 +162,11 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			})
 
 			duration := time.Since(startTime).Milliseconds()
+			timingSnapshot := streamTimings.Snapshot()
 			firstByteLatency := int64(0)
-			if firstByteRecorded {
+			if timingSnapshot.UpstreamTTFBMs >= 0 {
+				firstByteLatency = timingSnapshot.UpstreamTTFBMs
+			} else if firstByteRecorded {
 				firstByteLatency = firstByteTime.Sub(startTime).Milliseconds()
 			}
 
@@ -186,13 +190,20 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 			admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 				ID:               requestID,
 				Timestamp:        startTime,
+				Protocol:         "openai",
 				Model:            req.Model,
+				ThinkingLevel:    requestThinkingLevel(req),
 				Stream:           req.Stream,
 				AccountID:        accountHolder.Get(),
 				Status:           status,
 				ErrorMessage:     errMsg,
 				Duration:         duration,
 				FirstByteLatency: firstByteLatency,
+				FirstReasoning:   nonNegativeTiming(timingSnapshot.FirstReasoningMs),
+				FirstContent:     nonNegativeTiming(timingSnapshot.FirstContentMs),
+				TailClose:        nonNegativeTiming(timingSnapshot.TailCloseMs),
+				CompletionSource: timingSnapshot.CompletionSource,
+				StreamRetries:    timingSnapshot.RetryCount,
 				UserAgent:        userAgent,
 				RequestPath:      "/v1/chat/completions",
 			})
@@ -221,7 +232,9 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 		admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 			ID:               requestID,
 			Timestamp:        startTime,
+			Protocol:         "openai",
 			Model:            req.Model,
+			ThinkingLevel:    requestThinkingLevel(req),
 			Stream:           req.Stream,
 			AccountID:        accountHolder.Get(),
 			Status:           status,
@@ -240,7 +253,9 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 	admin.GetGlobalLogger().LogRequest(admin.RequestRecord{
 		ID:               requestID,
 		Timestamp:        startTime,
+		Protocol:         "openai",
 		Model:            req.Model,
+		ThinkingLevel:    requestThinkingLevel(req),
 		Stream:           req.Stream,
 		AccountID:        accountHolder.Get(),
 		Status:           status,
@@ -252,6 +267,13 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
 	})
 
 	return c.JSON(response)
+}
+
+func nonNegativeTiming(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 // HandleImageGenerations accepts image generation requests in OpenAI format

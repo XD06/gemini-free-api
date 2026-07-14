@@ -41,12 +41,17 @@ func applyCookieCache(cfg *configs.Config, accounts []configs.GeminiAccountConfi
 		if !ok {
 			continue
 		}
-		// Explicit environment Cookies are an operator override. A stale local
-		// cache must never silently replace newly supplied credentials.
-		if strings.TrimSpace(applied[i].Secure1PSID) == "" && strings.TrimSpace(entry.Secure1PSID) != "" {
+		// Console/worker updates are deliberate runtime operator changes and must
+		// survive restart even when .env still contains the original pair.
+		cacheSource := strings.ToLower(strings.TrimSpace(entry.Source))
+		cacheIsAuthoritative := cacheSource == "console" || cacheSource == "worker" || cacheSource == "runtime"
+		if (cacheIsAuthoritative || strings.TrimSpace(applied[i].Secure1PSID) == "") && strings.TrimSpace(entry.Secure1PSID) != "" {
 			applied[i].Secure1PSID = entry.Secure1PSID
 			applied[i].Secure1PSIDTS = entry.Secure1PSIDTS
-			applied[i].CookieSource = "cache"
+			applied[i].CookieSource = cacheSource
+			if applied[i].CookieSource == "" {
+				applied[i].CookieSource = "cache"
+			}
 		}
 		if strings.TrimSpace(applied[i].ProxyURL) == "" && strings.TrimSpace(entry.ProxyURL) != "" {
 			applied[i].ProxyURL = entry.ProxyURL

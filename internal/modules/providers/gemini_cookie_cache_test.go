@@ -24,12 +24,12 @@ func TestApplyCookieCacheFillsMissingAccountCookies(t *testing.T) {
 	if accounts[0].Secure1PSID != "cached-psid" || accounts[0].Secure1PSIDTS != "cached-ts" {
 		t.Fatalf("expected cached cookies to be applied, got %#v", accounts[0])
 	}
-	if accounts[0].CookieSource != "cache" {
-		t.Fatalf("expected cookie source cache, got %q", accounts[0].CookieSource)
+	if accounts[0].CookieSource != "worker" {
+		t.Fatalf("expected original cache source, got %q", accounts[0].CookieSource)
 	}
 }
 
-func TestApplyCookieCachePreservesExplicitEnvCookies(t *testing.T) {
+func TestApplyCookieCacheUsesPersistedOperatorUpdateAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
 	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "", "worker"); err != nil {
@@ -46,11 +46,32 @@ func TestApplyCookieCachePreservesExplicitEnvCookies(t *testing.T) {
 		Secure1PSIDTS: "env-ts",
 		CookieSource:  "env",
 	}})
-	if accounts[0].Secure1PSID != "env-psid" || accounts[0].Secure1PSIDTS != "env-ts" {
-		t.Fatalf("explicit env cookies must win, got %#v", accounts[0])
+	if accounts[0].Secure1PSID != "cached-psid" || accounts[0].Secure1PSIDTS != "cached-ts" {
+		t.Fatalf("persisted worker update must survive restart, got %#v", accounts[0])
 	}
-	if accounts[0].CookieSource != "env" {
-		t.Fatalf("expected cookie source env, got %q", accounts[0].CookieSource)
+	if accounts[0].CookieSource != "worker" {
+		t.Fatalf("expected cookie source worker, got %q", accounts[0].CookieSource)
+	}
+}
+
+func TestApplyCookieCachePreservesEnvAgainstNonAuthoritativeCache(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	if err := saveAccountCookieCache(path, "acc1", "cached-psid", "cached-ts", "", "env"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configs.Config{}
+	cfg.Gemini.CookieCache = true
+	cfg.Gemini.CookieCachePath = path
+	accounts := applyCookieCache(cfg, []configs.GeminiAccountConfig{{
+		ID:            "acc1",
+		Secure1PSID:   "env-psid",
+		Secure1PSIDTS: "env-ts",
+		CookieSource:  "env",
+	}})
+	if accounts[0].Secure1PSID != "env-psid" || accounts[0].Secure1PSIDTS != "env-ts" {
+		t.Fatalf("non-authoritative cache replaced env cookies: %#v", accounts[0])
 	}
 }
 

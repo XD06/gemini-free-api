@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -31,26 +30,28 @@ import (
 )
 
 type OpenAIService struct {
-	client                   providers.GeminiClient
-	log                      *zap.Logger
-	fileStore                *openAIFileStore
-	contextMu                sync.Mutex
-	transcriptContexts       map[string]string
-	transcriptContextUpdated map[string]time.Time
-	transcriptSuffixContexts map[string]string
-	transcriptSuffixUpdated  map[string]time.Time
-	userWindowContexts       map[string]string
-	userWindowUpdated        map[string]time.Time
-	providerLatestTranscript map[string]string
-	providerLatestLength     map[string]int
-	rootContexts             map[string]string
-	rootContextUpdated       map[string]time.Time
-	explicitProviderContexts map[string]string
-	explicitProviderUpdated  map[string]time.Time
-	toolPlannerContexts      map[string]string
-	toolPlannerUpdated       map[string]time.Time
-	toolBridgeContexts       map[string]string
-	toolBridgeUpdated        map[string]time.Time
+	client                    providers.GeminiClient
+	log                       *zap.Logger
+	fileStore                 *openAIFileStore
+	contextMu                 sync.Mutex
+	transcriptContexts        map[string]string
+	transcriptContextUpdated  map[string]time.Time
+	transcriptSuffixContexts  map[string]string
+	transcriptSuffixUpdated   map[string]time.Time
+	userWindowContexts        map[string]string
+	userWindowUpdated         map[string]time.Time
+	providerLatestTranscript  map[string]string
+	providerLatestLength      map[string]int
+	providerTranscripts       map[string][]dto.ChatCompletionMessage
+	providerTranscriptUpdated map[string]time.Time
+	rootContexts              map[string]string
+	rootContextUpdated        map[string]time.Time
+	explicitProviderContexts  map[string]string
+	explicitProviderUpdated   map[string]time.Time
+	toolPlannerContexts       map[string]string
+	toolPlannerUpdated        map[string]time.Time
+	toolBridgeContexts        map[string]string
+	toolBridgeUpdated         map[string]time.Time
 }
 
 type openAIRequestIDContextKey struct{}
@@ -97,25 +98,27 @@ func openAILocalFallbackEnabled() bool {
 
 func NewOpenAIService(client providers.GeminiClient, log *zap.Logger) *OpenAIService {
 	return &OpenAIService{
-		client:                   client,
-		log:                      log,
-		fileStore:                newOpenAIFileStore(""),
-		transcriptContexts:       make(map[string]string),
-		transcriptContextUpdated: make(map[string]time.Time),
-		transcriptSuffixContexts: make(map[string]string),
-		transcriptSuffixUpdated:  make(map[string]time.Time),
-		userWindowContexts:       make(map[string]string),
-		userWindowUpdated:        make(map[string]time.Time),
-		providerLatestTranscript: make(map[string]string),
-		providerLatestLength:     make(map[string]int),
-		rootContexts:             make(map[string]string),
-		rootContextUpdated:       make(map[string]time.Time),
-		explicitProviderContexts: make(map[string]string),
-		explicitProviderUpdated:  make(map[string]time.Time),
-		toolPlannerContexts:      make(map[string]string),
-		toolPlannerUpdated:       make(map[string]time.Time),
-		toolBridgeContexts:       make(map[string]string),
-		toolBridgeUpdated:        make(map[string]time.Time),
+		client:                    client,
+		log:                       log,
+		fileStore:                 newOpenAIFileStore(""),
+		transcriptContexts:        make(map[string]string),
+		transcriptContextUpdated:  make(map[string]time.Time),
+		transcriptSuffixContexts:  make(map[string]string),
+		transcriptSuffixUpdated:   make(map[string]time.Time),
+		userWindowContexts:        make(map[string]string),
+		userWindowUpdated:         make(map[string]time.Time),
+		providerLatestTranscript:  make(map[string]string),
+		providerLatestLength:      make(map[string]int),
+		providerTranscripts:       make(map[string][]dto.ChatCompletionMessage),
+		providerTranscriptUpdated: make(map[string]time.Time),
+		rootContexts:              make(map[string]string),
+		rootContextUpdated:        make(map[string]time.Time),
+		explicitProviderContexts:  make(map[string]string),
+		explicitProviderUpdated:   make(map[string]time.Time),
+		toolPlannerContexts:       make(map[string]string),
+		toolPlannerUpdated:        make(map[string]time.Time),
+		toolBridgeContexts:        make(map[string]string),
+		toolBridgeUpdated:         make(map[string]time.Time),
 	}
 }
 
@@ -194,21 +197,23 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 
 	// Logic: Call Provider
 	response, err := s.client.GenerateContent(ctx, prompt, opts...)
-	if err != nil && contextPlan.AutoContext {
+	if err != nil && shouldMigrateProviderConversation(err) {
 		if s.log != nil {
-			s.log.Warn("server-side context request failed, retrying stateless OpenAI prompt",
+			s.log.Warn("Gemini conversation rejected, migrating to a fresh conversation",
 				zap.String("request_id", requestID),
 				zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
 				zap.Error(err),
 			)
 		}
-		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
+		recoveryMessages := s.recoveryMessagesForProvider(contextPlan.ProviderConversationID, req.Messages)
+		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(recoveryMessages)
 		if useToolBridge {
 			fallbackPrompt = s.buildToolBridgePrompt(req, fallbackPrompt, toolBridgeRequiresToolCall(req))
 		}
 		if fallbackPrompt != "" {
 			s.forgetProviderConversation(contextPlan.ProviderConversationID)
 			fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
+			contextPlan.RequestMessages = cloneChatMessages(recoveryMessages)
 			s.dumpOpenAITrace(ctx, req, contextPlan, "non_stream_fallback", fallbackPrompt, fallbackOpts, inputFiles, useToolBridge, err)
 			response, err = s.client.GenerateContent(ctx, fallbackPrompt, fallbackOpts...)
 			prompt = fallbackPrompt
@@ -490,6 +495,7 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	})
 
 	var completionLen int
+	upstreamOutputObserved := false
 	var completionText strings.Builder
 	toolBridgeUndecided := useToolBridge && !mustBufferToolBridge(req)
 	toolBridgeStreamingContent := false
@@ -513,12 +519,18 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	handleStreamEvent := func(event providers.StreamEvent) bool {
 		switch event.Kind {
 		case "thinking_text":
+			if event.Delta != "" {
+				upstreamOutputObserved = true
+			}
 			traceOpenAIForward("reasoning_content", len(event.Delta), false, "provider_thinking_delta")
 			return onEvent(dto.ChatCompletionChunk{
 				ID: chunkID, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 				Choices: []dto.ChunkChoice{{Index: 0, Delta: dto.ChatCompletionChunkDelta{ReasoningContent: event.Delta}}},
 			})
 		case "content_delta":
+			if event.Delta != "" {
+				upstreamOutputObserved = true
+			}
 			completionLen += len(event.Delta)
 			completionText.WriteString(event.Delta)
 			if useToolBridge && mustBufferToolBridge(req) {
@@ -557,61 +569,28 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 		}
 	}
 	err = s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
-	if err == nil && completionLen == 0 {
+	if err == nil && !upstreamOutputObserved {
 		err = errEmptyProviderStream
 	}
-	if err != nil && useToolBridge && !contextPlan.AutoContext && completionLen == 0 && shouldRetryFreshProviderContext(err) {
+	if err != nil && !upstreamOutputObserved && shouldMigrateProviderConversation(err) {
+		recoveryMessages := s.recoveryMessagesForProvider(contextPlan.ProviderConversationID, req.Messages)
 		if s.log != nil {
-			s.log.Warn("tool bridge stream failed before content, retrying with fresh Gemini conversation",
+			s.log.Warn("Gemini conversation rejected, migrating stream to a fresh conversation",
 				zap.String("request_id", requestID),
 				zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
 				zap.Error(err),
 			)
 		}
-		fallbackPrompt := s.buildToolBridgePrompt(req, buildGeminiWebPromptFromOpenAIMessages(req.Messages), toolBridgeRequiresToolCall(req))
-		if fallbackPrompt != "" {
-			prompt = fallbackPrompt
-			fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
-			s.dumpOpenAITrace(ctx, req, contextPlan, "stream_tool_bridge_fallback", fallbackPrompt, fallbackOpts, inputFiles, useToolBridge, err)
-			completionText.Reset()
-			completionLen = 0
-			toolBridgeUndecided = useToolBridge && !mustBufferToolBridge(req)
-			toolBridgeStreamingContent = false
-			err = s.client.GenerateContentStreamForOpenAI(ctx, fallbackPrompt, handleStreamEvent, fallbackOpts...)
-			if err == nil && completionLen == 0 {
-				err = errEmptyProviderStream
-			}
-		}
-	}
-	if err != nil && contextPlan.AutoContext && completionLen == 0 && shouldRetrySameProviderContext(err) {
-		if s.log != nil {
-			s.log.Warn("server-side context stream failed before content, retrying same Gemini context once",
-				zap.String("request_id", requestID),
-				zap.String("provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
-				zap.Error(err),
-			)
-		}
-		err = s.client.GenerateContentStreamForOpenAI(ctx, prompt, handleStreamEvent, opts...)
-		if err == nil && completionLen == 0 {
-			err = errEmptyProviderStream
-		}
-	}
-	if err != nil && contextPlan.AutoContext && completionLen == 0 {
-		s.forgetProviderConversation(contextPlan.ProviderConversationID)
-		if s.log != nil {
-			s.log.Warn("server-side context stream failed before content, retrying stateless OpenAI prompt",
-				zap.String("request_id", requestID),
-				zap.String("stale_provider_conversation_id", strings.TrimSpace(contextPlan.ProviderConversationID)),
-				zap.Error(err),
-			)
-		}
-		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(req.Messages)
+		fallbackPrompt := buildGeminiWebPromptFromOpenAIMessages(recoveryMessages)
 		if useToolBridge {
 			fallbackPrompt = s.buildToolBridgePrompt(req, fallbackPrompt, toolBridgeRequiresToolCall(req))
 		}
 		if fallbackPrompt != "" {
+			s.forgetProviderConversation(contextPlan.ProviderConversationID)
+			upstreamOutputObserved = false
 			prompt = fallbackPrompt
 			fallbackOpts := fallbackOptionsWithFreshConversation(&contextPlan, baseOpts)
+			contextPlan.RequestMessages = cloneChatMessages(recoveryMessages)
 			s.dumpOpenAITrace(ctx, req, contextPlan, "stream_fallback", fallbackPrompt, fallbackOpts, inputFiles, useToolBridge, err)
 			if openAIRequestDebugEnabled() && s.log != nil {
 				s.log.Info("OpenAI stream fallback plan",
@@ -623,13 +602,13 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 				)
 			}
 			err = s.client.GenerateContentStreamForOpenAI(ctx, fallbackPrompt, handleStreamEvent, fallbackOpts...)
-			if err == nil && completionLen == 0 {
+			if err == nil && !upstreamOutputObserved {
 				err = errEmptyProviderStream
 			}
 		}
 	}
 	if err != nil {
-		return err
+		return streamResultUnknownError(err)
 	}
 	if useToolBridge && toolBridgeSignature != "" {
 		s.rememberToolBridgeContext(contextPlan.ProviderConversationID, toolBridgeSignature)
@@ -936,15 +915,6 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 		return
 	}
 
-	next := append(cloneChatMessages(plan.RequestMessages), dto.ChatCompletionMessage{
-		Role:    "assistant",
-		Content: plan.ResponseText,
-	})
-	key := transcriptFingerprint(next)
-	if key == "" {
-		return
-	}
-
 	s.contextMu.Lock()
 	defer s.contextMu.Unlock()
 	if s.transcriptContexts == nil {
@@ -971,6 +941,12 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	if s.providerLatestLength == nil {
 		s.providerLatestLength = make(map[string]int)
 	}
+	if s.providerTranscripts == nil {
+		s.providerTranscripts = make(map[string][]dto.ChatCompletionMessage)
+	}
+	if s.providerTranscriptUpdated == nil {
+		s.providerTranscriptUpdated = make(map[string]time.Time)
+	}
 	if s.rootContexts == nil {
 		s.rootContexts = make(map[string]string)
 	}
@@ -984,17 +960,26 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 		s.explicitProviderUpdated = make(map[string]time.Time)
 	}
 	now := time.Now()
-	s.pruneTranscriptContextsLocked(time.Now())
+	s.pruneTranscriptContextsLocked(now)
+	requestMessages := mergeRecoveryMessages(s.providerTranscripts[plan.ProviderConversationID], plan.RequestMessages)
+	next := append(cloneChatMessages(requestMessages), dto.ChatCompletionMessage{
+		Role:    "assistant",
+		Content: plan.ResponseText,
+	})
+	key := transcriptFingerprint(next)
+	if key == "" {
+		return
+	}
 	if plan.ClientConversationID != "" {
 		s.explicitProviderContexts[plan.ClientConversationID] = plan.ProviderConversationID
 		s.explicitProviderUpdated[plan.ClientConversationID] = now
 	}
-	if currentKey := transcriptFingerprint(plan.RequestMessages); currentKey != "" {
+	if currentKey := transcriptFingerprint(requestMessages); currentKey != "" {
 		s.transcriptContexts[currentKey] = plan.ProviderConversationID
 		s.transcriptContextUpdated[currentKey] = now
-		s.rememberTranscriptSuffixesLocked(plan.RequestMessages, plan.ProviderConversationID, now)
-		s.rememberUserWindowsLocked(plan.RequestMessages, plan.ProviderConversationID, now)
-		if rootKey := conversationRootFingerprint(plan.RequestMessages); rootKey != "" {
+		s.rememberTranscriptSuffixesLocked(requestMessages, plan.ProviderConversationID, now)
+		s.rememberUserWindowsLocked(requestMessages, plan.ProviderConversationID, now)
+		if rootKey := conversationRootFingerprint(requestMessages); rootKey != "" {
 			s.rootContexts[rootKey] = plan.ProviderConversationID
 			s.rootContextUpdated[rootKey] = now
 		}
@@ -1005,6 +990,8 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	s.rememberUserWindowsLocked(next, plan.ProviderConversationID, now)
 	s.providerLatestTranscript[plan.ProviderConversationID] = key
 	s.providerLatestLength[plan.ProviderConversationID] = len(next)
+	s.providerTranscripts[plan.ProviderConversationID] = cloneChatMessages(next)
+	s.providerTranscriptUpdated[plan.ProviderConversationID] = now
 	if rootKey := conversationRootFingerprint(next); rootKey != "" {
 		s.rootContexts[rootKey] = plan.ProviderConversationID
 		s.rootContextUpdated[rootKey] = now
@@ -1013,6 +1000,34 @@ func (s *OpenAIService) rememberRequestContext(plan openAIContextPlan) {
 	if plan.ClientConversationID != "" {
 		s.promoteToolPlannerContextLocked("client:"+plan.ClientConversationID, "provider:"+plan.ProviderConversationID, now)
 	}
+}
+
+func (s *OpenAIService) recoveryMessagesForProvider(providerID string, incoming []dto.ChatCompletionMessage) []dto.ChatCompletionMessage {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return cloneChatMessages(incoming)
+	}
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	s.pruneTranscriptContextsLocked(time.Now())
+	return mergeRecoveryMessages(s.providerTranscripts[providerID], incoming)
+}
+
+func mergeRecoveryMessages(base, incoming []dto.ChatCompletionMessage) []dto.ChatCompletionMessage {
+	base = cloneChatMessages(base)
+	incoming = cloneChatMessages(incoming)
+	if len(base) == 0 || len(incoming) == 0 {
+		return incoming
+	}
+	if len(incoming) >= len(base) && transcriptFingerprint(incoming[:len(base)]) == transcriptFingerprint(base) {
+		return incoming
+	}
+	if len(incoming) == 1 {
+		if _, ok := latestUserMessage(incoming); ok {
+			return append(base, incoming...)
+		}
+	}
+	return incoming
 }
 
 func (s *OpenAIService) promoteToolPlannerContextLocked(fromKey, toKey string, now time.Time) {
@@ -1164,7 +1179,7 @@ func toolPlannerContextKey(plan openAIContextPlan, req dto.ChatCompletionRequest
 	return ""
 }
 
-func shouldRetrySameProviderContext(err error) bool {
+func shouldMigrateProviderConversation(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -1172,37 +1187,35 @@ func shouldRetrySameProviderContext(err error) bool {
 	for _, token := range []string{
 		"gemini bard error 1097",
 		"conversation continuity mismatch",
-		"authentication failed",
-		"cookies invalid",
-		"status 401",
-		"status 403",
 	} {
 		if strings.Contains(msg, token) {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
-func shouldRetryFreshProviderContext(err error) bool {
+func streamResultUnknownError(err error) error {
 	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
+		return nil
 	}
 	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "upstream result unknown") {
+		return err
+	}
 	for _, token := range []string{
-		"authentication failed",
-		"cookies invalid",
-		"status 401",
-		"status 403",
+		"first activity timeout",
+		"progress idle timeout",
+		"stream completed without parsed content",
+		"stream terminated without parsed content",
+		"provider stream completed without content",
+		"stream read:",
 	} {
 		if strings.Contains(msg, token) {
-			return false
+			return fmt.Errorf("upstream result unknown; request was not retried: %w", err)
 		}
 	}
-	return true
+	return err
 }
 
 func (s *OpenAIService) forgetProviderConversation(providerID string) {
@@ -1244,6 +1257,8 @@ func (s *OpenAIService) forgetProviderConversation(providerID string) {
 	}
 	delete(s.providerLatestTranscript, providerID)
 	delete(s.providerLatestLength, providerID)
+	delete(s.providerTranscripts, providerID)
+	delete(s.providerTranscriptUpdated, providerID)
 	delete(s.toolBridgeContexts, providerID)
 	delete(s.toolBridgeUpdated, providerID)
 }
@@ -1461,6 +1476,12 @@ func (s *OpenAIService) rememberUserWindowsLocked(messages []dto.ChatCompletionM
 }
 
 func (s *OpenAIService) pruneTranscriptContextsLocked(now time.Time) {
+	for providerID, updatedAt := range s.providerTranscriptUpdated {
+		if now.Sub(updatedAt) > transcriptContextTTL {
+			delete(s.providerTranscripts, providerID)
+			delete(s.providerTranscriptUpdated, providerID)
+		}
+	}
 	for key, updatedAt := range s.transcriptContextUpdated {
 		if now.Sub(updatedAt) > transcriptContextTTL {
 			providerID := s.transcriptContexts[key]
@@ -1537,6 +1558,22 @@ func (s *OpenAIService) pruneTranscriptContextsLocked(now time.Time) {
 			delete(s.providerLatestTranscript, providerID)
 			delete(s.providerLatestLength, providerID)
 		}
+	}
+	for len(s.providerTranscripts) > maxTranscriptContextEntries {
+		var oldestID string
+		var oldestTime time.Time
+		for providerID := range s.providerTranscripts {
+			updatedAt := s.providerTranscriptUpdated[providerID]
+			if oldestID == "" || updatedAt.Before(oldestTime) {
+				oldestID = providerID
+				oldestTime = updatedAt
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		delete(s.providerTranscripts, oldestID)
+		delete(s.providerTranscriptUpdated, oldestID)
 	}
 	for len(s.rootContexts) > maxTranscriptContextEntries {
 		var oldestKey string

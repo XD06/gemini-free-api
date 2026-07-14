@@ -613,6 +613,153 @@ func TestStreamSkipsSameContextRetryForGemini1097(t *testing.T) {
 	}
 }
 
+func TestStreamMigratesContextForContinuityMismatch(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamErrs: []error{errors.New("conversation continuity mismatch: expected c_old, got c_new")},
+		streamEventsByCall: [][]providers.StreamEvent{
+			nil,
+			{{Kind: "content_delta", Delta: "fallback answer"}},
+		},
+	}
+	service := NewOpenAIService(client, nil)
+
+	prefix := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好，有什么可以帮你？"},
+	}
+	key := transcriptFingerprint(prefix)
+	service.transcriptContexts[key] = "provider-1"
+	service.transcriptContextUpdated[key] = time.Now()
+	service.providerLatestTranscript["provider-1"] = key
+	service.providerLatestLength["provider-1"] = len(prefix)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: append(cloneChatMessages(prefix), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "继续",
+		}),
+		Stream: true,
+	}
+
+	err := service.CreateChatCompletionStream(context.Background(), req, func(dto.ChatCompletionChunk) bool { return true })
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	}
+	if len(client.configs) != 2 {
+		t.Fatalf("expected context attempt plus one migration, got %#v", client.configs)
+	}
+	if client.configs[0].ConversationID != "provider-1" || client.configs[1].ConversationID == "provider-1" {
+		t.Fatalf("expected migration away from provider-1, got %#v", client.configs)
+	}
+}
+
+func TestStreamDoesNotRetryFirstActivityTimeout(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamErrs: []error{errors.New("gemini stream first activity timeout after 15s")},
+	}
+	service := NewOpenAIService(client, nil)
+	prefix := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好"},
+	}
+	key := transcriptFingerprint(prefix)
+	service.transcriptContexts[key] = "provider-1"
+	service.transcriptContextUpdated[key] = time.Now()
+	service.providerLatestTranscript["provider-1"] = key
+	service.providerLatestLength["provider-1"] = len(prefix)
+
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: append(cloneChatMessages(prefix), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "继续",
+		}),
+		Stream: true,
+	}
+	err := service.CreateChatCompletionStream(context.Background(), req, func(dto.ChatCompletionChunk) bool { return true })
+	if err == nil || !strings.Contains(err.Error(), "upstream result unknown") || !strings.Contains(err.Error(), "first activity timeout") {
+		t.Fatalf("expected first activity timeout, got %v", err)
+	}
+	if len(client.configs) != 1 {
+		t.Fatalf("first activity timeout must not retry or migrate, got %#v", client.configs)
+	}
+}
+
+func TestStreamDoesNotRetryAfterReasoning(t *testing.T) {
+	client := &fakeGeminiClient{
+		streamEventsByCall: [][]providers.StreamEvent{{
+			{Kind: "thinking_text", Delta: "已经开始分析"},
+		}},
+		streamErrs: []error{errors.New("gemini stream progress idle timeout after 30s")},
+	}
+	service := NewOpenAIService(client, nil)
+	prefix := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好"},
+	}
+	key := transcriptFingerprint(prefix)
+	service.transcriptContexts[key] = "provider-1"
+	service.transcriptContextUpdated[key] = time.Now()
+	service.providerLatestTranscript["provider-1"] = key
+	service.providerLatestLength["provider-1"] = len(prefix)
+
+	reasoning := ""
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: append(cloneChatMessages(prefix), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "继续",
+		}),
+		Stream: true,
+	}
+	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
+		if len(chunk.Choices) > 0 {
+			reasoning += chunk.Choices[0].Delta.ReasoningContent
+		}
+		return true
+	})
+	if err == nil || !strings.Contains(err.Error(), "upstream result unknown") || !strings.Contains(err.Error(), "progress idle timeout") {
+		t.Fatalf("expected progress idle timeout, got %v", err)
+	}
+	if reasoning != "已经开始分析" {
+		t.Fatalf("expected reasoning to be forwarded once, got %q", reasoning)
+	}
+	if len(client.configs) != 1 {
+		t.Fatalf("visible reasoning must disable retry and migration, got %#v", client.configs)
+	}
+}
+
+func TestNonStreamDoesNotMigrateGenericUpstreamError(t *testing.T) {
+	client := &fakeGeminiClient{
+		generateErrs: []error{errors.New("upstream response timeout")},
+	}
+	service := NewOpenAIService(client, nil)
+	prefix := []dto.ChatCompletionMessage{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好"},
+	}
+	key := transcriptFingerprint(prefix)
+	service.transcriptContexts[key] = "provider-1"
+	service.transcriptContextUpdated[key] = time.Now()
+	service.providerLatestTranscript["provider-1"] = key
+	service.providerLatestLength["provider-1"] = len(prefix)
+
+	_, err := service.CreateChatCompletion(context.Background(), dto.ChatCompletionRequest{
+		Model: "gemini-3.5-flash",
+		Messages: append(cloneChatMessages(prefix), dto.ChatCompletionMessage{
+			Role:    "user",
+			Content: "继续",
+		}),
+	})
+	if err == nil || !strings.Contains(err.Error(), "upstream response timeout") {
+		t.Fatalf("expected upstream timeout, got %v", err)
+	}
+	if len(client.configs) != 1 {
+		t.Fatalf("generic non-stream errors must not migrate, got %#v", client.configs)
+	}
+}
+
 func TestStreamRebindsExplicitConversationIDAfterFallback(t *testing.T) {
 	client := &fakeGeminiClient{
 		streamErrs: []error{nil, errors.New("gemini bard error 1097"), nil, nil},
@@ -658,6 +805,9 @@ func TestStreamRebindsExplicitConversationIDAfterFallback(t *testing.T) {
 	fallbackID := client.configs[2].ConversationID
 	if fallbackID == "" || fallbackID == "cherry-thread" {
 		t.Fatalf("expected fallback to allocate repaired provider id, got %q", fallbackID)
+	}
+	if len(client.prompts) < 3 || !strings.Contains(client.prompts[2], "记住一个词：松月") || !strings.Contains(client.prompts[2], "刚才让你记住的词是什么？") {
+		t.Fatalf("explicit latest-message migration must rebuild the available full history, got %#v", client.prompts)
 	}
 
 	thirdReq := dto.ChatCompletionRequest{
@@ -1207,12 +1357,9 @@ func TestCreateChatCompletionStreamStreamsNormalAnswerWhenToolsAreAuto(t *testin
 	}
 }
 
-func TestCreateChatCompletionStreamRetriesInitialToolBridgeEmptyStreamWithFreshConversation(t *testing.T) {
+func TestCreateChatCompletionStreamDoesNotRetryInitialToolBridgeEmptyStream(t *testing.T) {
 	client := &fakeGeminiClient{
-		streamEventsByCall: [][]providers.StreamEvent{
-			nil,
-			{{Kind: "content_delta", Delta: `{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"today news"}}]}`}},
-		},
+		streamEventsByCall: [][]providers.StreamEvent{nil},
 	}
 	service := NewOpenAIService(client, nil)
 	req := dto.ChatCompletionRequest{
@@ -1227,24 +1374,14 @@ func TestCreateChatCompletionStreamRetriesInitialToolBridgeEmptyStreamWithFreshC
 		Stream: true,
 	}
 
-	var toolCalls []dto.ChatCompletionChunkDeltaToolCall
 	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
-		if len(chunk.Choices) > 0 {
-			toolCalls = append(toolCalls, chunk.Choices[0].Delta.ToolCalls...)
-		}
 		return true
 	})
-	if err != nil {
-		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
+	if err == nil || !errors.Is(err, errEmptyProviderStream) {
+		t.Fatalf("expected empty provider stream error, got %v", err)
 	}
-	if len(toolCalls) != 1 || toolCalls[0].Function.Name != "search" {
-		t.Fatalf("expected retried tool call, got %#v", toolCalls)
-	}
-	if len(client.configs) != 2 {
-		t.Fatalf("expected initial failed stream and one fresh retry, got %#v", client.configs)
-	}
-	if client.configs[0].ConversationID == "" || client.configs[1].ConversationID == "" || client.configs[0].ConversationID == client.configs[1].ConversationID {
-		t.Fatalf("expected retry to use fresh conversation, got %#v", client.configs)
+	if len(client.configs) != 1 {
+		t.Fatalf("empty tool stream has unknown upstream result and must not retry, got %#v", client.configs)
 	}
 }
 
