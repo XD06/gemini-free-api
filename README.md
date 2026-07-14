@@ -74,6 +74,7 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 - 添加 / 编辑 / 删除账号
 - Cookie 更新会先验证，验证失败时保留原有可用 Cookie
 - 账号测试：发送真实对话消息验证可用性
+- 调用记录，方便查看实际情况
 - 代理测试：验证代理连通性
 
 ### Playground
@@ -81,6 +82,11 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 控制台内置 Playground 聊天界面，支持模型切换、Thinking Level 调节和流式对话测试。
 
 ![Playground](./asset/playground.gif)
+
+### 调用记录
+
+![request](./asset/request.png)
+
 
 ## 调用示例
 
