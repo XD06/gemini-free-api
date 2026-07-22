@@ -126,20 +126,60 @@ func TestSelectStartupPSIDTSPreservesAccountCacheOverLegacyCache(t *testing.T) {
 }
 
 func TestBuildGenerateInnerIncludesConversationMetadataAndContextToken(t *testing.T) {
-	metadata := []interface{}{"c_1", "r_1", "rc_1", nil, nil, nil, nil, nil, nil, ""}
-	inner := buildGenerateInner("hello", nil, "en", "request-id", metadata, "opaque-token")
+		metadata := []interface{}{"c_1", "r_1", "rc_1", nil, nil, nil, nil, nil, nil, ""}
+		inner := buildGenerateInner("hello", nil, "en", "request-id", modelIDFlash, metadata, "opaque-token")
 
-	got, ok := inner[2].([]interface{})
-	if !ok {
-		t.Fatalf("expected conversation metadata array, got %#v", inner[2])
+		if len(inner) != 92 {
+			t.Fatalf("expected live 92-element inner, got %d", len(inner))
+		}
+		got, ok := inner[2].([]interface{})
+		if !ok {
+			t.Fatalf("expected conversation metadata array, got %#v", inner[2])
+		}
+		if len(got) != 10 || got[0] != "c_1" || got[1] != "r_1" || got[2] != "rc_1" {
+			t.Fatalf("unexpected conversation metadata: %#v", got)
+		}
+		if inner[3] != "opaque-token" {
+			t.Fatalf("unexpected conversation context token: %#v", inner[3])
+		}
 	}
-	if len(got) != 10 || got[0] != "c_1" || got[1] != "r_1" || got[2] != "rc_1" {
-		t.Fatalf("unexpected conversation metadata: %#v", got)
+
+	func TestBuildGenerateInnerMatchesLiveWebShape(t *testing.T) {
+		flash := buildGenerateInner("hi", nil, "en", "req-flash", modelIDFlash, nil, nil)
+		lite := buildGenerateInner("hi", nil, "en", "req-lite", modelIDFlashLite, nil, nil)
+		pro := buildGenerateInner("hi", nil, "en", "req-pro", modelIDPro, nil, nil)
+
+		for name, inner := range map[string][]interface{}{"flash": flash, "lite": lite, "pro": pro} {
+			if len(inner) != 92 {
+				t.Fatalf("%s: expected 92 elements, got %d", name, len(inner))
+			}
+			if got, ok := inner[6].([]interface{}); !ok || len(got) != 1 || got[0] != 1 {
+				t.Fatalf("%s: expected inner[6]=[1], got %#v", name, inner[6])
+			}
+			if got, ok := inner[61].([]interface{}); !ok || len(got) != 1 || got[0] != 1 {
+				t.Fatalf("%s: expected inner[61]=[1], got %#v", name, inner[61])
+			}
+			if inner[68] != 2 {
+				t.Fatalf("%s: expected inner[68]=2, got %#v", name, inner[68])
+			}
+			if inner[80] != 1 {
+				t.Fatalf("%s: expected inner[80]=1, got %#v", name, inner[80])
+			}
+			if inner[91] != 0 {
+				t.Fatalf("%s: expected inner[91]=0, got %#v", name, inner[91])
+			}
+		}
+
+		if flash[79] != 1 {
+			t.Fatalf("expected flash mode 1 at inner[79], got %#v", flash[79])
+		}
+		if lite[79] != 6 {
+			t.Fatalf("expected lite mode 6 at inner[79], got %#v", lite[79])
+		}
+		if pro[79] != 3 {
+			t.Fatalf("expected pro mode 3 at inner[79], got %#v", pro[79])
+		}
 	}
-	if inner[3] != "opaque-token" {
-		t.Fatalf("unexpected conversation context token: %#v", inner[3])
-	}
-}
 
 func TestExtractConversationMetadataFromStreamBuffer(t *testing.T) {
 	first := buildStreamLine(t,
@@ -506,16 +546,18 @@ func TestGenerateContentStreamForOpenAIReturnsErrorForEmptyParsedStream(t *testi
 }
 
 func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
-	_, aliases := resolveModels([]ModelInfo{
-		{ID: "cf41b0e0dd7d53e5", Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
-		{ID: "fbb127bbb056c959", Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
-		{ID: "9d8ca3786ebdfbea", Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
+	_, aliases, canonical := resolveModels([]ModelInfo{
+		{ID: modelIDFlashLite, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDFlash, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDPro, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
 	})
 
 	want := map[string]string{
-		"gemini-3.1-flash-lite": "cf41b0e0dd7d53e5",
-		"gemini-3.5-flash":      "fbb127bbb056c959",
-		"gemini-3.1-pro":        "9d8ca3786ebdfbea",
+		"gemini-3.5-flash-lite": "8c46e95b1a07cecc",
+		"gemini-3.1-flash-lite": "8c46e95b1a07cecc", // backward-compatible
+		"gemini-3.6-flash":      "56fdd199312815e2",
+		"gemini-3.5-flash":      "56fdd199312815e2", // backward-compatible
+		"gemini-3.1-pro":        "e6fa609c3fa255c0",
 	}
 	for alias, id := range want {
 		if aliases[alias] != id {
@@ -525,6 +567,22 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 	if len(aliases) != len(want) {
 		t.Fatalf("expected only UI aliases, got %#v", aliases)
 	}
+
+	canonicalWant := map[string]bool{
+		"gemini-3.5-flash-lite": true,
+		"gemini-3.6-flash":      true,
+		"gemini-3.1-pro":        true,
+	}
+	for name := range canonicalWant {
+		if !canonical[name] {
+			t.Fatalf("expected %q to be canonical", name)
+		}
+	}
+	for name := range canonical {
+		if !canonicalWant[name] {
+			t.Fatalf("unexpected canonical model: %q", name)
+		}
+	}
 }
 
 func TestSetGenerationHeadersUsesModelSpecificMode(t *testing.T) {
@@ -532,30 +590,49 @@ func TestSetGenerationHeadersUsesModelSpecificMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(flashReq, "fbb127bbb056c959", "flash-req", "")
+	setGenerationHeaders(flashReq, modelIDFlash, "flash-req", "")
+
+	liteReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setGenerationHeaders(liteReq, modelIDFlashLite, "lite-req", "")
 
 	proReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(proReq, "9d8ca3786ebdfbea", "pro-req", "")
+	setGenerationHeaders(proReq, modelIDPro, "pro-req", "")
 
 	var flashHeader []interface{}
 	if err := json.Unmarshal([]byte(flashReq.Header.Get("x-goog-ext-525001261-jspb")), &flashHeader); err != nil {
 		t.Fatalf("unmarshal flash header: %v", err)
+	}
+	var liteHeader []interface{}
+	if err := json.Unmarshal([]byte(liteReq.Header.Get("x-goog-ext-525001261-jspb")), &liteHeader); err != nil {
+		t.Fatalf("unmarshal lite header: %v", err)
 	}
 	var proHeader []interface{}
 	if err := json.Unmarshal([]byte(proReq.Header.Get("x-goog-ext-525001261-jspb")), &proHeader); err != nil {
 		t.Fatalf("unmarshal pro header: %v", err)
 	}
 
+	if got := int(flashHeader[7].(float64)); got != 0 {
+		t.Fatalf("expected header index 7 = 0, got %d", got)
+	}
+	if got := int(flashHeader[11].(float64)); got != 2 {
+		t.Fatalf("expected header index 11 = 2, got %d", got)
+	}
 	if got := int(flashHeader[14].(float64)); got != 1 {
 		t.Fatalf("expected flash mode 1, got %d", got)
+	}
+	if got := int(liteHeader[14].(float64)); got != 6 {
+		t.Fatalf("expected lite mode 6, got %d", got)
 	}
 	if got := int(proHeader[14].(float64)); got != 3 {
 		t.Fatalf("expected pro mode 3, got %d", got)
 	}
-	if got := proHeader[4].(string); got != "9d8ca3786ebdfbea" {
+	if got := proHeader[4].(string); got != modelIDPro {
 		t.Fatalf("expected pro model id in header, got %q", got)
 	}
 }
@@ -565,13 +642,13 @@ func TestSetGenerationHeadersUsesThinkingLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(standardReq, "fbb127bbb056c959", "standard-req", "standard")
+	setGenerationHeaders(standardReq, modelIDFlash, "standard-req", "standard")
 
 	extendedReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(extendedReq, "fbb127bbb056c959", "extended-req", "extended")
+	setGenerationHeaders(extendedReq, modelIDFlash, "extended-req", "extended")
 
 	var standardHeader []interface{}
 	if err := json.Unmarshal([]byte(standardReq.Header.Get("x-goog-ext-525001261-jspb")), &standardHeader); err != nil {

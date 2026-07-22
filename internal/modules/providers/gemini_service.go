@@ -58,6 +58,7 @@ type Client struct {
 	maxRetries            int
 	cachedModels          []ModelInfo
 	cachedAliases         map[string]string
+	canonicalModels       map[string]bool // primary model names exposed via /v1/models
 	conversations         map[string]*SessionMetadata
 	conversationSeen      map[string]time.Time
 	conversationUntrusted map[string]bool
@@ -153,7 +154,7 @@ func NewClientForAccount(cfg *configs.Config, account configs.GeminiAccountConfi
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,
 	}
@@ -610,21 +611,29 @@ func (c *Client) refreshSessionTokenContext(parent context.Context) error {
 	return nil
 }
 
+// Live Gemini web model IDs captured from StreamGenerate
+// x-goog-ext-525001261-jspb on 2026-07-22.
+const (
+	modelIDFlashLite = "8c46e95b1a07cecc" // UI: 3.5 Flash-Lite
+	modelIDFlash     = "56fdd199312815e2" // UI: 3.6 Flash
+	modelIDPro       = "e6fa609c3fa255c0" // UI: 3.1 Pro
+)
+
 func (c *Client) refreshModels(body string) {
 	now := time.Now().Unix()
 
 	allModels := []ModelInfo{
-		{ID: "cf41b0e0dd7d53e5", Created: now, OwnedBy: "google", Provider: "gemini"},
-		{ID: "fbb127bbb056c959", Created: now, OwnedBy: "google", Provider: "gemini"},
-		{ID: "9d8ca3786ebdfbea", Created: now, OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDFlashLite, Created: now, OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDFlash, Created: now, OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDPro, Created: now, OwnedBy: "google", Provider: "gemini"},
 	}
 
 	// Also pick up gemini-advanced if available in page body
 	matches := modelIDRegex.FindAllString(body, -1)
 	seen := map[string]bool{
-		"cf41b0e0dd7d53e5": true,
-		"fbb127bbb056c959": true,
-		"9d8ca3786ebdfbea": true,
+		modelIDFlashLite: true,
+		modelIDFlash:     true,
+		modelIDPro:       true,
 	}
 	for _, id := range matches {
 		id = strings.Trim(id, `\"' `)
@@ -640,7 +649,7 @@ func (c *Client) refreshModels(body string) {
 	}
 
 	c.mu.Lock()
-	c.cachedModels, c.cachedAliases = resolveModels(allModels)
+	c.cachedModels, c.cachedAliases, c.canonicalModels = resolveModels(allModels)
 	c.mu.Unlock()
 
 	if len(c.cachedModels) == 0 {
@@ -654,10 +663,11 @@ func (c *Client) refreshModels(body string) {
 	}
 }
 
-func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string) {
+func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string, map[string]bool) {
 	seen := make(map[string]bool)
 	var models []ModelInfo
 	aliases := map[string]string{}
+	canonical := map[string]bool{}
 	for _, m := range all {
 		id := m.ID
 		if seen[id] {
@@ -667,15 +677,22 @@ func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string) {
 		models = append(models, m)
 
 		switch id {
-		case "cf41b0e0dd7d53e5":
+		case modelIDFlashLite:
+			aliases["gemini-3.5-flash-lite"] = id
+			canonical["gemini-3.5-flash-lite"] = true
+			// Backward-compatible alias from the previous UI name.
 			aliases["gemini-3.1-flash-lite"] = id
-		case "fbb127bbb056c959":
+		case modelIDFlash:
+			aliases["gemini-3.6-flash"] = id
+			canonical["gemini-3.6-flash"] = true
+			// Backward-compatible alias from the previous UI name.
 			aliases["gemini-3.5-flash"] = id
-		case "9d8ca3786ebdfbea":
+		case modelIDPro:
 			aliases["gemini-3.1-pro"] = id
+			canonical["gemini-3.1-pro"] = true
 		}
 	}
-	return models, aliases
+	return models, aliases, canonical
 }
 
 // startAutoRefresh periodically refreshes the PSIDTS cookie
@@ -1062,75 +1079,75 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	if config.SourcePath {
 		sourcePath = c.conversationSourcePath(config.ConversationID)
 	}
-	inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
+inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
 
-	innerJSON, _ := json.Marshal(inner)
-	outer := []interface{}{nil, string(innerJSON)}
-	outerJSON, _ := json.Marshal(outer)
+		innerJSON, _ := json.Marshal(inner)
+		outer := []interface{}{nil, string(innerJSON)}
+		outerJSON, _ := json.Marshal(outer)
 
-	// Encode form body manually to have full control over the request
-	formValues := url.Values{}
-	formValues.Set("at", at)
-	formValues.Set("f.req", string(outerJSON))
-	formBody := formValues.Encode()
+		// Encode form body manually to have full control over the request
+		formValues := url.Values{}
+		formValues.Set("at", at)
+		formValues.Set("f.req", string(outerJSON))
+		formBody := formValues.Encode()
 
-	queryValues := url.Values{}
-	queryValues.Set("at", at)
-	queryValues.Set("hl", language)
-	queryValues.Set("_reqid", c.nextRequestID())
-	queryValues.Set("rt", "c")
-	if sourcePath != "" {
-		queryValues.Set("source-path", sourcePath)
-	}
-	if buildLabel != "" {
-		queryValues.Set("bl", buildLabel)
-	}
-	if sessionID != "" {
-		queryValues.Set("f.sid", sessionID)
-	}
-	generateURL := EndpointGenerate + "?" + queryValues.Encode()
+		queryValues := url.Values{}
+		queryValues.Set("at", at)
+		queryValues.Set("hl", language)
+		queryValues.Set("_reqid", c.nextRequestID())
+		queryValues.Set("rt", "c")
+		if sourcePath != "" {
+			queryValues.Set("source-path", sourcePath)
+		}
+		if buildLabel != "" {
+			queryValues.Set("bl", buildLabel)
+		}
+		if sessionID != "" {
+			queryValues.Set("f.sid", sessionID)
+		}
+		generateURL := EndpointGenerate + "?" + queryValues.Encode()
 
-	maxAttempts := c.maxRetries
-	if maxAttempts <= 0 {
-		maxAttempts = 1
-	}
-	if maxAttempts > 2 {
-		maxAttempts = 2
-	}
+		maxAttempts := c.maxRetries
+		if maxAttempts <= 0 {
+			maxAttempts = 1
+		}
+		if maxAttempts > 2 {
+			maxAttempts = 2
+		}
 
-	totalStart := time.Now()
+		totalStart := time.Now()
 
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if attempt > 1 {
-			backoff := time.Duration(1<<uint(attempt-2)) * time.Second
-			c.log.Warn("Retrying GenerateContent",
-				zap.Int("attempt", attempt),
-				zap.Int("max_attempts", maxAttempts),
-				zap.Duration("backoff", backoff),
-				zap.Error(lastErr),
-			)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil, ctx.Err()
+		var lastErr error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if attempt > 1 {
+				backoff := time.Duration(1<<uint(attempt-2)) * time.Second
+				c.log.Warn("Retrying GenerateContent",
+					zap.Int("attempt", attempt),
+					zap.Int("max_attempts", maxAttempts),
+					zap.Duration("backoff", backoff),
+					zap.Error(lastErr),
+				)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
-		}
 
-		httpStart := time.Now()
+			httpStart := time.Now()
 
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", generateURL, strings.NewReader(formBody))
-		if err != nil {
-			lastErr = fmt.Errorf("failed to build generate request: %w", err)
-			continue
-		}
-		httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
-		httpReq.Header.Set("Origin", "https://gemini.google.com")
-		httpReq.Header.Set("Referer", "https://gemini.google.com/")
-		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		httpReq.Header.Set("X-Same-Domain", "1")
-		// Model ID + tracking headers are mandatory for streaming; see setGenerationHeaders.
-		setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel)
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", generateURL, strings.NewReader(formBody))
+			if err != nil {
+				lastErr = fmt.Errorf("failed to build generate request: %w", err)
+				continue
+			}
+			httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+			httpReq.Header.Set("Origin", "https://gemini.google.com")
+			httpReq.Header.Set("Referer", "https://gemini.google.com/")
+			httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			httpReq.Header.Set("X-Same-Domain", "1")
+			// Model ID + tracking headers are mandatory for streaming; see setGenerationHeaders.
+			setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel)
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
@@ -1235,8 +1252,11 @@ type StreamState struct {
 // Do not infer completion from a brief pause by default: Gemini can pause
 // between visible chunks while it continues generating.
 const defaultStreamFinishIdleTimeout = 0
-const defaultStreamFirstActivityTimeout = 15 * time.Second
-const defaultStreamProgressIdleTimeout = 30 * time.Second
+// First activity waits for either parsed generation progress (content/thinking)
+	// or an accepted conversation ACK (cid). Tool-bridge prompts are longer and
+	// can sit on the ACK chunk for more than the old 15s window.
+	const defaultStreamFirstActivityTimeout = 25 * time.Second
+	const defaultStreamProgressIdleTimeout = 45 * time.Second
 
 func (c *Client) GenerateContentStreamForOpenAI(ctx context.Context, prompt string, onEvent func(event StreamEvent) bool, options ...GenerateOption) error {
 	state := &StreamState{}
@@ -1432,9 +1452,9 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 			}
 		}
 
-		requestID := strings.ToUpper(uuid.NewString())
-		inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
-		innerJSON, _ := json.Marshal(inner)
+requestID := strings.ToUpper(uuid.NewString())
+			inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
+			innerJSON, _ := json.Marshal(inner)
 		outer := []interface{}{nil, string(innerJSON)}
 		outerJSON, _ := json.Marshal(outer)
 
@@ -1724,23 +1744,30 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 				if hasStreamTerminalEntry(parseBuffer) {
 					terminalObserved = true
 				}
-				if !continuityChecked || !metadataStored {
-					metadata := extractConversationMetadataFromBuffer(parseBuffer)
-					streamMetadata = mergeConversationMetadata(streamMetadata, metadata)
-					if cid, _ := metadata["cid"].(string); cid != "" {
-						if !continuityChecked {
-							if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
-								parserErr = err
-								return false
+if !continuityChecked || !metadataStored {
+						metadata := extractConversationMetadataFromBuffer(parseBuffer)
+						streamMetadata = mergeConversationMetadata(streamMetadata, metadata)
+						if cid, _ := metadata["cid"].(string); cid != "" {
+							// Conversation ACK proves the upstream accepted the request.
+							// Treat it as first activity so long tool-bridge prompts are
+							// not killed by first-activity timeout while waiting for text.
+							if !firstActivityObserved {
+								firstActivityObserved = true
+								lastProgressAt = time.Now()
 							}
-							continuityChecked = true
-						}
-						if !metadataStored {
-							c.updateConversation(config.ConversationID, metadata)
-							metadataStored = true
+							if !continuityChecked {
+								if err := c.checkConversationContinuity(config.ConversationID, expectedConversationCID, metadata, lastText != ""); err != nil {
+									parserErr = err
+									return false
+								}
+								continuityChecked = true
+							}
+							if !metadataStored {
+								c.updateConversation(config.ConversationID, metadata)
+								metadataStored = true
+							}
 						}
 					}
-				}
 				visit := onEvent(parseBuffer, "")
 				if visit.madeProgress {
 					firstActivityObserved = true
@@ -2293,60 +2320,63 @@ func resolveAvailableModel(requested string, models []ModelInfo) (string, bool) 
 }
 
 // buildGenerateInner constructs the inner JSON array for the StreamGenerate
-// request body. The structure (81 elements) mirrors exactly what the Gemini
-// web frontend sends, which is required for the server to respond in true
-// token-level streaming mode. If the structure deviates, the server silently
-// falls back to a batch mode that only returns the full response once
-// generation is complete (40-60s latency for long outputs).
-//
-// IMPORTANT: the model ID is NOT part of this structure. It is passed via the
-// x-goog-ext-525001261-jspb request header (see setGenerationHeaders).
-// inner[3] historically held the model in this codebase, but on the real web
-// client it carries an opaque conversation-context token. We leave it nil for
-// new conversations, and fill it only when callers opt into server-side context.
-func buildGenerateInner(prompt string, files []uploadedFile, language, requestID string, conversationMetadata []interface{}, conversationContext interface{}) []interface{} {
-	// inner[0]: message content.
-	// No attachments:  [prompt, 0, null, null, null, null, 0]
-	// With attachments:[prompt, 0, null, fileData, null, nil, 0]
-	var messageContent []interface{}
-	if len(files) == 0 {
-		messageContent = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
-	} else {
-		fileData := make([]interface{}, 0, len(files))
-		for _, file := range files {
-			fileData = append(fileData, []interface{}{[]interface{}{file.ID}, file.Name})
+	// request body. Live Gemini web (2026-07-22) sends a 92-element array. The
+	// model ID is still NOT part of this structure; it is passed via the
+	// x-goog-ext-525001261-jspb request header (see setGenerationHeaders).
+	//
+	// inner[3] carries an opaque conversation-context token on the real web
+	// client. We leave it nil for new conversations and fill it only when
+	// callers opt into server-side context.
+	//
+	// Field notes from live Pro StreamGenerate capture:
+	//   [6]=[1], [61]=[1], [68]=2, [79]=<mode>, [80]=1, [91]=0
+	// where [79] matches generationHeaderMode(model): Flash=1, Pro=3, Lite=6.
+	func buildGenerateInner(prompt string, files []uploadedFile, language, requestID, model string, conversationMetadata []interface{}, conversationContext interface{}) []interface{} {
+		// inner[0]: message content.
+		// No attachments:  [prompt, 0, null, null, null, null, 0]
+		// With attachments:[prompt, 0, null, fileData, null, nil, 0]
+		var messageContent []interface{}
+		if len(files) == 0 {
+			messageContent = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
+		} else {
+			fileData := make([]interface{}, 0, len(files))
+			for _, file := range files {
+				fileData = append(fileData, []interface{}{[]interface{}{file.ID}, file.Name})
+			}
+			messageContent = []interface{}{prompt, 0, nil, fileData, nil, nil, 0}
 		}
-		messageContent = []interface{}{prompt, 0, nil, fileData, nil, nil, 0}
-	}
 
-	defaultMetadata := []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
-	if len(conversationMetadata) > 0 {
-		defaultMetadata = conversationMetadata
-	}
+		defaultMetadata := []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
+		if len(conversationMetadata) > 0 {
+			defaultMetadata = conversationMetadata
+		}
 
-	// 81-element structure captured from the live web client (see debug_req_*).
-	inner := make([]interface{}, 81)
-	inner[0] = messageContent
-	inner[1] = []interface{}{language}
-	inner[2] = defaultMetadata
-	inner[3] = conversationContext // conversation-context token; nil for first turn
-	inner[4] = nil                 // response_id; assigned by server
-	inner[6] = []interface{}{0}
-	inner[7] = 1
-	inner[10] = 1
-	inner[11] = 0
-	inner[17] = []interface{}{[]interface{}{0}}
-	inner[27] = 1
-	inner[30] = []interface{}{4}
-	inner[41] = []interface{}{1}
-	inner[53] = 0
-	inner[59] = requestID
-	inner[61] = []interface{}{}
-	inner[68] = 1
-	inner[79] = 6
-	inner[80] = 1
-	return inner
-}
+		mode := generationHeaderMode(model)
+
+		// 92-element structure captured from the live web client (2026-07-22).
+		inner := make([]interface{}, 92)
+		inner[0] = messageContent
+		inner[1] = []interface{}{language}
+		inner[2] = defaultMetadata
+		inner[3] = conversationContext // conversation-context token; nil for first turn
+		inner[4] = nil                 // response_id / session nonce; assigned by server
+		inner[6] = []interface{}{1}
+		inner[7] = 1
+		inner[10] = 1
+		inner[11] = 0
+		inner[17] = []interface{}{[]interface{}{0}}
+		inner[27] = 1
+		inner[30] = []interface{}{4}
+		inner[41] = []interface{}{1}
+		inner[53] = 0
+		inner[59] = requestID
+		inner[61] = []interface{}{1}
+		inner[68] = 2
+		inner[79] = mode
+		inner[80] = 1
+		inner[91] = 0
+		return inner
+	}
 
 func (c *Client) conversationMetadata(id string) []interface{} {
 	id = strings.TrimSpace(id)
@@ -2835,44 +2865,46 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 }
 
 // setGenerationHeaders applies the x-goog-ext-* headers that the Gemini web
-// client sends with StreamGenerate. The model ID lives in
-// x-goog-ext-525001261-jspb (NOT in the request body); omitting these headers
-// causes the server to respond in non-streaming batch mode.
-//
-// Captured structure (debug_req_425):
-//
-//	x-goog-ext-525001261-jspb: [1,null,null,null,"<modelID>",null,null,0,[4,5,6,8],null,null,1,null,null,6,1,"<reqUUID>"]
-//	x-goog-ext-525005358-jspb: ["<reqUUID>",1]
-//	x-goog-ext-73010989-jspb:  [0]
-//	x-goog-ext-73010990-jspb:  [0,0,0]
-//
-// Newer Gemini web builds vary one field by model family. For gemini-3.1-pro,
-// the 15th element is 3 instead of 1 in live captures. The 16th element carries
-// the Flash thinking level: 1=standard, 2=extended.
-func setGenerationHeaders(req *http.Request, model, requestID, thinkingLevel string) {
-	mode := generationHeaderMode(model)
-	thinkingMode := generationThinkingMode(thinkingLevel)
-	modelExt := []interface{}{
-		1, nil, nil, nil, model, nil, nil, nil,
-		[]interface{}{4, 5, 6, 8}, nil, nil, nil, nil, nil, mode, thinkingMode, requestID,
+	// client sends with StreamGenerate. The model ID lives in
+	// x-goog-ext-525001261-jspb (NOT in the request body); omitting these headers
+	// causes the server to respond in non-streaming batch mode.
+	//
+	// Live capture structure (2026-07-22):
+	//
+	//	x-goog-ext-525001261-jspb: [1,null,null,null,"<modelID>",null,null,0,[4,5,6,8],null,null,2,null,null,<mode>,<thinking>,"<reqUUID>"]
+	//	x-goog-ext-525005358-jspb: ["<reqUUID>",1]
+	//	x-goog-ext-73010989-jspb:  [0]
+	//	x-goog-ext-73010990-jspb:  [0,0,0]
+	//
+	// Index 14 (mode) varies by model family:
+	//   1 = Flash (3.6 Flash)
+	//   3 = Pro (3.1 Pro)
+	//   6 = Lite (3.5 Flash-Lite)
+	// Index 15 carries the thinking level: 1=standard, 2=extended.
+	func setGenerationHeaders(req *http.Request, model, requestID, thinkingLevel string) {
+		mode := generationHeaderMode(model)
+		thinkingMode := generationThinkingMode(thinkingLevel)
+		modelExt := []interface{}{
+			1, nil, nil, nil, model, nil, nil, 0,
+			[]interface{}{4, 5, 6, 8}, nil, nil, 2, nil, nil, mode, thinkingMode, requestID,
+		}
+		req.Header.Set("x-goog-ext-525001261-jspb", jsonCompact(modelExt))
+		req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`[%q,1]`, requestID))
+		req.Header.Set("x-goog-ext-73010989-jspb", "[0]")
+		req.Header.Set("x-goog-ext-73010990-jspb", "[0,0,0]")
 	}
-	req.Header.Set("x-goog-ext-525001261-jspb", jsonCompact(modelExt))
-	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`[%q,1]`, requestID))
-	req.Header.Set("x-goog-ext-73010989-jspb", "[0]")
-	req.Header.Set("x-goog-ext-73010990-jspb", "[0,0,0]")
-}
 
-func generationHeaderMode(model string) int {
-	model = strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(model, "pro"), strings.Contains(model, "advanced"):
-		return 3
-	case model == "9d8ca3786ebdfbea":
-		return 3
-	default:
-		return 1
+	func generationHeaderMode(model string) int {
+		model = strings.ToLower(strings.TrimSpace(model))
+		switch {
+		case model == modelIDFlashLite, strings.Contains(model, "flash-lite"):
+			return 6
+		case model == modelIDPro, strings.Contains(model, "pro"), strings.Contains(model, "advanced"):
+			return 3
+		default:
+			return 1
+		}
 	}
-}
 
 func generationThinkingMode(level string) int {
 	switch strings.ToLower(strings.TrimSpace(level)) {
@@ -3582,6 +3614,9 @@ func (c *Client) ListModels() []ModelInfo {
 	var result []ModelInfo
 	ts := c.cachedModels[0].Created
 	for alias := range c.cachedAliases {
+		if c.canonicalModels != nil && !c.canonicalModels[alias] {
+			continue // hide backward-compat aliases
+		}
 		result = append(result, ModelInfo{
 			ID:       alias,
 			Created:  ts,

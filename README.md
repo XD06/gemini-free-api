@@ -98,7 +98,7 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 curl http://localhost:8787/openai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.6-flash",
     "stream": true,
     "messages": [{"role": "user", "content": "你好"}]
   }'
@@ -110,7 +110,7 @@ curl http://localhost:8787/openai/v1/chat/completions \
 curl http://localhost:8787/claude/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.6-flash",
     "stream": true,
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "你好"}]
@@ -120,7 +120,7 @@ curl http://localhost:8787/claude/v1/messages \
 **Gemini 原生格式**：
 
 ```bash
-curl http://localhost:8787/gemini/v1beta/models/gemini-3.5-flash:streamGenerateContent \
+curl http://localhost:8787/gemini/v1beta/models/gemini-3.6-flash:streamGenerateContent \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [{"parts": [{"text": "你好"}]}]
@@ -133,7 +133,7 @@ curl http://localhost:8787/gemini/v1beta/models/gemini-3.5-flash:streamGenerateC
 
 ```json
 {
-  "model": "gemini-3.5-flash",
+  "model": "gemini-3.6-flash",
   "reasoning_effort": "high",
   "stream": true,
   "messages": [{"role": "user", "content": "详细分析这个问题"}]
@@ -175,7 +175,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8787/openai/v1", api_key="not-needed")
 
 stream = client.chat.completions.create(
-    model="gemini-3.5-flash",
+    model="gemini-3.6-flash",
     stream=True,
     messages=[{"role": "user", "content": "你好"}],
 )
@@ -189,9 +189,9 @@ for chunk in stream:
 
 | 模型名 | 说明 |
 |:---|:---|
-| `gemini-3.5-flash` | UI 可见模型 |
-| `gemini-3.1-flash-lite` | UI 可见模型 |
-| `gemini-3.1-pro` | UI 可见模型 |
+| `gemini-3.6-flash` | UI 默认 Flash（兼容旧名 `gemini-3.5-flash`） |
+| `gemini-3.5-flash-lite` | UI Flash-Lite（兼容旧名 `gemini-3.1-flash-lite`） |
+| `gemini-3.1-pro` | UI Pro |
 
 需要深度思考时使用 Thinking Level 参数，而非依赖模型名后缀。
 

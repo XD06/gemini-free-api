@@ -116,7 +116,7 @@ func main() {
 
 	flag.StringVar(&baseURL, "base-url", "http://127.0.0.1:8787", "API base URL")
 	flag.StringVar(&token, "admin-token", os.Getenv("COOKIE_SYNC_TOKEN"), "admin token for /admin/*")
-	flag.StringVar(&model, "model", "gemini-3.5-flash", "model name")
+	flag.StringVar(&model, "model", "gemini-3.6-flash", "model name")
 	flag.StringVar(&scenariosCSV, "scenarios", "status,multiturn,stream,tool,bom,negative-cookie", "comma-separated scenarios: status,multiturn,truncated-history,stream,tool,bom,negative-cookie,rotation,audit-explicit")
 	flag.StringVar(&reportDir, "report-dir", "scratch/e2e-reports", "directory for JSON reports")
 	flag.StringVar(&invalidAccount, "invalid-account", "acc2", "account used by negative-cookie scenario")
