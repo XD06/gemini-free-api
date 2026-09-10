@@ -19,7 +19,7 @@
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少填写 COOKIE_SYNC_TOKEN
+# 编辑 .env，至少填写 GEMINI_1PSID 或 GEMINI_ACCOUNTS（configs.Validate() 强制要求）
 go run cmd/server/main.go
 ```
 
@@ -325,6 +325,32 @@ curl -X POST http://localhost:8787/admin/proxy-test \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"proxy_url":"http://host.docker.internal:10808"}'
 ```
+
+## 技术栈
+
+Go 1.25.1 + Fiber v3.2.0 + uber/fx 1.24.0（DI 组装）+ zap 日志 + req/v3 + godotenv（见 `go.mod`）。
+Node 仅用于 `tools/cookie-worker`（Playwright Cookie Worker），主服务无 `package.json`。
+
+## 项目结构
+
+- `cmd/server/` — 唯一入口（`fx.New` 组装）与 DI 图校验测试
+- `internal/server/` — Fiber 装配：`/health`、`/ready`、`/console`、`/docs`、`/openapi.json`、限流与 404
+- `internal/modules/openai|claude|gemini/` — 三协议适配（前缀 `/openai/v1`、`/claude/v1`、`/gemini/v1beta`）
+- `internal/modules/providers/` — Gemini Web 语义唯一所有者（`f.req`、流解析、账号池）
+- `internal/modules/admin/` — `/admin/*` 账号与请求记录管理
+- `internal/commons/configs/` — 配置唯一入口（`.env` + `GEMINI_*`）
+- `tools/e2e/` — 黑盒回归；`tools/cookie-worker/` — Playwright 兜底 Worker
+- `docs/` — 维护者文档；`docs/archive/` — 本地过期存档（永不提交）
+
+## 相关文档
+
+- 架构说明：`ARCHITECTURE.md`
+- 更新日志：`CHANGELOG.md`
+- AI 协作规范：`AGENTS.md`（仅本地，永不提交）
+- 技术细节与环境变量全表：`docs/technical-details.md`
+- 改动入口：`docs/core-bridge-handoff.md`
+- 流式链路：`docs/openai-gemini-stream-pipeline.md`
+- 上游协议漂移排查：`docs/upstream-protocol-drift-runbook.md`
 
 ## 开发
 

@@ -1,6 +1,32 @@
 # Changelog
 
-## [Unreleased] — 性能与可靠性优化
+> 遵循 Keep a Changelog：写给人看的变更摘要，细节以 `git log` 为准。
+> 本文件上次更新止于 `286d6ec`（2026-07-02）；之后条目按提交信息归纳。
+
+## [Unreleased]
+
+### 新增
+
+- **三协议真正流式输出**：Claude / Gemini 复用 provider 原生 stream 能力实时转发 delta，首字节延迟与 OpenAI 侧一致（`dd30994`）。
+- **请求记录看板**：控制台调用记录、首字节延迟列、账号列；统计改由前端计算（`0070213`、`caedb54`、`a687325`）。
+- **模型对齐线上**：canonical 三模型 `gemini-3.6-flash` / `gemini-3.5-flash-lite` / `gemini-3.1-pro`，旧名仅作兼容别名，`/models` 只暴露 canonical；e2e 默认模型同步切换（`10550c6`）。
+- **控制台与流韧性升级**：账号操作错误分类、stream timings、代理前置校验、Cookie/流状态可靠性（`9ebc237`、`db35f15`、`253b628`、`7fd2eb0`）。
+- **CI 质量门**：`go vet` + `go test` + `-race`（providers/openai）+ `govulncheck`（`e0f778e`）。
+
+### 修复
+
+- **Cookie 持久化与文件安全**：Cookie 缓存落盘与文件店安全性修复（`00c24f9`）。
+- **Bard 错误处理**：非流式 `BardErrorInfo` 检测、错误触发 Cookie 轮换并跳过无用重试；1060 语义回退到原始行为（`d6e39b6`、`0bd4018`、`12f3ec6`、`e91d3fe`）。
+- **流式重试对齐**：流式路径补重试循环，与非流式行为一致（`b01a273`）。
+- **流重置与重复日志**：修复 stream reset 错误、重复请求日志、流 handler 错误账号归属（`c8fcadd`、`6039824`）。
+- **控制台安全**：XSS 修复（账号 ID 事件委托 / Markdown URL 过滤 / title 转义）、认证前 401 刷屏、Playground 历史重构与流式取消（`a687325`）。
+- **初始化校验顺序**：优先直接 SNlM0e 校验而非 Cookie 轮换（`149c75b`）。
+
+### 变更
+
+- **流超时对齐线上**：默认首活动 15s→25s、进度空闲 30s→45s、响应头 15s→60s；会话 ACK 视为首活动（`10550c6`）。
+
+## [2026-07-02] — 性能与可靠性优化
 
 ### P0 — 严重 Bug 修复
 
