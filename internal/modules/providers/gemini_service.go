@@ -615,7 +615,7 @@ func (c *Client) refreshSessionTokenContext(parent context.Context) error {
 // x-goog-ext-525001261-jspb on 2026-07-22.
 const (
 	modelIDFlashLite = "8c46e95b1a07cecc" // UI: 3.5 Flash-Lite
-	modelIDFlash     = "56fdd199312815e2" // UI: 3.6 Flash
+	modelIDFlash     = "56fdd199312815e2" // UI: 3.8 Flash
 	modelIDPro       = "e6fa609c3fa255c0" // UI: 3.1 Pro
 )
 
@@ -683,9 +683,10 @@ func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string, map[string]
 			// Backward-compatible alias from the previous UI name.
 			aliases["gemini-3.1-flash-lite"] = id
 		case modelIDFlash:
+			aliases["gemini-3.8-flash"] = id
+			canonical["gemini-3.8-flash"] = true
+			// Backward-compatible aliases from previous UI names.
 			aliases["gemini-3.6-flash"] = id
-			canonical["gemini-3.6-flash"] = true
-			// Backward-compatible alias from the previous UI name.
 			aliases["gemini-3.5-flash"] = id
 		case modelIDPro:
 			aliases["gemini-3.1-pro"] = id
@@ -2877,7 +2878,7 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 	//	x-goog-ext-73010990-jspb:  [0,0,0]
 	//
 	// Index 14 (mode) varies by model family:
-	//   1 = Flash (3.6 Flash)
+	//   1 = Flash (3.8 Flash)
 	//   3 = Pro (3.1 Pro)
 	//   6 = Lite (3.5 Flash-Lite)
 	// Index 15 carries the thinking level: 1=standard, 2=extended.

@@ -9,7 +9,7 @@
 
 - **三协议真正流式输出**：Claude / Gemini 复用 provider 原生 stream 能力实时转发 delta，首字节延迟与 OpenAI 侧一致（`dd30994`）。
 - **请求记录看板**：控制台调用记录、首字节延迟列、账号列；统计改由前端计算（`0070213`、`caedb54`、`a687325`）。
-- **模型对齐线上**：canonical 三模型 `gemini-3.6-flash` / `gemini-3.5-flash-lite` / `gemini-3.1-pro`，旧名仅作兼容别名，`/models` 只暴露 canonical；e2e 默认模型同步切换（`10550c6`）。
+- **模型对齐线上**：canonical 三模型 `gemini-3.8-flash` / `gemini-3.5-flash-lite` / `gemini-3.1-pro`，旧名仅作兼容别名，`/models` 只暴露 canonical；e2e 默认模型同步切换（`10550c6`）。
 - **控制台与流韧性升级**：账号操作错误分类、stream timings、代理前置校验、Cookie/流状态可靠性（`9ebc237`、`db35f15`、`253b628`、`7fd2eb0`）。
 - **CI 质量门**：`go vet` + `go test` + `-race`（providers/openai）+ `govulncheck`（`e0f778e`）。
 

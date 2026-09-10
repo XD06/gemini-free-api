@@ -555,7 +555,8 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 	want := map[string]string{
 		"gemini-3.5-flash-lite": "8c46e95b1a07cecc",
 		"gemini-3.1-flash-lite": "8c46e95b1a07cecc", // backward-compatible
-		"gemini-3.6-flash":      "56fdd199312815e2",
+		"gemini-3.8-flash":      "56fdd199312815e2",
+		"gemini-3.6-flash":      "56fdd199312815e2", // backward-compatible
 		"gemini-3.5-flash":      "56fdd199312815e2", // backward-compatible
 		"gemini-3.1-pro":        "e6fa609c3fa255c0",
 	}
@@ -570,7 +571,7 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 
 	canonicalWant := map[string]bool{
 		"gemini-3.5-flash-lite": true,
-		"gemini-3.6-flash":      true,
+		"gemini-3.8-flash":      true,
 		"gemini-3.1-pro":        true,
 	}
 	for name := range canonicalWant {
