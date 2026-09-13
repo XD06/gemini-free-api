@@ -46,6 +46,8 @@ func (c *Controller) Register(group fiber.Router) {
 	group.Get("/requests", c.HandleListRequests)
 	group.Get("/requests/stats", c.HandleRequestStats)
 	group.Delete("/requests", c.HandleClearRequests)
+	group.Get("/settings", c.HandleGetSettings)
+	group.Post("/settings", c.HandleUpdateSettings)
 }
 
 func (c *Controller) HandleListAccounts(ctx fiber.Ctx) error {
@@ -401,6 +403,52 @@ func (c *Controller) HandleTestProxy(ctx fiber.Ctx) error {
 		"latency":   latency,
 		"http_code": resp.StatusCode,
 		"proxy_url": proxyURL,
+	})
+}
+
+// HandleGetSettings returns the runtime switches that the console can toggle.
+// incognito_source tells the UI whether the value comes from the console
+// ("runtime") or from the GEMINI_INCOGNITO .env default ("env").
+func (c *Controller) HandleGetSettings(ctx fiber.Ctx) error {
+	if err := c.requireToken(ctx); err != nil {
+		return err
+	}
+	return ctx.JSON(fiber.Map{
+		"incognito":        providers.IncognitoEnabled(),
+		"incognito_source": providers.IncognitoSource(),
+	})
+}
+
+type updateSettingsRequest struct {
+	Incognito *bool `json:"incognito"`
+}
+
+// HandleUpdateSettings flips a process-wide switch at runtime, so the operator
+// does not have to edit .env and restart. The change applies to every
+// subsequent request; a restart falls back to the .env default.
+func (c *Controller) HandleUpdateSettings(ctx fiber.Ctx) error {
+	if err := c.requireToken(ctx); err != nil {
+		return err
+	}
+
+	var req updateSettingsRequest
+	if err := ctx.Bind().Body(&req); err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("invalid request body: %w", err), "invalid_request_error"))
+	}
+	if req.Incognito == nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("no supported setting provided"), "invalid_request_error"))
+	}
+
+	value := providers.SetIncognito(*req.Incognito)
+	if c.log != nil {
+		c.log.Info("admin runtime setting updated",
+			zap.String("setting", "incognito"),
+			zap.Bool("value", value),
+		)
+	}
+	return ctx.JSON(fiber.Map{
+		"incognito":        value,
+		"incognito_source": providers.IncognitoSource(),
 	})
 }
 

@@ -456,6 +456,10 @@
         "gemini-free-api_internal_modules_claude_dto.MessageRequest": {
             "type": "object",
             "properties": {
+                "incognito": {
+                    "description": "Gemini web privacy mode (Temporary chat) for this request only. The web UI keeps no entry in recents and does not use the exchange for model improvement. Continuation still works: the same conversation_id maps to the same Gemini-side thread. The global GEMINI_INCOGNITO env switch enables it for every request; either one is enough.",
+                    "type": "boolean"
+                },
                 "max_tokens": {
                     "type": "integer"
                 },
@@ -651,6 +655,10 @@
                 },
                 "generationConfig": {
                     "$ref": "#/definitions/gemini-free-api_internal_modules_gemini_dto.GenerationConfig"
+                },
+                "incognito": {
+                    "description": "Gemini web privacy mode (Temporary chat) for this request only. The web UI keeps no entry in recents and does not use the exchange for model improvement. Continuation still works: the same conversation_id maps to the same Gemini-side thread. The global GEMINI_INCOGNITO env switch enables it for every request; either one is enough.",
+                    "type": "boolean"
                 },
                 "safety_settings": {
                     "type": "array",
@@ -861,6 +869,10 @@
                 "conversation_id": {
                     "description": "Optional OpenAI-compatible extension. Requests with the same ID reuse server-side Gemini web conversation context. If omitted, the server can also infer context from standard OpenAI messages history within the same process.",
                     "type": "string"
+                },
+                "incognito": {
+                    "description": "Gemini web privacy mode (Temporary chat) for this request only. The web UI keeps no entry in recents and does not use the exchange for model improvement. Continuation still works: the same conversation_id maps to the same Gemini-side thread. The global GEMINI_INCOGNITO env switch enables it for every request; either one is enough.",
+                    "type": "boolean"
                 },
                 "max_tokens": {
                     "type": "integer"

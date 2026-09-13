@@ -1,4 +1,4 @@
-# Gemini Web to API <img src="https://th.bing.com/th/id/ODF.nAWZa6qAQb-ILV5Rp8qOrw?w=32&amp;h=32&amp;qlt=90&amp;pcl=fffffa&amp;o=6&amp;pid=1.2" height="32" width="32" alt="logo" align="left" hspace="8" vspace="4">
+# Gemini Web API <img src="https://th.bing.com/th/id/ODF.nAWZa6qAQb-ILV5Rp8qOrw?w=32&amp;h=32&amp;qlt=90&amp;pcl=fffffa&amp;o=6&amp;pid=1.2" height="32" width="32" alt="logo" align="left" hspace="8" vspace="4">
 
 把 Gemini 网页端封装成 OpenAI / Claude / Gemini 兼容接口的本地代理服务。
 
@@ -14,6 +14,7 @@
 | 多轮上下文 | 实验性 | — | — |
 | 图片/文件输入 | ✅ | ✅ | ✅ |
 | 工具调用 | 实验性桥接 | 桥接 | 桥接 |
+| 隐私模式（网页端不留记录） | ✅ | ✅ | ✅ |
 
 ## 快速开始
 
@@ -39,6 +40,7 @@ go run cmd/server/main.go
 PORT=8787
 COOKIE_SYNC_TOKEN=你的管理密钥
 PROXY_URL=http://127.0.0.1:10808
+GEMINI_INCOGNITO=false   # 隐私模式启动默认值；控制台顶栏开关可运行时切换，无需改这里
 ```
 
 单账号模式直接填写 Cookie：
@@ -82,6 +84,37 @@ GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 控制台内置 Playground 聊天界面，支持模型切换、Thinking Level 调节和流式对话测试。
 
 ![Playground](./asset/playground.gif)
+
+### 隐私模式
+
+对齐 Gemini 网页端「临时对话」（Temporary chat）：**网页端不留记录**（侧栏不新增会话），该轮也不用于模型改进。
+
+控制台**顶栏的「隐私模式」开关**与 `.env` 的 `GEMINI_INCOGNITO` 是**同一个开关**：点一下立即对所有后续请求生效，无需改配置文件、无需重启。来源显示在按钮提示中（「控制台运行时设置」或「.env GEMINI_INCOGNITO」），重启后回落到 `.env` 默认值。
+
+![控制台隐私模式开关](./asset/console-incognito-global.png)
+
+两种开启方式，效果等价：
+
+| 方式 | 用法 |
+|:---|:---|
+| 控制台 | 顶栏点「隐私模式」开关，立即全局生效 |
+| 配置文件 | `.env` 设 `GEMINI_INCOGNITO=true`（默认值，重启后生效） |
+
+```env
+GEMINI_INCOGNITO=false   # 默认关闭
+```
+
+> 此外三协议请求体仍支持单请求 `"incognito": true`（OpenAI / Claude / Gemini），与全局开关是**或**关系——任一开启即走隐私路径。
+
+**续聊语义不变**：同一 `conversation_id` 仍映射到同一 Gemini 侧会话，多轮上下文照常可用，只是网页端不出现记录。
+
+上游请求差异（与网页端单变量基线逐位对齐）：
+
+| 位置 | 隐私关 | 隐私开 |
+|:---|:---|:---|
+| `f.req` inner[45] | `null` | `1` |
+| `f.req` inner[67] | `null` | `0` |
+| `x-goog-ext-525001261-jspb`[7] | `0` | `1` |
 
 ### 调用记录
 

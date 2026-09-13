@@ -77,6 +77,25 @@ Gemini Web 没有稳定的隐藏 system 字段。首轮会把 system 作为提�
 
 `GEMINI_USE_SOURCE_PATH=true` 可用于 A/B 排查续聊问题。
 
+## 隐私模式（Temporary chat）
+
+`GEMINI_INCOGNITO=true`（`.env` 默认值）或控制台顶栏「隐私模式」开关，会把生成按 Gemini Web「临时对话」下发：网页端不留下记录（侧栏 `recents` 不新增），该轮也不用于模型改进。
+
+- **控制台开关与 `.env` 是同一个开关**：`POST /admin/settings {"incognito":true}` 写入运行时设置（进程级、加锁），立即对后续所有请求生效，无需改 `.env`、无需重启。重启后回落到 `.env` 默认值。
+- 运行时设置由 `providers.RuntimeSettings`（`runtime_settings.go`，`sync.RWMutex`）持有，是进程内唯一可变态；请求路径读、admin 路径写，必须走锁。
+- `GET /admin/settings` 返回 `{"incognito":bool,"incognito_source":"env"|"runtime"}`；`incognito_source` 表明当前值来自 `.env` 还是控制台覆盖。
+- 优先级：控制台覆盖 > `.env` 默认；三协议请求体 `incognito: true` 与全局值为**或**关系（只加不减）。
+- **续聊语义不变**：同一 `conversation_id` 仍映射到同一 Gemini 侧会话，多轮上下文照常（本地已验证第二轮能回忆起第一轮内容）。
+- 上游差异（2026-09-10 网页单变量基线，同一账号/模型/提示词，仅切换 Temporary chat）：
+
+| 位置 | 隐私关 | 隐私开 |
+|:---|:---|:---|
+| `f.req` inner[45] | `null` | `1` |
+| `f.req` inner[67] | `null` | `0` |
+| `x-goog-ext-525001261-jspb[7]` | `0` | `1` |
+
+其余字段（模型 ID、URL query key、inner 长度 92、其他 `x-goog-ext-*` 索引）无差异；`inner[3]`/`inner[4]`/`inner[59]` 为每次随机的 token/UUID，与隐私语义无关。
+
 ## 排错开关
 
 涉及 Thinking 档位、思考内容路径或 Gemini Web 请求结构变化时，先按 [上游协议漂移排查手册](upstream-protocol-drift-runbook.md) 做网页基线和本地 raw/SSE 分层对照。
@@ -267,3 +286,4 @@ go run ./tools/e2e \
 | `GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS` | `30000` | 思考已开始、正文未出现时的连续无进度最大等待 |
 | `GEMINI_WEB_STREAM_QUERY` | `false` | 强制带 Gemini Web 流式查询参数 |
 | `OPENAI_CONTEXT_LOCAL_FALLBACK` | `true` | 服务端会话不可信时从本地历史重建 |
+| `GEMINI_INCOGNITO` | `false` | 网页端隐私模式（Temporary chat）的启动默认值；控制台顶栏开关可运行时覆盖（`/admin/settings`），三协议请求体 `incognito` 字段可单请求开启 |

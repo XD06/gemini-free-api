@@ -591,19 +591,19 @@ func TestSetGenerationHeadersUsesModelSpecificMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(flashReq, modelIDFlash, "flash-req", "")
+	setGenerationHeaders(flashReq, modelIDFlash, "flash-req", "", false)
 
 	liteReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(liteReq, modelIDFlashLite, "lite-req", "")
+	setGenerationHeaders(liteReq, modelIDFlashLite, "lite-req", "", false)
 
 	proReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(proReq, modelIDPro, "pro-req", "")
+	setGenerationHeaders(proReq, modelIDPro, "pro-req", "", false)
 
 	var flashHeader []interface{}
 	if err := json.Unmarshal([]byte(flashReq.Header.Get("x-goog-ext-525001261-jspb")), &flashHeader); err != nil {
@@ -643,13 +643,13 @@ func TestSetGenerationHeadersUsesThinkingLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(standardReq, modelIDFlash, "standard-req", "standard")
+	setGenerationHeaders(standardReq, modelIDFlash, "standard-req", "standard", false)
 
 	extendedReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(extendedReq, modelIDFlash, "extended-req", "extended")
+	setGenerationHeaders(extendedReq, modelIDFlash, "extended-req", "extended", false)
 
 	var standardHeader []interface{}
 	if err := json.Unmarshal([]byte(standardReq.Header.Get("x-goog-ext-525001261-jspb")), &standardHeader); err != nil {
@@ -665,6 +665,81 @@ func TestSetGenerationHeadersUsesThinkingLevel(t *testing.T) {
 	}
 	if got := int(extendedHeader[15].(float64)); got != 2 {
 		t.Fatalf("expected extended thinking mode 2, got %d", got)
+	}
+}
+
+// TestApplyIncognitoMatchesLiveWebCapture pins the two inner-array markers that
+// the Gemini web client changes when "Temporary chat" is enabled. Baseline was
+// captured on 2026-09-10 with the same account, model and prompt, toggling only
+// the Temporary chat switch: off = inner[45]null / inner[67]null,
+// on = inner[45]1 / inner[67]0.
+func TestApplyIncognitoMatchesLiveWebCapture(t *testing.T) {
+	inner := buildGenerateInner("hi", nil, "en", "req-incognito", modelIDFlash, nil, nil)
+
+	if inner[45] != nil || inner[67] != nil {
+		t.Fatalf("expected incognito markers unset by default, got inner[45]=%#v inner[67]=%#v", inner[45], inner[67])
+	}
+
+	applyIncognito(inner)
+
+	if inner[45] != 1 {
+		t.Fatalf("expected inner[45]=1 for incognito, got %#v", inner[45])
+	}
+	if inner[67] != 0 {
+		t.Fatalf("expected inner[67]=0 for incognito, got %#v", inner[67])
+	}
+	if len(inner) != 92 {
+		t.Fatalf("expected 92-element inner preserved, got %d", len(inner))
+	}
+}
+
+func TestApplyIncognitoIgnoresShortArrays(t *testing.T) {
+	inner := make([]interface{}, 10)
+	applyIncognito(inner)
+	if len(inner) != 10 {
+		t.Fatalf("expected short array length preserved, got %d", len(inner))
+	}
+}
+
+// TestSetGenerationHeadersUsesIncognitoFlag pins header index 7, the only
+// index that changed in the 2026-09-10 Temporary chat baseline.
+func TestSetGenerationHeadersUsesIncognitoFlag(t *testing.T) {
+	normalReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setGenerationHeaders(normalReq, modelIDFlash, "normal-req", "", false)
+
+	incognitoReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setGenerationHeaders(incognitoReq, modelIDFlash, "incognito-req", "", true)
+
+	var normalHeader []interface{}
+	if err := json.Unmarshal([]byte(normalReq.Header.Get("x-goog-ext-525001261-jspb")), &normalHeader); err != nil {
+		t.Fatalf("unmarshal normal header: %v", err)
+	}
+	var incognitoHeader []interface{}
+	if err := json.Unmarshal([]byte(incognitoReq.Header.Get("x-goog-ext-525001261-jspb")), &incognitoHeader); err != nil {
+		t.Fatalf("unmarshal incognito header: %v", err)
+	}
+
+	if got := int(normalHeader[7].(float64)); got != 0 {
+		t.Fatalf("expected normal header index 7 = 0, got %d", got)
+	}
+	if got := int(incognitoHeader[7].(float64)); got != 1 {
+		t.Fatalf("expected incognito header index 7 = 1, got %d", got)
+	}
+	// The incognito toggle must not disturb any other header index.
+	if got := int(incognitoHeader[11].(float64)); got != 2 {
+		t.Fatalf("expected header index 11 = 2 unchanged, got %d", got)
+	}
+	if got := int(incognitoHeader[14].(float64)); got != 1 {
+		t.Fatalf("expected flash mode 1 unchanged, got %d", got)
+	}
+	if got := incognitoHeader[4].(string); got != modelIDFlash {
+		t.Fatalf("expected model id unchanged, got %q", got)
 	}
 }
 

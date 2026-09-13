@@ -1,6 +1,8 @@
 package providers
 
-import "context"
+import (
+	"context"
+)
 
 // Provider defines the interface that all AI providers must implement
 type Provider interface {
@@ -97,6 +99,7 @@ type GenerateConfig struct {
 	ThinkingLevel  string
 	ConversationID string
 	SourcePath     bool
+	Incognito      bool
 }
 
 // InputFile is an in-memory file to upload with a generation request.
@@ -158,6 +161,17 @@ func WithConversationID(id string) GenerateOption {
 func WithSourcePath(enabled bool) GenerateOption {
 	return func(c *GenerateConfig) {
 		c.SourcePath = enabled
+	}
+}
+
+// WithIncognito controls whether the request is sent as a Gemini Web
+// "Temporary chat" (incognito) turn: the web UI keeps no entry in recents and
+// does not use the exchange for model improvement. Continuation semantics are
+// unchanged — the same conversation_id still resolves to the same Gemini-side
+// thread and multi-turn context keeps working.
+func WithIncognito(enabled bool) GenerateOption {
+	return func(c *GenerateConfig) {
+		c.Incognito = enabled
 	}
 }
 

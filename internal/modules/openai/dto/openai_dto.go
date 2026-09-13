@@ -288,6 +288,10 @@ type ChatCompletionRequest struct {
 	ReasoningEffort string                  `json:"reasoning_effort,omitempty"`
 	ThinkingLevel   string                  `json:"thinking_level,omitempty"`
 	ConversationID  string                  `json:"conversation_id,omitempty"`
+	// Incognito requests Gemini Web "Temporary chat" (privacy) mode for this
+	// request only: the web UI keeps no entry in recents. The provider also
+	// honors the global GEMINI_INCOGNITO env switch; either one enables it.
+	Incognito bool `json:"incognito,omitempty"`
 }
 
 func (r ChatCompletionRequest) ToModelMessages() []models.Message {

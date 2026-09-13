@@ -23,6 +23,10 @@ type GeminiGenerateRequest struct {
 	ToolConfig       *ToolConfig         `json:"tool_config,omitempty"`
 	GenerationConfig *GenerationConfig   `json:"generationConfig,omitempty"`
 	Safety           []map[string]string `json:"safety_settings,omitempty"`
+	// Incognito requests Gemini Web "Temporary chat" (privacy) mode for this
+	// request only: the web UI keeps no entry in recents. The global
+	// GEMINI_INCOGNITO env switch also enables it; either one is enough.
+	Incognito bool `json:"incognito,omitempty"`
 }
 
 // Content represents a content block in Gemini API

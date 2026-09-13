@@ -12,6 +12,7 @@
 - **模型对齐线上**：canonical 三模型 `gemini-3.8-flash` / `gemini-3.5-flash-lite` / `gemini-3.1-pro`，旧名仅作兼容别名，`/models` 只暴露 canonical；e2e 默认模型同步切换（`10550c6`）。
 - **控制台与流韧性升级**：账号操作错误分类、stream timings、代理前置校验、Cookie/流状态可靠性（`9ebc237`、`db35f15`、`253b628`、`7fd2eb0`）。
 - **CI 质量门**：`go vet` + `go test` + `-race`（providers/openai）+ `govulncheck`（`e0f778e`）。
+- **网页端隐私模式（Temporary chat）**：新增 `GEMINI_INCOGNITO` 全局开关（默认 false）与控制台顶栏「隐私模式」运行时开关（同一开关，`GET|POST /admin/settings`，无需改 `.env`、无需重启），三协议请求体支持 `incognito` 字段。开启后上游请求带网页基线对齐的隐私标记（`inner[45]=1`、`inner[67]=0`、`x-goog-ext-525001261-jspb[7]=1`），网页端不留记录；`conversation_id` 语义不变，续聊照常。
 
 ### 修复
 

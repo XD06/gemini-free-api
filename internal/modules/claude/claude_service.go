@@ -56,6 +56,9 @@ func (s *ClaudeService) GenerateMessage(ctx context.Context, req dto.MessageRequ
 	if req.Model != "" {
 		opts = append(opts, providers.WithModel(req.Model))
 	}
+	if req.Incognito || providers.IncognitoEnabled() {
+		opts = append(opts, providers.WithIncognito(true))
+	}
 	inputFiles, err := providers.InputFilesFromAttachments(req.Messages)
 	if err != nil {
 		return nil, err
@@ -126,6 +129,9 @@ func (s *ClaudeService) GenerateMessageStream(ctx context.Context, req dto.Messa
 	opts := []providers.GenerateOption{}
 	if req.Model != "" {
 		opts = append(opts, providers.WithModel(req.Model))
+	}
+	if req.Incognito || providers.IncognitoEnabled() {
+		opts = append(opts, providers.WithIncognito(true))
 	}
 	inputFiles, err := providers.InputFilesFromAttachments(req.Messages)
 	if err != nil {

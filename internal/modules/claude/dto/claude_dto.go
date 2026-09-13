@@ -14,6 +14,10 @@ type MessageRequest struct {
 	Stream    bool             `json:"stream,omitempty"`
 	Tools     []Tool           `json:"tools,omitempty"`
 	ToolChoice *ToolChoice     `json:"tool_choice,omitempty"`
+	// Incognito requests Gemini Web "Temporary chat" (privacy) mode for this
+	// request only: the web UI keeps no entry in recents. The global
+	// GEMINI_INCOGNITO env switch also enables it; either one is enough.
+	Incognito bool `json:"incognito,omitempty"`
 }
 
 // Tool represents a tool available to the model

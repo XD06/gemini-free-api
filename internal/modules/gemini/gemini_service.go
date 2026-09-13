@@ -71,6 +71,9 @@ func (s *GeminiService) GenerateContent(ctx context.Context, modelID string, req
 	if len(inputFiles) > 0 {
 		opts = append(opts, providers.WithInputFiles(inputFiles))
 	}
+	if req.Incognito || providers.IncognitoEnabled() {
+		opts = append(opts, providers.WithIncognito(true))
+	}
 	response, err := s.client.GenerateContent(ctx, prompt, opts...)
 	if err != nil {
 		return nil, err
@@ -182,6 +185,9 @@ func (s *GeminiService) GenerateContentStream(ctx context.Context, modelID strin
 	opts := []providers.GenerateOption{providers.WithModel(modelID)}
 	if len(inputFiles) > 0 {
 		opts = append(opts, providers.WithInputFiles(inputFiles))
+	}
+	if req.Incognito || providers.IncognitoEnabled() {
+		opts = append(opts, providers.WithIncognito(true))
 	}
 
 	if hasTools {

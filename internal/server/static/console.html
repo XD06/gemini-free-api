@@ -1685,6 +1685,10 @@ body.overlay-open { overflow: hidden; }
         <svg viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.24-4.24M14 8a6 6 0 01-10.24 4.24M12 2v4h-4M4 14v-4h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span class="optional-label">刷新</span>
       </button>
+      <button class="token-pill" id="incognitoPill" type="button" onclick="toggleIncognito()" title="隐私模式（Temporary chat）：网页端不留记录。与 .env 的 GEMINI_INCOGNITO 同一开关，切换立即对所有请求生效">
+        <span class="token-dot"></span>
+        <span id="incognitoText">隐私模式：关</span>
+      </button>
     </div>
   </header>
 
@@ -2008,6 +2012,7 @@ const State = {
   accounts: [],
   editing: null,
   refreshTimer: null,
+  incognito: false,
 };
 
 // ===== Token management =====
@@ -2530,6 +2535,56 @@ function pgKeydown(e) {
     e.preventDefault();
     pgSend();
   }
+}
+
+// ===== Runtime settings (privacy mode) =====
+// These read/write GET|POST /admin/settings, which flips the same process-wide
+// switch as the GEMINI_INCOGNITO .env key — one toggle applies to every
+// subsequent request, no .env edit and no restart.
+async function fetchSettings() {
+  try {
+    const res = await fetch('/admin/settings', { headers: apiHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    renderIncognito(data.incognito, data.incognito_source);
+  } catch (e) { /* non-fatal: keep the default label */ }
+}
+
+async function toggleIncognito() {
+  const next = !State.incognito;
+  const pill = document.getElementById('incognitoPill');
+  if (pill) pill.disabled = true;
+  try {
+    const res = await fetch('/admin/settings', {
+      method: 'POST',
+      headers: apiHeaders(),
+      body: JSON.stringify({ incognito: next })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(adminErrorMessage(data, '设置失败 (HTTP ' + res.status + ')'), 'err');
+      return;
+    }
+    renderIncognito(data.incognito, data.incognito_source);
+    toast(data.incognito ? '隐私模式已开启，后续请求网页端不留记录' : '隐私模式已关闭', 'ok');
+  } catch (e) {
+    toast('设置失败: ' + e.message, 'err');
+  } finally {
+    if (pill) pill.disabled = false;
+  }
+}
+
+function renderIncognito(enabled, source) {
+  State.incognito = !!enabled;
+  const pill = document.getElementById('incognitoPill');
+  const text = document.getElementById('incognitoText');
+  if (pill) {
+    pill.classList.toggle('active', !!enabled);
+    pill.title = '隐私模式（Temporary chat）：网页端不留记录。当前来源：' +
+      (source === 'runtime' ? '控制台运行时设置' : '.env GEMINI_INCOGNITO') +
+      '。切换立即对所有请求生效';
+  }
+  if (text) text.textContent = enabled ? '隐私模式：开' : '隐私模式：关';
 }
 
 function escapeHtml(text) {
@@ -3130,6 +3185,7 @@ async function verifyAndEnter() {
     startRequestRefresh();
     const initial = ['accounts', 'playground', 'requests'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'accounts';
     switchTab(initial, false);
+    fetchSettings();
   } catch (error) {
     if (gateError) gateError.textContent = error.message;
     document.getElementById('appGate').style.display = 'block';

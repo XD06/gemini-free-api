@@ -1081,7 +1081,9 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		sourcePath = c.conversationSourcePath(config.ConversationID)
 	}
 inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
-
+if config.Incognito {
+	applyIncognito(inner)
+}
 		innerJSON, _ := json.Marshal(inner)
 		outer := []interface{}{nil, string(innerJSON)}
 		outerJSON, _ := json.Marshal(outer)
@@ -1148,7 +1150,7 @@ inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolved
 			httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 			httpReq.Header.Set("X-Same-Domain", "1")
 			// Model ID + tracking headers are mandatory for streaming; see setGenerationHeaders.
-			setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel)
+			setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel, config.Incognito)
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
@@ -1455,6 +1457,9 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 
 requestID := strings.ToUpper(uuid.NewString())
 			inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
+			if config.Incognito {
+				applyIncognito(inner)
+			}
 			innerJSON, _ := json.Marshal(inner)
 		outer := []interface{}{nil, string(innerJSON)}
 		outerJSON, _ := json.Marshal(outer)
@@ -1490,7 +1495,7 @@ requestID := strings.ToUpper(uuid.NewString())
 		httpReq.Header.Set("Referer", "https://gemini.google.com/")
 		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		httpReq.Header.Set("X-Same-Domain", "1")
-		setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel)
+		setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel, config.Incognito)
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
@@ -2332,6 +2337,9 @@ func resolveAvailableModel(requested string, models []ModelInfo) (string, bool) 
 	// Field notes from live Pro StreamGenerate capture:
 	//   [6]=[1], [61]=[1], [68]=2, [79]=<mode>, [80]=1, [91]=0
 	// where [79] matches generationHeaderMode(model): Flash=1, Pro=3, Lite=6.
+	//
+	// inner[45] / inner[67] are Gemini Web "Temporary chat" markers; see
+	// applyIncognito for the captured values.
 	func buildGenerateInner(prompt string, files []uploadedFile, language, requestID, model string, conversationMetadata []interface{}, conversationContext interface{}) []interface{} {
 		// inner[0]: message content.
 		// No attachments:  [prompt, 0, null, null, null, null, 0]
@@ -2378,6 +2386,25 @@ func resolveAvailableModel(requested string, models []ModelInfo) (string, bool) 
 		inner[91] = 0
 		return inner
 	}
+
+// applyIncognito marks the inner array as a Gemini Web "Temporary chat" turn.
+//
+// Live web single-variable baseline (2026-09-10, same account / model / prompt,
+// only the Temporary chat toggle changed):
+//
+//	incognito off: inner[45]=null, inner[67]=null
+//	incognito on : inner[45]=1,    inner[67]=0
+//
+// The same values were observed on both the first turn and the follow-up turn
+// of an incognito conversation, so they are stable markers rather than
+// per-request nonces. Everything else in the 92-element array is unchanged.
+func applyIncognito(inner []interface{}) {
+	if len(inner) <= 67 {
+		return
+	}
+	inner[45] = 1
+	inner[67] = 0
+}
 
 func (c *Client) conversationMetadata(id string) []interface{} {
 	id = strings.TrimSpace(id)
@@ -2882,11 +2909,19 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 	//   3 = Pro (3.1 Pro)
 	//   6 = Lite (3.5 Flash-Lite)
 	// Index 15 carries the thinking level: 1=standard, 2=extended.
-	func setGenerationHeaders(req *http.Request, model, requestID, thinkingLevel string) {
+	//
+	// Index 7 is the Gemini Web "Temporary chat" flag (captured 2026-09-10):
+	// 0 = normal chat, 1 = incognito. It is the only header index that changes
+	// when the Temporary chat toggle is flipped.
+	func setGenerationHeaders(req *http.Request, model, requestID, thinkingLevel string, incognito bool) {
 		mode := generationHeaderMode(model)
 		thinkingMode := generationThinkingMode(thinkingLevel)
+		incognitoFlag := 0
+		if incognito {
+			incognitoFlag = 1
+		}
 		modelExt := []interface{}{
-			1, nil, nil, nil, model, nil, nil, 0,
+			1, nil, nil, nil, model, nil, nil, incognitoFlag,
 			[]interface{}{4, 5, 6, 8}, nil, nil, 2, nil, nil, mode, thinkingMode, requestID,
 		}
 		req.Header.Set("x-goog-ext-525001261-jspb", jsonCompact(modelExt))

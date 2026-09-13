@@ -82,6 +82,16 @@ func geminiSourcePathEnabled() bool {
 	}
 }
 
+// geminiIncognitoEnabled reports whether privacy mode (Gemini Web "Temporary
+// chat") is on for this process. It reads the runtime settings store, so the
+// /console toggle and the GEMINI_INCOGNITO .env default are the same switch —
+// flipping the console one applies to every following request with no restart
+// and no .env edit. A request that sets `incognito: true` also turns it on for
+// that request only; the values are OR-ed and can only add.
+func geminiIncognitoEnabled() bool {
+	return providers.IncognitoEnabled()
+}
+
 // openAILocalFallbackEnabled controls whether a provider conversation flagged
 // untrusted is treated as not-reusable, forcing the next turn to rebuild the
 // prompt from the locally retained full history. Defaults to enabled so the
@@ -180,6 +190,9 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
 	}
 	if geminiSourcePathEnabled() {
 		baseOpts = append(baseOpts, providers.WithSourcePath(true))
+	}
+	if geminiIncognitoEnabled() || req.Incognito {
+		baseOpts = append(baseOpts, providers.WithIncognito(true))
 	}
 	opts := append([]providers.GenerateOption{}, baseOpts...)
 	if contextPlan.ProviderConversationID != "" {
@@ -474,6 +487,9 @@ func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.
 	}
 	if geminiSourcePathEnabled() {
 		baseOpts = append(baseOpts, providers.WithSourcePath(true))
+	}
+	if geminiIncognitoEnabled() || req.Incognito {
+		baseOpts = append(baseOpts, providers.WithIncognito(true))
 	}
 	opts := append([]providers.GenerateOption{}, baseOpts...)
 	if contextPlan.ProviderConversationID != "" {
