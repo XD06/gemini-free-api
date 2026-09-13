@@ -2415,11 +2415,41 @@ func (s *OpenAIService) parseToolBridgePlan(req dto.ChatCompletionRequest, text 
 		return toolBridgePlan{Err: fmt.Errorf("empty tool planner output")}
 	}
 
-	payload, ok := decodeToolBridgePayload(cleaned)
-	if !ok {
-		return toolBridgePlan{Content: strings.TrimSpace(text), Err: fmt.Errorf("tool planner output is not valid JSON")}
+	// Fast path: the entire (fence-stripped) output is a single JSON object.
+	var payload toolBridgePayload
+	if err := json.Unmarshal([]byte(cleaned), &payload); err == nil {
+		if plan := validateToolBridgePayload(req, payload, text); plan.Err == nil {
+			return plan
+		}
 	}
-	return validateToolBridgePayload(req, payload, text)
+
+	// Otherwise scan every top-level JSON object and keep the first one that
+	// actually validates. A single greedy "first balanced object" match is not
+	// enough: models sometimes emit an example object before the real planner
+	// payload ("Example: {...} real: {...}"), and betting on the first one would
+	// reject an otherwise usable tool call.
+	var firstErr error
+	for _, candidate := range extractJSONObjectCandidates(cleaned) {
+		var candidatePayload toolBridgePayload
+		if err := json.Unmarshal([]byte(candidate), &candidatePayload); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		plan := validateToolBridgePayload(req, candidatePayload, text)
+		if plan.Err == nil {
+			return plan
+		}
+		if firstErr == nil {
+			firstErr = plan.Err
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = fmt.Errorf("tool planner output is not valid JSON")
+	}
+	return toolBridgePlan{Content: strings.TrimSpace(text), Err: firstErr}
 }
 
 func validateToolBridgePayload(req dto.ChatCompletionRequest, payload toolBridgePayload, originalText string) toolBridgePlan {
@@ -2543,28 +2573,37 @@ func chunkToolCalls(calls []dto.ChatCompletionToolCall) []dto.ChatCompletionChun
 	return out
 }
 
-func decodeToolBridgePayload(text string) (toolBridgePayload, bool) {
-	var payload toolBridgePayload
-	if err := json.Unmarshal([]byte(text), &payload); err == nil {
-		return payload, true
+// extractJSONObjectCandidates returns every top-level balanced JSON object found
+// in text, in order. Callers validate each candidate so that a decoy object
+// earlier in the output cannot mask a valid planner payload later on.
+//
+// Objects left unterminated (e.g. a response cut off mid-JSON) are skipped
+// rather than half-recovered: repairing a truncated object would mean guessing
+// at missing keys, and tool arguments must never be guessed.
+func extractJSONObjectCandidates(text string) []string {
+	var out []string
+	for i := 0; i < len(text); {
+		if text[i] != '{' {
+			i++
+			continue
+		}
+		end := matchingJSONObjectEnd(text, i)
+		if end < 0 {
+			break
+		}
+		out = append(out, strings.TrimSpace(text[i:end+1]))
+		i = end + 1
 	}
-
-	obj := extractFirstJSONObject(text)
-	if obj == "" {
-		return toolBridgePayload{}, false
-	}
-	if err := json.Unmarshal([]byte(obj), &payload); err != nil {
-		return toolBridgePayload{}, false
-	}
-	return payload, true
+	return out
 }
 
-func extractFirstJSONObject(text string) string {
-	start := strings.Index(text, "{")
-	if start < 0 {
-		return ""
+// matchingJSONObjectEnd returns the index of the brace closing the object that
+// starts at start, honoring string literals and escapes so that braces inside
+// strings do not affect nesting depth.
+func matchingJSONObjectEnd(text string, start int) int {
+	if start < 0 || start >= len(text) || text[start] != '{' {
+		return -1
 	}
-
 	depth := 0
 	inString := false
 	escaped := false
@@ -2593,15 +2632,18 @@ func extractFirstJSONObject(text string) string {
 		case '}':
 			depth--
 			if depth == 0 {
-				return strings.TrimSpace(text[start : i+1])
+				return i
 			}
 		}
 	}
-	return ""
+	return -1
 }
 
 func validateAndNormalizeToolArguments(raw json.RawMessage, schemaRaw json.RawMessage) (string, error) {
-	normalized := normalizeArguments(raw)
+	normalized, err := normalizeArguments(raw)
+	if err != nil {
+		return "", err
+	}
 	var args interface{}
 	if err := json.Unmarshal([]byte(normalized), &args); err != nil {
 		return "", fmt.Errorf("arguments are not valid JSON: %w", err)
@@ -2746,10 +2788,20 @@ func schemaStringSlice(raw interface{}) []string {
 	return out
 }
 
-func normalizeArguments(raw json.RawMessage) string {
+// normalizeArguments canonicalizes tool-call arguments and reports a malformed
+// payload as an error.
+//
+// It deliberately does not fall back to "{}" when the JSON cannot be parsed:
+// tool calls can have side effects, and an unparseable payload means the model
+// produced something we did not understand. Silently substituting empty
+// arguments would execute the tool with wrong (missing) inputs and look like a
+// successful call to the client. Absent arguments ("" / "null") still map to
+// "{}" because that is the legitimate no-argument encoding. Callers turn the
+// error into a repair round-trip.
+func normalizeArguments(raw json.RawMessage) (string, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
-		return "{}"
+		return "{}", nil
 	}
 
 	if strings.HasPrefix(trimmed, "\"") {
@@ -2757,26 +2809,26 @@ func normalizeArguments(raw json.RawMessage) string {
 		if err := json.Unmarshal(raw, &asString); err == nil {
 			trimmed = strings.TrimSpace(asString)
 			if trimmed == "" {
-				return "{}"
+				return "{}", nil
 			}
 		}
 	}
 
 	var parsed interface{}
 	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
-		return "{}"
+		return "", fmt.Errorf("arguments are not valid JSON: %w", err)
 	}
 	parsed = sanitizeToolArgumentValue(parsed)
 
 	sanitized, err := json.Marshal(parsed)
 	if err != nil {
-		return "{}"
+		return "", fmt.Errorf("arguments could not be re-encoded: %w", err)
 	}
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, sanitized); err != nil {
-		return "{}"
+		return "", fmt.Errorf("arguments could not be compacted: %w", err)
 	}
-	return compact.String()
+	return compact.String(), nil
 }
 
 func sanitizeToolArgumentValue(value interface{}) interface{} {

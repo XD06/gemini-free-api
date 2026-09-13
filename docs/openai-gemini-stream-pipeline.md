@@ -220,15 +220,17 @@ If the prefix is normal text, the buffered text is flushed as OpenAI `delta.cont
 After upstream completion, `parseToolBridgeOutput` performs:
 
 1. `utils.StripCodeFence` to remove JSON fences.
-2. `decodeToolBridgePayload` to parse the full JSON or first JSON object inside noisy text.
+2. Candidate scanning: the whole fence-stripped output is tried first; otherwise `extractJSONObjectCandidates` yields every top-level balanced JSON object and each is validated. The first candidate that validates wins, so a decoy object emitted before the real payload no longer masks a usable tool call. Unterminated objects are skipped rather than half-recovered.
 3. Validation that tool names are in the OpenAI request's allowed tool list.
 4. Forced tool-name filtering if `tool_choice` specifies one function.
-5. `normalizeArguments` to compact JSON and sanitize obvious string issues such as Markdown-wrapped URL values.
+5. `normalizeArguments` to compact JSON and sanitize obvious string issues such as Markdown-wrapped URL values. A payload that cannot be parsed is reported as an error — it is never silently replaced with `{}`, because executing a tool with substituted-empty arguments would look successful while dropping the model's inputs. Absent (`""`/`null`) arguments still legitimately mean `{}`.
 6. Construction of `dto.ChatCompletionToolCall` values.
 
 The service emits tool calls as a single streaming delta with `choices[0].delta.tool_calls`, then finishes with `finish_reason: "tool_calls"`.
 
 If no valid tool call is parsed, normal content is emitted if available. `tool_choice=required` or forced function can use `buildFallbackToolCalls`; otherwise the request finishes as normal text.
+
+When parsing fails, `resolveToolBridgeOutput` issues one repair round-trip (`buildToolBridgeRepairPrompt`) that feeds the validation error and the invalid output back to the model. Recovery is deliberately limited to structure the parser can already read; missing or invented argument values are never guessed.
 
 ### Tool Result Turn
 
@@ -265,7 +267,7 @@ These rules prioritize one continuous Gemini Web record and avoid appending the 
 |:---|:---|:---|
 | Improve raw Gemini parsing | `extractStreamTextFromBuffer`, `extractTextFromBuffer`, `ExtractStreamState` in `gemini_service.go` | Use debug `.raw.txt` and `.entries.jsonl` fixtures before changing parser behavior |
 | Improve OpenAI streaming behavior | `CreateChatCompletionStream` in `openai_service.go` | Keep no-tool path fast and direct |
-| Improve tool-call detection | `classifyToolBridgeStreamPrefix`, `parseToolBridgeOutput`, `decodeToolBridgePayload` | Avoid matching one specific tool name; operate on generic OpenAI tool schema |
+| Improve tool-call detection | `classifyToolBridgeStreamPrefix`, `parseToolBridgeOutput`, `extractJSONObjectCandidates` | Avoid matching one specific tool name; operate on generic OpenAI tool schema |
 | Improve tool argument cleanup | `normalizeArguments`, `sanitizeToolArgumentValue` | Must not rewrite ordinary natural-language queries |
 | Improve context reuse | `planRequestContext`, `rememberRequestContext`, transcript fingerprint helpers | Preserve branch/retry safety; do not append edited history to an old Gemini record |
 | Improve account failover | `ClientPool.clientForOptions`, `markClientError`, refresh helpers | Do not move an existing provider conversation to a different account |

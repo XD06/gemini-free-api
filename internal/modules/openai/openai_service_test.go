@@ -166,7 +166,10 @@ func TestChatCompletionMessageKeepsToolCallFields(t *testing.T) {
 func TestNormalizeArgumentsUnwrapsMarkdownURLValues(t *testing.T) {
 	raw := json.RawMessage(`{"urls":["[[https://opencode.ai/docs/zh-cn/go](https://opencode.ai/docs/zh-cn/go)](https://opencode.ai/docs/zh-cn/go)"],"nested":{"url":"[OpenCode](https://opencode.ai/docs/zh-cn/go)"}}`)
 
-	got := normalizeArguments(raw)
+	got, err := normalizeArguments(raw)
+	if err != nil {
+		t.Fatalf("normalizeArguments returned error: %v", err)
+	}
 
 	expected := `{"nested":{"url":"https://opencode.ai/docs/zh-cn/go"},"urls":["https://opencode.ai/docs/zh-cn/go"]}`
 	if got != expected {
@@ -177,11 +180,71 @@ func TestNormalizeArgumentsUnwrapsMarkdownURLValues(t *testing.T) {
 func TestNormalizeArgumentsKeepsNonURLMarkdownText(t *testing.T) {
 	raw := json.RawMessage(`{"query":"read [OpenCode Go docs](https://opencode.ai/docs/zh-cn/go) and summarize","numResults":3}`)
 
-	got := normalizeArguments(raw)
+	got, err := normalizeArguments(raw)
+	if err != nil {
+		t.Fatalf("normalizeArguments returned error: %v", err)
+	}
 
 	expected := `{"numResults":3,"query":"read [OpenCode Go docs](https://opencode.ai/docs/zh-cn/go) and summarize"}`
 	if got != expected {
 		t.Fatalf("unexpected normalized arguments:\n got: %s\nwant: %s", got, expected)
+	}
+}
+
+// TestNormalizeArgumentsRejectsMalformedPayloads pins the P0 contract: an
+// unparseable arguments payload must surface as an error instead of silently
+// collapsing to "{}". Executing a tool with substituted-empty arguments would
+// look successful to the client while actually dropping the model's inputs.
+//
+// Note: valid JSON that is not an object (e.g. `["x"]`) is intentionally absent
+// here — it parses fine and is rejected one layer up, by the object assertion in
+// validateAndNormalizeToolArguments.
+func TestNormalizeArgumentsRejectsMalformedPayloads(t *testing.T) {
+	cases := map[string]string{
+		"single quotes":    `{'query':'x'}`,
+		"trailing comma":   `{"query":"x",}`,
+		"truncated":        `{"query":"x"`,
+		"fullwidth quotes": `{“query”:“x”}`,
+		"unquoted key":     `{query:"x"}`,
+		"bare word":        `query=x`,
+		"python boolean":   `{"query":True}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := normalizeArguments(json.RawMessage(raw))
+			if err == nil {
+				t.Fatalf("expected error for %s, got %q", raw, got)
+			}
+			if got != "" {
+				t.Fatalf("expected empty result alongside error, got %q", got)
+			}
+		})
+	}
+}
+
+// TestNormalizeArgumentsAcceptsAbsentArguments keeps the legitimate no-argument
+// encoding working: missing/null arguments are a real case and still mean "{}".
+func TestNormalizeArgumentsAcceptsAbsentArguments(t *testing.T) {
+	for _, raw := range []string{"", "  ", "null"} {
+		got, err := normalizeArguments(json.RawMessage(raw))
+		if err != nil {
+			t.Fatalf("normalizeArguments(%q) returned error: %v", raw, err)
+		}
+		if got != "{}" {
+			t.Fatalf("normalizeArguments(%q) = %q, want {}", raw, got)
+		}
+	}
+}
+
+// TestNormalizeArgumentsUnwrapsStringEncodedObject keeps the double-encoding
+// tolerance: models sometimes send arguments as a JSON string containing JSON.
+func TestNormalizeArgumentsUnwrapsStringEncodedObject(t *testing.T) {
+	got, err := normalizeArguments(json.RawMessage(`"{\"query\":\"x\"}"`))
+	if err != nil {
+		t.Fatalf("normalizeArguments returned error: %v", err)
+	}
+	if got != `{"query":"x"}` {
+		t.Fatalf("got %q, want {\"query\":\"x\"}", got)
 	}
 }
 
@@ -1109,6 +1172,170 @@ func TestParseToolBridgePlanAcceptsFencedAndWrappedJSON(t *testing.T) {
 		if len(plan.ToolCalls) != 1 || plan.ToolCalls[0].Function.Name != "search" {
 			t.Fatalf("unexpected tool calls: %#v", plan.ToolCalls)
 		}
+	}
+}
+
+// TestParseToolBridgePlanSkipsDecoyObject is the P1 regression: the previous
+// implementation greedily took the first balanced object, so an example object
+// emitted before the real payload made an otherwise usable tool call fail.
+func TestParseToolBridgePlanSkipsDecoyObject(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	req := dto.ChatCompletionRequest{
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+	}
+
+	cases := map[string]string{
+		"decoy object first":   `Example:{"foo":1} real:{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"}}]}`,
+		"decoy invalid status": `{"status":"nonsense"} then {"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"}}]}`,
+		"decoy unused tool":    `{"status":"tool_calls","tool_calls":[{"name":"other","arguments":{}}]} {"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"}}]}`,
+		"decoy invalid args":   `{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{}}]} {"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"}}]}`,
+		"fenced then prose":    "```json\n{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"search\",\"arguments\":{\"query\":\"x\"}}]}\n```\nHope that helps!",
+	}
+	for name, text := range cases {
+		t.Run(name, func(t *testing.T) {
+			plan := service.parseToolBridgePlan(req, text)
+			if plan.Err != nil {
+				t.Fatalf("expected a usable plan, got error: %v", plan.Err)
+			}
+			if len(plan.ToolCalls) != 1 || plan.ToolCalls[0].Function.Name != "search" {
+				t.Fatalf("unexpected tool calls: %#v", plan.ToolCalls)
+			}
+			if plan.ToolCalls[0].Function.Arguments != `{"query":"x"}` {
+				t.Fatalf("unexpected arguments: %q", plan.ToolCalls[0].Function.Arguments)
+			}
+		})
+	}
+}
+
+// TestParseToolBridgePlanFirstValidWins documents the deliberate precedence:
+// the first candidate that validates decides the outcome. A valid `message`
+// status before a later tool_calls object therefore returns the message — the
+// model's first valid statement is authoritative, and preferring a later tool
+// call would hijack a "no tool needed" answer into a side-effecting call.
+func TestParseToolBridgePlanFirstValidWins(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	req := dto.ChatCompletionRequest{
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+	}
+
+	plan := service.parseToolBridgePlan(req, `{"status":"message","content":"hmm"} then {"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"}}]}`)
+	if plan.Err != nil {
+		t.Fatalf("unexpected error: %v", plan.Err)
+	}
+	if len(plan.ToolCalls) != 0 {
+		t.Fatalf("expected no tool calls from the first valid message plan, got %#v", plan.ToolCalls)
+	}
+	if !plan.NoTool || plan.Content != "hmm" {
+		t.Fatalf("expected first valid message plan to win, got %#v", plan)
+	}
+}
+
+// TestParseToolBridgePlanRejectsUnrecoverableInputs pins the other half of the
+// contract: when nothing validates, the error must be reported rather than
+// guessed at. Truncated JSON in particular is never partially recovered,
+// because that would require inventing missing tool arguments.
+func TestParseToolBridgePlanRejectsUnrecoverableInputs(t *testing.T) {
+	service := NewOpenAIService(&fakeGeminiClient{}, nil)
+	req := dto.ChatCompletionRequest{
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+	}
+
+	for name, text := range map[string]string{
+		"truncated mid-object": `{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"`,
+		"single quotes":        `{'status':'tool_calls','tool_calls':[{'name':'search','arguments':{'query':'x'}}]}`,
+		"fullwidth quotes":     `{“status”:“tool_calls”,“tool_calls”:[{“name”:“search”,“arguments”:{“query”:“x”}}]}`,
+		"trailing comma":       `{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"x"}},]}`,
+		"prose only":           `I could not find a matching tool for this request.`,
+		"empty":                ``,
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan := service.parseToolBridgePlan(req, text)
+			if plan.Err == nil {
+				t.Fatalf("expected an error, got %#v", plan)
+			}
+			if len(plan.ToolCalls) != 0 {
+				t.Fatalf("expected no tool calls on failure, got %#v", plan.ToolCalls)
+			}
+		})
+	}
+}
+
+// TestExtractJSONObjectCandidatesHandlesNestingAndBraces documents the scanner:
+// nested objects are one candidate (not two), braces inside strings are ignored,
+// and an unterminated object yields no candidate.
+func TestExtractJSONObjectCandidatesHandlesNestingAndBraces(t *testing.T) {
+	got := extractJSONObjectCandidates(`a{"x":{"y":1}}b{"z":"}"}c`)
+	want := []string{`{"x":{"y":1}}`, `{"z":"}"}`}
+	if len(got) != len(want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidate %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if candidates := extractJSONObjectCandidates(`{"unterminated":1`); len(candidates) != 0 {
+		t.Fatalf("expected no candidates for unterminated object, got %#v", candidates)
+	}
+}
+
+// TestCreateChatCompletionDoesNotSilentlyEmptyToolArguments is the end-to-end
+// P0 regression: malformed arguments must go through the repair round-trip
+// rather than being silently replaced with "{}".
+func TestCreateChatCompletionDoesNotSilentlyEmptyToolArguments(t *testing.T) {
+	client := &fakeGeminiClient{
+		responses: []string{
+			`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{'query':'weather'}}]}`,
+			`{"status":"tool_calls","tool_calls":[{"name":"search","arguments":{"query":"weather"}}]}`,
+		},
+	}
+	service := NewOpenAIService(client, nil)
+	req := dto.ChatCompletionRequest{
+		Model: "gemini-3.8-flash",
+		Messages: []dto.ChatCompletionMessage{
+			{Role: "user", Content: "search weather"},
+		},
+		Tools: []dto.ToolDefinition{{
+			Type: "function",
+			Function: dto.ToolFunctionDefinition{
+				Name:       "search",
+				Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			},
+		}},
+	}
+
+	resp, err := service.CreateChatCompletion(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateChatCompletion returned error: %v", err)
+	}
+	if len(resp.Choices) != 1 || len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %#v", resp.Choices)
+	}
+	args := resp.Choices[0].Message.ToolCalls[0].Function.Arguments
+	if args != `{"query":"weather"}` {
+		t.Fatalf("arguments must come from repair, got %q", args)
+	}
+	if len(client.generatePrompts) != 2 || !strings.Contains(client.generatePrompts[1], "Repair the previous tool-planning output") {
+		t.Fatalf("expected one repair request, got prompts %#v", client.generatePrompts)
 	}
 }
 
