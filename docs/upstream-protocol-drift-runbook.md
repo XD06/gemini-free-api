@@ -140,7 +140,7 @@ list_pages / select_page
 New-Item -ItemType Directory -Force scratch | Out-Null
 curl.exe -N http://127.0.0.1:8787/openai/v1/chat/completions `
   -H "Content-Type: application/json" `
-  --data-raw '{"model":"gemini-3.5-flash","reasoning_effort":"high","stream":true,"messages":[{"role":"user","content":"请逐步证明根号2是无理数，最后单独给出结论。"}]}' `
+  --data-raw '{"model":"gemini-3.8-flash","reasoning_effort":"high","stream":true,"messages":[{"role":"user","content":"请逐步证明根号2是无理数，最后单独给出结论。"}]}' `
   -o scratch/extended.sse
 ```
 

@@ -14,7 +14,7 @@ OpenAI Chat Completions 本身是无状态协议。本项目通过两种方式�
 
 ```json
 {
-  "model": "gemini-3.5-flash",
+  "model": "gemini-3.8-flash",
   "conversation_id": "thread-1",
   "messages": [{"role": "user", "content": "记住一个词：海棠"}]
 }
