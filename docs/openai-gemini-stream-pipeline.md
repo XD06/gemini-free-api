@@ -202,7 +202,7 @@ When active, the service replaces the normal user prompt with `buildToolBridgePr
 
 The prompt contains bridge instructions, the required JSON schema `{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}`, tool-choice constraints, all allowed tool definitions from `req.Tools`, and compact recent conversation context from `buildToolPlanningPrompt`.
 
-Tool planning intentionally runs in the main Gemini conversation. The first tool-enabled turn writes the bridge protocol and available tool definitions into that record; later turns reuse the same provider conversation and normally send only the latest user request. This keeps the tool decision, tool result, and final answer in one Gemini topic.
+Tool planning intentionally runs in the main Gemini conversation. The first tool-enabled turn writes the bridge protocol and available tool definitions into that record; later turns reuse the same provider conversation. Because Gemini Web has no native tool calling, a later turn is only allowed to skip the tool list when `toolBridgeContextReady` confirms that this exact provider conversation already received this exact tool set (signature match); it always still carries a compact strict reminder telling the model that tools are executed by this runtime and that the only way to request one is the agreed JSON object. A changed tool set forces the full definitions to be resent. This keeps the tool decision, tool result, and final answer in one Gemini topic.
 
 ### Streaming Decision
 

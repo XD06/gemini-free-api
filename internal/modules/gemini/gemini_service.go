@@ -350,12 +350,18 @@ type toolBridgeCall struct {
 func (s *GeminiService) buildToolBridgePrompt(req dto.GeminiGenerateRequest, basePrompt string) string {
 	var b strings.Builder
 	b.WriteString("You are a Gemini assistant running behind a bridge that supports function calling.\n")
+	b.WriteString("You have NO native function calling. You cannot perform the action yourself, and you cannot obtain live or real-time data on your own; functions are executed by the client runtime, never by you.\n")
+	b.WriteString("To call a function, you must NOT attempt the action yourself and must NOT answer from your own knowledge or from any built-in UI card. Instead reply with exactly one JSON object in the schema below and nothing else.\n")
+	b.WriteString("The client then executes the requested function(s) and automatically sends the result back to you as the next message. You do not need to ask for permission, and there is no other way for you to obtain the result.\n")
 	b.WriteString("You MUST respond with JSON only. Do not output markdown code fences.\n")
 	b.WriteString("Output schema:\n")
 	b.WriteString("{\"status\":\"call\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]} OR {\"status\":\"text\",\"content\":\"<assistant_text>\"}\n")
 	b.WriteString("Rules:\n")
-	b.WriteString("- Use only tool names listed below.\n")
-	b.WriteString("- arguments must be valid JSON object.\n")
+	b.WriteString("- Emit that JSON object alone: no code fences, and no text before or after it.\n")
+	b.WriteString("- Use only function names listed below, spelled exactly as shown.\n")
+	b.WriteString("- arguments must be a valid JSON object whose fields match the parameters schema; string values must be double-quoted.\n")
+	b.WriteString("- Never invent a function result, and never describe the call in prose instead of emitting the JSON.\n")
+	b.WriteString("- If no function is needed, use {\"status\":\"text\",\"content\":\"...\"} instead of wrapping normal text in JSON.")
 
 	b.WriteString("Available tools:\n")
 	for _, tool := range req.Tools {

@@ -1452,8 +1452,153 @@ func TestCreateChatCompletionAutoToolsNormalMessageDoesNotRepair(t *testing.T) {
 	if len(client.generatePrompts) != 1 {
 		t.Fatalf("auto normal message should complete in one main-topic request, got %d prompts", len(client.generatePrompts))
 	}
-	if !strings.Contains(client.generatePrompts[0], "If a tool is needed") {
-		t.Fatalf("expected tools request to include tool-call protocol, got %q", client.generatePrompts[0])
+	if !strings.Contains(client.generatePrompts[0], "You have NO native tool calling") {
+		t.Fatalf("expected tools request to state that the model cannot call tools natively, got %q", client.generatePrompts[0])
+	}
+	if !strings.Contains(client.generatePrompts[0], "Available tools:") {
+		t.Fatalf("expected tools request to include the tool list, got %q", client.generatePrompts[0])
+	}
+}
+
+func TestToolBridgePromptStatesNoNativeToolCalling(t *testing.T) {
+	tools := []dto.ToolDefinition{{
+		Type: "function",
+		Function: dto.ToolFunctionDefinition{
+			Name:        "search",
+			Description: "Search the web",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+		},
+	}}
+	service := NewOpenAIService(&fakeGeminiClient{responses: []string{"ok"}}, nil)
+
+	for _, mode := range []string{"auto", "required"} {
+		req := dto.ChatCompletionRequest{
+			Model:         "gemini-3.5-flash",
+			Messages:      []dto.ChatCompletionMessage{{Role: "user", Content: "查一下北京天气"}},
+			Tools:         tools,
+			ToolChoiceRaw: json.RawMessage(`"` + mode + `"`),
+		}
+		prompt := service.buildToolBridgePrompt(req, "查一下北京天气", mode == "required")
+
+		// The whole point of the strict prompt: the model must be told it has no
+		// native tool calling and that the runtime returns the result for it.
+		for _, want := range []string{
+			"You have NO native tool calling",
+			"automatically sends the tool result back",
+			`{"status":"tool_calls","tool_calls":[{"name":"<tool_name>","arguments":{}}]}`,
+			"Available tools:",
+			"search",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("mode=%s strict prompt missing %q\n--- prompt ---\n%s", mode, want, prompt)
+			}
+		}
+	}
+}
+
+// The reuse path (same Gemini conversation) used to send the bare user message
+// with no bridge contract at all, which let the model answer from its own
+// knowledge instead of emitting tool JSON. It must now always carry the strict
+// reminder, even in auto mode where no tool call is forced.
+func TestToolBridgeReusePathKeepsStrictReminder(t *testing.T) {
+	tools := []dto.ToolDefinition{{
+		Type:     "function",
+		Function: dto.ToolFunctionDefinition{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)},
+	}}
+	service := NewOpenAIService(&fakeGeminiClient{responses: []string{"ok"}}, nil)
+	req := dto.ChatCompletionRequest{
+		Model:    "gemini-3.5-flash",
+		Messages: []dto.ChatCompletionMessage{{Role: "user", Content: "再查一次"}},
+		Tools:    tools,
+	}
+
+	light := service.buildToolBridgeLightPrompt(req, "再查一次", false)
+	if !strings.Contains(light, toolBridgeReuseReminder) {
+		t.Fatalf("auto reuse prompt must keep the strict reminder, got %q", light)
+	}
+	if !strings.Contains(light, "再查一次") {
+		t.Fatalf("auto reuse prompt must carry the user request, got %q", light)
+	}
+	if strings.Contains(light, "Available tools:") {
+		t.Fatalf("auto reuse prompt must not resend the full tool list, got %q", light)
+	}
+
+	forced := service.buildToolBridgeLightPrompt(req, "再查一次", true)
+	for _, want := range []string{"NO native tool calling", "sends the result back automatically"} {
+		if !strings.Contains(forced, want) {
+			t.Fatalf("forced reuse prompt missing %q, got %q", want, forced)
+		}
+	}
+}
+
+// Regression: planRequestContext marks AutoContext=true on the very first turn
+// when the client supplies an explicit conversation_id, and the old reuse gate
+// only checked "we have a provider conversation id && AutoContext". That made
+// the first turn take the light path, so the model was asked for tool-call JSON
+// while never being told which tools exist -- observed in production as
+// prompt_len=53 and the model replying that it cannot use the search tool.
+// The light path must now require evidence that this conversation actually
+// received this exact tool set.
+func TestToolBridgePromptForPlanRequiresDeliveredInstructions(t *testing.T) {
+	tools := []dto.ToolDefinition{{
+		Type: "function",
+		Function: dto.ToolFunctionDefinition{
+			Name:        "search",
+			Description: "Search the web",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+		},
+	}}
+	service := NewOpenAIService(&fakeGeminiClient{responses: []string{"ok"}}, nil)
+	req := dto.ChatCompletionRequest{
+		Model:          "gemini-3.8-flash",
+		Messages:       []dto.ChatCompletionMessage{{Role: "user", Content: "查一下北京天气"}},
+		Tools:          tools,
+		ConversationID: "client-thread-1",
+	}
+	plan := openAIContextPlan{
+		Prompt:                 "查一下北京天气",
+		ProviderConversationID: "provider-thread-1",
+		ClientConversationID:   "client-thread-1",
+		AutoContext:            true,
+	}
+
+	// First turn of an explicit conversation: nothing was delivered yet.
+	prompt, _, reused := service.buildToolBridgePromptForPlan(req, plan)
+	if reused {
+		t.Fatalf("first turn of an explicit conversation must not reuse tool instructions")
+	}
+	if !strings.Contains(prompt, "Available tools:") || !strings.Contains(prompt, "search") {
+		t.Fatalf("first turn must deliver the full tool list, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "You have NO native tool calling") {
+		t.Fatalf("first turn must deliver the strict bridge contract, got %q", prompt)
+	}
+
+	// Same conversation, same tools: now the light path is legitimate.
+	service.rememberToolBridgeContext(plan.ProviderConversationID, toolBridgeSignature(req))
+	prompt, _, reused = service.buildToolBridgePromptForPlan(req, plan)
+	if !reused {
+		t.Fatalf("second turn with an already delivered tool set should reuse instructions")
+	}
+	if strings.Contains(prompt, "Available tools:") {
+		t.Fatalf("reuse turn must not resend the tool list, got %q", prompt)
+	}
+	if !strings.Contains(prompt, toolBridgeReuseReminder) {
+		t.Fatalf("reuse turn must still carry the strict bridge contract, got %q", prompt)
+	}
+
+	// A different tool set has never been seen by that conversation: resend.
+	changed := req
+	changed.Tools = []dto.ToolDefinition{{
+		Type:     "function",
+		Function: dto.ToolFunctionDefinition{Name: "lookup_time", Parameters: json.RawMessage(`{"type":"object"}`)},
+	}}
+	prompt, _, reused = service.buildToolBridgePromptForPlan(changed, plan)
+	if reused {
+		t.Fatalf("a tool set never delivered to this conversation must not reuse instructions")
+	}
+	if !strings.Contains(prompt, "lookup_time") {
+		t.Fatalf("changed tool set must be delivered in full, got %q", prompt)
 	}
 }
 
@@ -1579,8 +1724,8 @@ func TestCreateChatCompletionStreamStreamsNormalAnswerWhenToolsAreAuto(t *testin
 	if len(client.prompts) != 1 {
 		t.Fatalf("expected one main-topic stream prompt, got %#v", client.prompts)
 	}
-	if !strings.Contains(client.prompts[0], "If a tool is needed") {
-		t.Fatalf("expected stream prompt to include tool-call protocol, got %#v", client.prompts)
+	if !strings.Contains(client.prompts[0], "You have NO native tool calling") {
+		t.Fatalf("expected stream prompt to state that the model cannot call tools natively, got %#v", client.prompts)
 	}
 }
 
@@ -1844,8 +1989,8 @@ func TestCreateChatCompletionStreamUsesMainTopicForGreetingWithTools(t *testing.
 	if err != nil {
 		t.Fatalf("CreateChatCompletionStream returned error: %v", err)
 	}
-	if len(client.prompts) != 1 || !strings.Contains(client.prompts[0], "If a tool is needed") {
-		t.Fatalf("expected greeting to use one main-topic tool prompt, got prompts %#v", client.prompts)
+	if len(client.prompts) != 1 || !strings.Contains(client.prompts[0], "You have NO native tool calling") {
+		t.Fatalf("expected greeting to use one main-topic tool prompt carrying the strict contract, got prompts %#v", client.prompts)
 	}
 	if len(client.configs) != 1 || client.configs[0].ConversationID == "" {
 		t.Fatalf("tool bridge must use a main conversation id, got configs %#v", client.configs)
@@ -1878,6 +2023,9 @@ func TestCreateChatCompletionStreamAppendsToolBridgeToExistingMainConversation(t
 		Tools:  []dto.ToolDefinition{{Type: "function", Function: dto.ToolFunctionDefinition{Name: "mcp__exa__web_search_exa"}}},
 		Stream: true,
 	}
+	// A real first turn that delivered these instructions also records the
+	// bridge context; the light prompt is only valid when that happened.
+	service.rememberToolBridgeContext("provider-thread", toolBridgeSignature(req))
 
 	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool { return true })
 	if err != nil {
@@ -1889,8 +2037,14 @@ func TestCreateChatCompletionStreamAppendsToolBridgeToExistingMainConversation(t
 	if client.configs[0].ConversationID != "provider-thread" {
 		t.Fatalf("tool bridge must append to main conversation, got %q", client.configs[0].ConversationID)
 	}
-	if client.prompts[0] != "今天 GitHub 的热点是什么？" {
-		t.Fatalf("same-topic tool bridge should send only latest user request, got %q", client.prompts[0])
+	if !strings.Contains(client.prompts[0], "今天 GitHub 的热点是什么？") {
+		t.Fatalf("same-topic tool bridge should carry the latest user request, got %q", client.prompts[0])
+	}
+	if strings.Contains(client.prompts[0], "Available tools:") {
+		t.Fatalf("same-topic tool bridge must not resend the full tool list, got %q", client.prompts[0])
+	}
+	if !strings.Contains(client.prompts[0], toolBridgeReuseReminder) {
+		t.Fatalf("same-topic tool bridge must keep the strict bridge contract, got %q", client.prompts[0])
 	}
 }
 
@@ -1943,18 +2097,18 @@ func TestCreateChatCompletionStreamReusesToolBridgeInstructionsInSameConversatio
 	if strings.Contains(client.prompts[1], "Available tools:") || strings.Contains(client.prompts[1], "parameters:") {
 		t.Fatalf("second prompt should reuse existing tool instructions, got %q", client.prompts[1])
 	}
-	if strings.Contains(client.prompts[1], "already defined in this Gemini conversation") {
-		t.Fatalf("auto follow-up should not repeat tool reminders, got %q", client.prompts[1])
+	if !strings.Contains(client.prompts[1], toolBridgeReuseReminder) {
+		t.Fatalf("auto follow-up must keep the strict bridge contract, got %q", client.prompts[1])
 	}
-	if client.prompts[1] != "你知道 SpaceX 吗？" {
-		t.Fatalf("second prompt should be only the current user request, got %q", client.prompts[1])
+	if !strings.Contains(client.prompts[1], "你知道 SpaceX 吗？") {
+		t.Fatalf("second prompt should carry the current user request, got %q", client.prompts[1])
 	}
 	if len(client.configs) < 2 || client.configs[0].ConversationID == "" || client.configs[1].ConversationID != client.configs[0].ConversationID {
 		t.Fatalf("expected second request to reuse provider conversation, configs=%#v", client.configs)
 	}
 }
 
-func TestCreateChatCompletionStreamDoesNotResendToolBridgeInstructionsInSameConversationWhenToolsChange(t *testing.T) {
+func TestCreateChatCompletionStreamResendsToolBridgeInstructionsInSameConversationWhenToolsChange(t *testing.T) {
 	firstTools := []dto.ToolDefinition{{
 		Type:     "function",
 		Function: dto.ToolFunctionDefinition{Name: "lookup_weather", Parameters: json.RawMessage(`{"type":"object"}`)},
@@ -1997,11 +2151,14 @@ func TestCreateChatCompletionStreamDoesNotResendToolBridgeInstructionsInSameConv
 	if len(client.prompts) != 2 {
 		t.Fatalf("expected two prompts, got %#v", client.prompts)
 	}
-	if strings.Contains(client.prompts[1], "Available tools:") || strings.Contains(client.prompts[1], "lookup_time") {
-		t.Fatalf("same-topic follow-up should not resend tool instructions, got %q", client.prompts[1])
+	// The model has never seen lookup_time, so the full tool list must be
+	// resent. Reusing the light prompt here would ask for a tool call while
+	// leaving the model unaware of the tool's name and parameters.
+	if !strings.Contains(client.prompts[1], "Available tools:") || !strings.Contains(client.prompts[1], "lookup_time") {
+		t.Fatalf("changed tool set must resend the full tool instructions, got %q", client.prompts[1])
 	}
-	if client.prompts[1] != "继续" {
-		t.Fatalf("same-topic follow-up should send only latest user request, got %q", client.prompts[1])
+	if !strings.Contains(client.prompts[1], "继续") {
+		t.Fatalf("same-topic follow-up should carry the latest user request, got %q", client.prompts[1])
 	}
 }
 
@@ -2037,6 +2194,9 @@ func TestCreateChatCompletionStreamFallbackFreshConversationRestoresFullToolProm
 		}},
 		Stream: true,
 	}
+	// Simulate the earlier turn that already handed these tools to that
+	// conversation, so the first attempt legitimately reuses the light prompt.
+	service.rememberToolBridgeContext("provider-1", toolBridgeSignature(req))
 
 	err := service.CreateChatCompletionStream(context.Background(), req, func(chunk dto.ChatCompletionChunk) bool {
 		return true
@@ -2047,8 +2207,8 @@ func TestCreateChatCompletionStreamFallbackFreshConversationRestoresFullToolProm
 	if len(client.prompts) != 2 {
 		t.Fatalf("expected failed same-topic call and fresh fallback, got prompts %#v", client.prompts)
 	}
-	if client.prompts[0] != "查一下今天新闻" {
-		t.Fatalf("same-topic attempt should send only latest user request, got %q", client.prompts[0])
+	if !strings.Contains(client.prompts[0], "查一下今天新闻") || strings.Contains(client.prompts[0], "Available tools:") {
+		t.Fatalf("same-topic attempt should carry the latest request without resending tools, got %q", client.prompts[0])
 	}
 	if !strings.Contains(client.prompts[1], "Available tools:") || !strings.Contains(client.prompts[1], "search") {
 		t.Fatalf("fresh fallback must restore full tool prompt, got %q", client.prompts[1])

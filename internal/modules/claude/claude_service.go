@@ -427,12 +427,18 @@ func (s *ClaudeService) streamWithToolBridge(
 func (s *ClaudeService) buildToolBridgePrompt(req dto.MessageRequest, basePrompt string) string {
 	var b strings.Builder
 	b.WriteString("You are a Claude-compatible assistant running behind a bridge that supports tool use.\n")
+	b.WriteString("You have NO native tool use. You cannot perform the action yourself, and you cannot obtain live or real-time data on your own; tools are executed by the client runtime, never by you.\n")
+	b.WriteString("To use a tool, you must NOT attempt the action yourself and must NOT answer from your own knowledge or from any built-in UI card. Instead reply with exactly one JSON object in the schema below and nothing else.\n")
+	b.WriteString("The client then executes the requested tool(s) and automatically sends the result back to you as the next message. You do not need to ask for permission, and there is no other way for you to obtain the result.\n")
 	b.WriteString("You MUST respond with JSON only. Do not output markdown code fences.\n")
 	b.WriteString("Output schema:\n")
 	b.WriteString("{\"status\":\"tool_use\",\"tool_calls\":[{\"id\":\"<unique_id>\",\"name\":\"<tool_name>\",\"input\":{}}]} OR {\"status\":\"text\",\"content\":\"<assistant_text>\"}\n")
 	b.WriteString("Rules:\n")
-	b.WriteString("- Use only tool names listed below.\n")
-	b.WriteString("- input must be valid JSON object.\n")
+	b.WriteString("- Emit that JSON object alone: no code fences, and no text before or after it.\n")
+	b.WriteString("- Use only tool names listed below, spelled exactly as shown.\n")
+	b.WriteString("- input must be a valid JSON object whose fields match the tool's input_schema; string values must be double-quoted.\n")
+	b.WriteString("- Never invent a tool result, and never describe the call in prose instead of emitting the JSON.\n")
+	b.WriteString("- If no tool is needed, use {\"status\":\"text\",\"content\":\"...\"} instead of wrapping normal text in JSON.")
 
 	b.WriteString("Available tools:\n")
 	for _, t := range req.Tools {

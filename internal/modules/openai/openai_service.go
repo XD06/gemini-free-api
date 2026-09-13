@@ -2178,8 +2178,16 @@ func compactText(text string, limit int) string {
 
 func (s *OpenAIService) buildToolBridgePromptForPlan(req dto.ChatCompletionRequest, plan openAIContextPlan) (string, string, bool) {
 	signature := toolBridgeSignature(req)
-	reuseInstructions := strings.TrimSpace(plan.ProviderConversationID) != "" &&
-		plan.AutoContext
+	providerID := strings.TrimSpace(plan.ProviderConversationID)
+	// The light prompt may only be used when this exact provider conversation
+	// has already been given this exact tool set. Keying off "we have a
+	// conversation id" alone was wrong: an explicitly supplied
+	// conversation_id makes planRequestContext set AutoContext on the very
+	// first turn, so the model was asked to emit tool-call JSON while never
+	// having been told which tools exist or what their parameters look like.
+	reuseInstructions := providerID != "" &&
+		plan.AutoContext &&
+		s.toolBridgeContextReady(providerID, signature)
 	if reuseInstructions {
 		return s.buildToolBridgeLightPrompt(req, plan.Prompt, toolBridgeRequiresToolCall(req)), signature, true
 	}
@@ -2216,18 +2224,31 @@ func toolBridgeSignature(req dto.ChatCompletionRequest) string {
 	return sha256Hex(string(body))
 }
 
+// toolBridgeReuseReminder is the compact strict contract sent on the reuse
+// path (same Gemini conversation, tool instructions already delivered). Gemini
+// web has no native tool calling, so even a follow-up turn must be told that
+// the runtime executes tools and that the only way to request one is the JSON
+// object below. Without this the model tends to answer from its own knowledge.
+const toolBridgeReuseReminder = "You have NO native tool calling. Tools are executed by the client runtime, not by you.\n" +
+	"If the current request needs one of the tools already defined in this Gemini conversation, reply with exactly one JSON object and no other text:\n" +
+	"{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n" +
+	"The client then executes it and automatically sends the result back; you do not need to ask for permission. Do not perform the action yourself and do not invent the result.\n" +
+	"If no tool is needed and tool_choice is auto, answer normally in Markdown."
+
 func (s *OpenAIService) buildToolBridgePrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
 	var b strings.Builder
 	b.WriteString("You are an OpenAI-compatible assistant running behind a bridge to Gemini web.\n")
-	b.WriteString("Use tools only when the current user request needs one of the available tools.\n")
-	b.WriteString("If a tool is needed, return exactly one JSON object and no surrounding text.\n")
+	b.WriteString("You have NO native tool calling. You cannot search, browse, run code, or reach any external service by yourself, and you cannot obtain live or real-time data on your own. Tools are executed by this runtime, never by you.\n")
+	b.WriteString("To call a tool you must NOT attempt the action yourself and must NOT answer from your own knowledge or from any built-in UI card. Instead, reply with exactly one JSON object in the schema below and nothing else.\n")
+	b.WriteString("The client then executes the requested tool(s) and automatically sends the tool result back to you as the next message. You do not need to ask for permission, and there is no other way for you to obtain the result.\n")
 	b.WriteString("Tool-call JSON schema:\n")
 	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
-	b.WriteString("When you output this JSON, the client will execute the requested tool(s) and send the tool result back in the next message; then you should answer the user naturally based on that result.\n")
+	b.WriteString("After the tool result comes back, answer the user naturally in Markdown based on that result.\n")
 	b.WriteString("Rules:\n")
-	b.WriteString("- Use only tool names listed below.\n")
-	b.WriteString("- arguments must be a valid JSON object matching the tool's parameters schema.\n")
-	b.WriteString("- Do not put JSON in markdown code fences.\n")
+	b.WriteString("- Emit that JSON object alone: no markdown code fences, and no text before or after it.\n")
+	b.WriteString("- Use only the tool names listed below, spelled exactly as shown.\n")
+	b.WriteString("- arguments must be a valid JSON object whose fields match the tool's parameters schema; string values must be double-quoted.\n")
+	b.WriteString("- Never invent a tool result, and never describe the call in prose (for example \"I will search ...\") instead of emitting the JSON.\n")
 	b.WriteString("- Tool-call JSON is an internal request for tool execution, not the final answer to the user.\n")
 	b.WriteString("- If no tool is needed and tool_choice is auto, answer the user normally in Markdown. Do not wrap normal text in JSON.\n")
 	if requireToolCall {
@@ -2279,12 +2300,17 @@ func (s *OpenAIService) buildToolBridgeLightPrompt(req dto.ChatCompletionRequest
 		latestPrompt = compactText(latest.Content, 1500)
 	}
 	if req.ToolChoiceMode() == "auto" && !requireToolCall {
-		return latestPrompt
+		// The model has no native tool calling, so a bare user message would
+		// silently drop the bridge contract and let the model answer from its
+		// own knowledge. Keep a compact strict reminder on the reuse path
+		// instead of resending the whole tool list.
+		return toolBridgeReuseReminder + "\nCurrent user request:\n" + latestPrompt
 	}
 
 	var b strings.Builder
 	b.WriteString("Use the OpenAI tool protocol and available tools already defined in this Gemini conversation.\n")
-	b.WriteString("If the current request needs a tool, return exactly one JSON object with status=tool_calls. The client will execute the tool and send the result back; then answer naturally. If no tool is needed and tool_choice is auto, answer normally in Markdown.\n")
+	b.WriteString("You have NO native tool calling: you cannot perform the action yourself, and the client is what executes the tool. To use a tool, reply with exactly one JSON object and no other text; the client then executes it and sends the result back automatically. Do not answer from your own knowledge instead of emitting that JSON.\n")
+	b.WriteString("If no tool is needed and tool_choice is auto, answer normally in Markdown.\n")
 	if requireToolCall {
 		b.WriteString("This request requires a tool call; return status=tool_calls with at least one valid tool call.\n")
 	}
@@ -2301,29 +2327,6 @@ func (s *OpenAIService) buildToolBridgeLightPrompt(req dto.ChatCompletionRequest
 	}
 	b.WriteString("\nCurrent user request:\n")
 	b.WriteString(latestPrompt)
-	return b.String()
-}
-
-func (s *OpenAIService) buildToolBridgeContinuationPrompt(req dto.ChatCompletionRequest, basePrompt string, requireToolCall bool) string {
-	var b strings.Builder
-	b.WriteString("Continue as the same tool-planning router. Use the JSON protocol and available tools already defined in this Gemini conversation.\n")
-	b.WriteString("Return exactly one JSON object: {\"status\":\"tool_calls\",\"tool_calls\":[...]} or {\"status\":\"no_tool\"}. Do not answer the user directly.\n")
-	if requireToolCall {
-		b.WriteString("This request requires a tool call; return status=tool_calls.\n")
-	}
-	toolChoiceMode := req.ToolChoiceMode()
-	if toolChoiceMode == "required" {
-		b.WriteString("tool_choice is required; return at least one valid tool call.\n")
-	}
-	if toolChoiceMode == "function" {
-		if forced := req.ForcedToolName(); forced != "" {
-			b.WriteString("tool_choice selects function: ")
-			b.WriteString(forced)
-			b.WriteString("\n")
-		}
-	}
-	b.WriteString("\nCurrent planning context:\n")
-	b.WriteString(basePrompt)
 	return b.String()
 }
 
@@ -2386,6 +2389,7 @@ func looksLikeToolPlannerOutput(text string) bool {
 func (s *OpenAIService) buildToolBridgeRepairPrompt(req dto.ChatCompletionRequest, invalidOutput string, parseErr error) string {
 	var b strings.Builder
 	b.WriteString("Repair the previous tool-planning output. Return exactly one JSON object and no surrounding text.\n")
+	b.WriteString("You have NO native tool calling; the runtime executes tools for you. Do not answer the user directly here and do not repeat the mistake described below.\n")
 	b.WriteString("Allowed output schemas:\n")
 	b.WriteString("{\"status\":\"tool_calls\",\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}\n")
 	b.WriteString("{\"status\":\"message\",\"content\":\"<assistant_text>\"}\n")
