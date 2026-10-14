@@ -76,7 +76,7 @@ The service keeps an in-process recovery transcript for each active provider con
 | OpenAI input | Provider behavior |
 |:---|:---|
 | `model` | `modelAndThinkingLevel` maps aliases / suffixes before provider dispatch |
-| `reasoning_effort`, `reasoning.effort`, `thinking_level` | `providers.WithThinkingLevel` sets Gemini Web thinking header behavior |
+| `reasoning_effort`, `reasoning.effort`, `thinking_level` | `providers.WithThinkingLevel` sets the Gemini Web thinking level (`low` / `medium` / `high`; legacy `standard`→low, `extended`→high) |
 | inferred or explicit conversation | `providers.WithConversationID` enables Gemini Web continuation metadata |
 | attachments | `providers.InputFilesFromAttachments` then `providers.WithInputFiles` |
 | `GEMINI_USE_SOURCE_PATH=true` | `providers.WithSourcePath(true)` adds Gemini Web `source-path` query parameter |
@@ -136,9 +136,23 @@ Header redaction is not sufficient by itself: the request URL and trace logs can
 
 ### Thinking Protocol Baseline
 
-As verified on 2026-07-13, `x-goog-ext-525001261-jspb[15]` is `1` for Standard and `2` for Extended. The cumulative thinking summary is currently read from `payload[4][0][37][0][0]`. A sibling at `[37][1]` may contain structured web UI metadata and must not be recursively flattened into reasoning text.
+As re-verified on 2026-10-14, the web picker now offers three levels, and both
+`x-goog-ext-525001261-jspb[15]` and `f.req` `inner[80]` carry the same value:
+Low=1, Medium=4, High=2 (same account, model and prompt; only the picker moved).
+The provider keeps the legacy mapping usable — `standard` still resolves to 1 and
+`extended` to 2. The cumulative thinking summary is still read from
+`payload[4][0][37][0][0]`, the phase title from metadata `7[5]`, and a sibling at
+`[37][1]` still holds structured web UI metadata that must not be recursively
+flattened into reasoning text.
 
-The current Gemini Web `f.req` inner array has been observed at 92 elements, while this project can still produce thinking with its older 81-element shape. Array length alone is therefore not evidence of a breaking change. Use single-variable browser captures and the [upstream protocol drift runbook](upstream-protocol-drift-runbook.md) before changing the request template or parser.
+The 2026-10-14 client sends a 99-element `f.req` inner array and a 20-element
+model header, while this project still sends a 92-element array and an 18-element
+header. A browser replay on that date confirmed the shorter body is still
+accepted: replaying the project's 92-element shape through the web client's own
+transport streamed normally. Array length alone is therefore still not evidence
+of a breaking change. Use single-variable browser captures and the
+[upstream protocol drift runbook](upstream-protocol-drift-runbook.md) before
+changing the request template or parser.
 
 ### Upstream Parsing
 

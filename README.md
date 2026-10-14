@@ -4,13 +4,15 @@
 
 基于网页端逆向实现，依赖 Google Gemini Web 的私有请求结构。适合个人研究和本地客户端接入。
 
+> **已对齐网页端 2026-10-14 最新版本**：新增支持 **Gemini 4 Argon**（复杂任务模型），思考档位升级为 **Low / Medium / High** 三档；三个旧模型（3.8 Flash / 3.5 Flash-Lite / 3.1 Pro）ID 与模式值保持不变。
+
 ## 能力概览
 
 | 能力 | OpenAI | Claude | Gemini 原生 |
 |:---|:---:|:---:|:---:|
 | 文本对话 | ✅ | ✅ | ✅ |
 | 流式输出 | **实时流** | **实时流** | **实时流** |
-| Thinking Level | ✅ | — | — |
+| Thinking Level（Low / Medium / High） | ✅ | — | — |
 | 多轮上下文 | 实验性 | — | — |
 | 图片/文件输入 | ✅ | ✅ | ✅ |
 | 工具调用 | 实验性桥接 | 桥接 | 桥接 |
@@ -175,9 +177,8 @@ curl http://localhost:8787/gemini/v1beta/models/gemini-3.8-flash:streamGenerateC
 
 | 参数 | 值 | 对应 |
 |:---|:---|:---|
-| `reasoning_effort` | `low` / `medium` | Standard |
-| `reasoning_effort` | `high` | Extended |
-| `thinking_level` | `standard` / `extended` | 直接映射 |
+| `reasoning_effort` | `low` / `medium` / `high` | 网页端 Low / Medium / High 三档 |
+| `thinking_level` | `low` / `medium` / `high` | 直接映射（旧名 `standard`＝`low`、`extended`＝`high`） |
 
 ### 文件上传
 
@@ -225,6 +226,7 @@ for chunk in stream:
 | `gemini-3.8-flash` | UI 默认 Flash（兼容旧名 `gemini-3.6-flash`、`gemini-3.5-flash`） |
 | `gemini-3.5-flash-lite` | UI Flash-Lite（兼容旧名 `gemini-3.1-flash-lite`） |
 | `gemini-3.1-pro` | UI Pro |
+| `gemini-4-argon` | UI 4 Argon（复杂任务） |
 
 需要深度思考时使用 Thinking Level 参数，而非依赖模型名后缀。
 

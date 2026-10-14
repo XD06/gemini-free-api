@@ -617,6 +617,7 @@ const (
 	modelIDFlashLite = "8c46e95b1a07cecc" // UI: 3.5 Flash-Lite
 	modelIDFlash     = "56fdd199312815e2" // UI: 3.8 Flash
 	modelIDPro       = "e6fa609c3fa255c0" // UI: 3.1 Pro
+	modelIDArgon     = "95a4c0abcba24364" // UI: 4 Argon
 )
 
 func (c *Client) refreshModels(body string) {
@@ -626,6 +627,7 @@ func (c *Client) refreshModels(body string) {
 		{ID: modelIDFlashLite, Created: now, OwnedBy: "google", Provider: "gemini"},
 		{ID: modelIDFlash, Created: now, OwnedBy: "google", Provider: "gemini"},
 		{ID: modelIDPro, Created: now, OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDArgon, Created: now, OwnedBy: "google", Provider: "gemini"},
 	}
 
 	// Also pick up gemini-advanced if available in page body
@@ -634,6 +636,7 @@ func (c *Client) refreshModels(body string) {
 		modelIDFlashLite: true,
 		modelIDFlash:     true,
 		modelIDPro:       true,
+		modelIDArgon:     true,
 	}
 	for _, id := range matches {
 		id = strings.Trim(id, `\"' `)
@@ -691,6 +694,9 @@ func resolveModels(all []ModelInfo) ([]ModelInfo, map[string]string, map[string]
 		case modelIDPro:
 			aliases["gemini-3.1-pro"] = id
 			canonical["gemini-3.1-pro"] = true
+		case modelIDArgon:
+			aliases["gemini-4-argon"] = id
+			canonical["gemini-4-argon"] = true
 		}
 	}
 	return models, aliases, canonical
@@ -1080,7 +1086,7 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	if config.SourcePath {
 		sourcePath = c.conversationSourcePath(config.ConversationID)
 	}
-inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
+inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, config.ThinkingLevel, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
 if config.Incognito {
 	applyIncognito(inner)
 }
@@ -1150,7 +1156,7 @@ if config.Incognito {
 			httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 			httpReq.Header.Set("X-Same-Domain", "1")
 			// Model ID + tracking headers are mandatory for streaming; see setGenerationHeaders.
-			setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel, config.Incognito)
+			setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel, config.Incognito, buildLabel)
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
@@ -1456,7 +1462,7 @@ func (c *Client) generateContentStreamInternal(ctx context.Context, prompt strin
 		}
 
 requestID := strings.ToUpper(uuid.NewString())
-			inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
+			inner := buildGenerateInner(prompt, uploadedFiles, language, requestID, resolvedModelID, config.ThinkingLevel, c.conversationMetadata(config.ConversationID), c.conversationContextToken(config.ConversationID))
 			if config.Incognito {
 				applyIncognito(inner)
 			}
@@ -1495,7 +1501,7 @@ requestID := strings.ToUpper(uuid.NewString())
 		httpReq.Header.Set("Referer", "https://gemini.google.com/")
 		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		httpReq.Header.Set("X-Same-Domain", "1")
-		setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel, config.Incognito)
+		setGenerationHeaders(httpReq, resolvedModelID, requestID, config.ThinkingLevel, config.Incognito, buildLabel)
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
@@ -2335,12 +2341,13 @@ func resolveAvailableModel(requested string, models []ModelInfo) (string, bool) 
 	// callers opt into server-side context.
 	//
 	// Field notes from live Pro StreamGenerate capture:
-	//   [6]=[1], [61]=[1], [68]=2, [79]=<mode>, [80]=1, [91]=0
-	// where [79] matches generationHeaderMode(model): Flash=1, Pro=3, Lite=6.
+	//   [6]=[1], [61]=[1], [68]=2, [79]=<mode>, [80]=<thinking level>, [91]=0
+	// where [79] matches generationHeaderMode(model): Flash=1, Pro=3, Lite=6, Argon=8,
+	// and [80] mirrors x-goog-ext-525001261-jspb[15] (see generationThinkingMode).
 	//
 	// inner[45] / inner[67] are Gemini Web "Temporary chat" markers; see
 	// applyIncognito for the captured values.
-	func buildGenerateInner(prompt string, files []uploadedFile, language, requestID, model string, conversationMetadata []interface{}, conversationContext interface{}) []interface{} {
+	func buildGenerateInner(prompt string, files []uploadedFile, language, requestID, model, thinkingLevel string, conversationMetadata []interface{}, conversationContext interface{}) []interface{} {
 		// inner[0]: message content.
 		// No attachments:  [prompt, 0, null, null, null, null, 0]
 		// With attachments:[prompt, 0, null, fileData, null, nil, 0]
@@ -2382,7 +2389,7 @@ func resolveAvailableModel(requested string, models []ModelInfo) (string, bool) 
 		inner[61] = []interface{}{1}
 		inner[68] = 2
 		inner[79] = mode
-		inner[80] = 1
+		inner[80] = generationThinkingMode(thinkingLevel)
 		inner[91] = 0
 		return inner
 	}
@@ -2897,9 +2904,12 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 	// x-goog-ext-525001261-jspb (NOT in the request body); omitting these headers
 	// causes the server to respond in non-streaming batch mode.
 	//
-	// Live capture structure (2026-07-22):
+	// Live capture structure (2026-10-14):
 	//
-	//	x-goog-ext-525001261-jspb: [1,null,null,null,"<modelID>",null,null,0,[4,5,6,8],null,null,2,null,null,<mode>,<thinking>,"<reqUUID>"]
+	//	x-goog-ext-525001261-jspb: [1,null,null,null,"<modelID>",null,null,0,
+	//	                            [4,5,6,8,16,19,20,4,5,6,8,16,19,20],
+	//	                            null,null,2,null,null,<mode>,<thinking>,"<reqUUID>",
+	//	                            ["<buildLabel>"],null,[[<n>,<nanos>],[<epoch>,<nanos>]]]
 	//	x-goog-ext-525005358-jspb: ["<reqUUID>",1]
 	//	x-goog-ext-73010989-jspb:  [0]
 	//	x-goog-ext-73010990-jspb:  [0,0,0]
@@ -2908,12 +2918,25 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 	//   1 = Flash (3.8 Flash)
 	//   3 = Pro (3.1 Pro)
 	//   6 = Lite (3.5 Flash-Lite)
-	// Index 15 carries the thinking level: 1=standard, 2=extended.
+	//   8 = Argon (4 Argon)
+	// Index 15 carries the thinking level: 1=Low, 4=Medium, 2=High (see
+	// generationThinkingMode).
 	//
 	// Index 7 is the Gemini Web "Temporary chat" flag (captured 2026-09-10):
 	// 0 = normal chat, 1 = incognito. It is the only header index that changes
 	// when the Temporary chat toggle is flipped.
-	func setGenerationHeaders(req *http.Request, model, requestID, thinkingLevel string, incognito bool) {
+	//
+	// Index 8 and index 17 mirror the live 2026-10-14 client: the capability list
+	// now carries 16/19/20 (doubled) and [17] echoes the page build label.
+	// An early 2026-10-14 observation had 3.8 Flash answering the older
+	// 17-element header (short [8], no [17]) with an ACK-only close, but that did
+	// not reproduce: with the same body, both header forms later streamed
+	// normally. Treat these two indexes as baseline alignment, not as a proven
+	// fix — an ACK followed by silence is an upstream-side flake and surfaces to
+	// the client as `upstream result unknown`.
+	// The [19] telemetry pair is still observed-but-unadopted: it never varied
+	// with the request outcome, so nothing is fabricated for it.
+	func setGenerationHeaders(req *http.Request, model, requestID, thinkingLevel string, incognito bool, buildLabel string) {
 		mode := generationHeaderMode(model)
 		thinkingMode := generationThinkingMode(thinkingLevel)
 		incognitoFlag := 0
@@ -2922,7 +2945,11 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 		}
 		modelExt := []interface{}{
 			1, nil, nil, nil, model, nil, nil, incognitoFlag,
-			[]interface{}{4, 5, 6, 8}, nil, nil, 2, nil, nil, mode, thinkingMode, requestID,
+			[]interface{}{4, 5, 6, 8, 16, 19, 20, 4, 5, 6, 8, 16, 19, 20},
+			nil, nil, 2, nil, nil, mode, thinkingMode, requestID,
+		}
+		if label := strings.TrimSpace(buildLabel); label != "" {
+			modelExt = append(modelExt, []interface{}{label})
 		}
 		req.Header.Set("x-goog-ext-525001261-jspb", jsonCompact(modelExt))
 		req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`[%q,1]`, requestID))
@@ -2933,6 +2960,8 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 	func generationHeaderMode(model string) int {
 		model = strings.ToLower(strings.TrimSpace(model))
 		switch {
+		case model == modelIDArgon, strings.Contains(model, "argon"):
+			return 8
 		case model == modelIDFlashLite, strings.Contains(model, "flash-lite"):
 			return 6
 		case model == modelIDPro, strings.Contains(model, "pro"), strings.Contains(model, "advanced"):
@@ -2942,9 +2971,23 @@ func mergeConversationMetadata(base, next map[string]any) map[string]any {
 		}
 	}
 
+// generationThinkingMode maps a thinking level to the Gemini web value used by
+// both x-goog-ext-525001261-jspb[15] and f.req inner[80].
+//
+// Live web first-turn baseline (2026-10-14, same account/model/prompt, only the
+// "Thinking level" picker changed):
+//
+//	Low    = 1
+//	Medium = 4
+//	High   = 2
+//
+// The legacy project names stay accepted: "standard" behaved as today's Low and
+// "extended" as today's High.
 func generationThinkingMode(level string) int {
 	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "extended", "high", "deep":
+	case "medium", "balanced":
+		return 4
+	case "high", "extended", "deep", "xhigh":
 		return 2
 	default:
 		return 1

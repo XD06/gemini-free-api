@@ -95,7 +95,7 @@ func TestModelAndThinkingLevelUsesExplicitLevel(t *testing.T) {
 	if model != "gemini-3.5-flash" {
 		t.Fatalf("expected clean model, got %q", model)
 	}
-	if level != "standard" {
+	if level != "low" {
 		t.Fatalf("expected explicit thinking level, got %q", level)
 	}
 }
@@ -106,8 +106,19 @@ func TestModelAndThinkingLevelReadsModelSuffix(t *testing.T) {
 	if model != "gemini-3.5-flash" {
 		t.Fatalf("expected clean model, got %q", model)
 	}
-	if level != "extended" {
-		t.Fatalf("expected extended thinking level, got %q", level)
+	if level != "high" {
+		t.Fatalf("expected high thinking level, got %q", level)
+	}
+}
+
+func TestModelAndThinkingLevelReadsMediumSuffix(t *testing.T) {
+	model, level := modelAndThinkingLevel("gemini-4-argon:thinking=medium", "")
+
+	if model != "gemini-4-argon" {
+		t.Fatalf("expected clean model, got %q", model)
+	}
+	if level != "medium" {
+		t.Fatalf("expected medium thinking level, got %q", level)
 	}
 }
 
@@ -123,18 +134,26 @@ func TestModelAndThinkingLevelIgnoresUnknownSuffix(t *testing.T) {
 }
 
 func TestRequestThinkingLevelReadsReasoningEffort(t *testing.T) {
-	level := requestThinkingLevel(dto.ChatCompletionRequest{ReasoningEffort: "high"})
-
-	if level != "extended" {
-		t.Fatalf("expected high reasoning effort to map to extended, got %q", level)
+	cases := map[string]string{
+		"high":     "high",
+		"medium":   "medium",
+		"low":      "low",
+		"minimal":  "low",
+		"extended": "high", // legacy alias
+	}
+	for effort, want := range cases {
+		level := requestThinkingLevel(dto.ChatCompletionRequest{ReasoningEffort: effort})
+		if level != want {
+			t.Fatalf("reasoning_effort %q: expected %q, got %q", effort, want, level)
+		}
 	}
 }
 
 func TestRequestThinkingLevelReadsNestedReasoningEffort(t *testing.T) {
 	level := requestThinkingLevel(dto.ChatCompletionRequest{Reasoning: &dto.ReasoningConfig{Effort: "low"}})
 
-	if level != "standard" {
-		t.Fatalf("expected low reasoning effort to map to standard, got %q", level)
+	if level != "low" {
+		t.Fatalf("expected low reasoning effort to map to low, got %q", level)
 	}
 }
 

@@ -127,7 +127,7 @@ func TestSelectStartupPSIDTSPreservesAccountCacheOverLegacyCache(t *testing.T) {
 
 func TestBuildGenerateInnerIncludesConversationMetadataAndContextToken(t *testing.T) {
 		metadata := []interface{}{"c_1", "r_1", "rc_1", nil, nil, nil, nil, nil, nil, ""}
-		inner := buildGenerateInner("hello", nil, "en", "request-id", modelIDFlash, metadata, "opaque-token")
+		inner := buildGenerateInner("hello", nil, "en", "request-id", modelIDFlash, "", metadata, "opaque-token")
 
 		if len(inner) != 92 {
 			t.Fatalf("expected live 92-element inner, got %d", len(inner))
@@ -145,11 +145,12 @@ func TestBuildGenerateInnerIncludesConversationMetadataAndContextToken(t *testin
 	}
 
 	func TestBuildGenerateInnerMatchesLiveWebShape(t *testing.T) {
-		flash := buildGenerateInner("hi", nil, "en", "req-flash", modelIDFlash, nil, nil)
-		lite := buildGenerateInner("hi", nil, "en", "req-lite", modelIDFlashLite, nil, nil)
-		pro := buildGenerateInner("hi", nil, "en", "req-pro", modelIDPro, nil, nil)
+		flash := buildGenerateInner("hi", nil, "en", "req-flash", modelIDFlash, "", nil, nil)
+		lite := buildGenerateInner("hi", nil, "en", "req-lite", modelIDFlashLite, "", nil, nil)
+		pro := buildGenerateInner("hi", nil, "en", "req-pro", modelIDPro, "", nil, nil)
+		argon := buildGenerateInner("hi", nil, "en", "req-argon", modelIDArgon, "", nil, nil)
 
-		for name, inner := range map[string][]interface{}{"flash": flash, "lite": lite, "pro": pro} {
+		for name, inner := range map[string][]interface{}{"flash": flash, "lite": lite, "pro": pro, "argon": argon} {
 			if len(inner) != 92 {
 				t.Fatalf("%s: expected 92 elements, got %d", name, len(inner))
 			}
@@ -179,7 +180,30 @@ func TestBuildGenerateInnerIncludesConversationMetadataAndContextToken(t *testin
 		if pro[79] != 3 {
 			t.Fatalf("expected pro mode 3 at inner[79], got %#v", pro[79])
 		}
+		if argon[79] != 8 {
+			t.Fatalf("expected argon mode 8 at inner[79], got %#v", argon[79])
+		}
 	}
+
+// TestBuildGenerateInnerMirrorsThinkingLevel pins inner[80] to the same value
+// the live web sends in x-goog-ext-525001261-jspb[15] (2026-10-14 baseline:
+// Low=1, Medium=4, High=2).
+func TestBuildGenerateInnerMirrorsThinkingLevel(t *testing.T) {
+	cases := map[string]interface{}{
+		"":         1, // web default is Low
+		"low":      1,
+		"standard": 1, // legacy alias
+		"medium":   4,
+		"high":     2,
+		"extended": 2, // legacy alias
+	}
+	for level, want := range cases {
+		inner := buildGenerateInner("hi", nil, "en", "req-level", modelIDFlash, level, nil, nil)
+		if inner[80] != want {
+			t.Fatalf("level %q: expected inner[80]=%v, got %#v", level, want, inner[80])
+		}
+	}
+}
 
 func TestExtractConversationMetadataFromStreamBuffer(t *testing.T) {
 	first := buildStreamLine(t,
@@ -550,6 +574,7 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 		{ID: modelIDFlashLite, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
 		{ID: modelIDFlash, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
 		{ID: modelIDPro, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
+		{ID: modelIDArgon, Created: time.Now().Unix(), OwnedBy: "google", Provider: "gemini"},
 	})
 
 	want := map[string]string{
@@ -559,6 +584,7 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 		"gemini-3.6-flash":      "56fdd199312815e2", // backward-compatible
 		"gemini-3.5-flash":      "56fdd199312815e2", // backward-compatible
 		"gemini-3.1-pro":        "e6fa609c3fa255c0",
+		"gemini-4-argon":        "95a4c0abcba24364",
 	}
 	for alias, id := range want {
 		if aliases[alias] != id {
@@ -573,6 +599,7 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 		"gemini-3.5-flash-lite": true,
 		"gemini-3.8-flash":      true,
 		"gemini-3.1-pro":        true,
+		"gemini-4-argon":        true,
 	}
 	for name := range canonicalWant {
 		if !canonical[name] {
@@ -586,24 +613,34 @@ func TestResolveModelsExposesOnlyUIModelAliases(t *testing.T) {
 	}
 }
 
+// testBuildLabel stands in for the page build label (bl / "cfb2h") that the live
+// web client echoes back in x-goog-ext-525001261-jspb[17].
+const testBuildLabel = "boq_gemini-web-uiserver_20261012.19_p1"
+
 func TestSetGenerationHeadersUsesModelSpecificMode(t *testing.T) {
 	flashReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(flashReq, modelIDFlash, "flash-req", "", false)
+	setGenerationHeaders(flashReq, modelIDFlash, "flash-req", "", false, testBuildLabel)
 
 	liteReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(liteReq, modelIDFlashLite, "lite-req", "", false)
+	setGenerationHeaders(liteReq, modelIDFlashLite, "lite-req", "", false, testBuildLabel)
 
 	proReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(proReq, modelIDPro, "pro-req", "", false)
+	setGenerationHeaders(proReq, modelIDPro, "pro-req", "", false, testBuildLabel)
+
+	argonReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setGenerationHeaders(argonReq, modelIDArgon, "argon-req", "", false, testBuildLabel)
 
 	var flashHeader []interface{}
 	if err := json.Unmarshal([]byte(flashReq.Header.Get("x-goog-ext-525001261-jspb")), &flashHeader); err != nil {
@@ -616,6 +653,10 @@ func TestSetGenerationHeadersUsesModelSpecificMode(t *testing.T) {
 	var proHeader []interface{}
 	if err := json.Unmarshal([]byte(proReq.Header.Get("x-goog-ext-525001261-jspb")), &proHeader); err != nil {
 		t.Fatalf("unmarshal pro header: %v", err)
+	}
+	var argonHeader []interface{}
+	if err := json.Unmarshal([]byte(argonReq.Header.Get("x-goog-ext-525001261-jspb")), &argonHeader); err != nil {
+		t.Fatalf("unmarshal argon header: %v", err)
 	}
 
 	if got := int(flashHeader[7].(float64)); got != 0 {
@@ -633,38 +674,60 @@ func TestSetGenerationHeadersUsesModelSpecificMode(t *testing.T) {
 	if got := int(proHeader[14].(float64)); got != 3 {
 		t.Fatalf("expected pro mode 3, got %d", got)
 	}
+	if got := int(argonHeader[14].(float64)); got != 8 {
+		t.Fatalf("expected argon mode 8, got %d", got)
+	}
+	if got := argonHeader[4].(string); got != modelIDArgon {
+		t.Fatalf("expected argon model id in header, got %q", got)
+	}
 	if got := proHeader[4].(string); got != modelIDPro {
 		t.Fatalf("expected pro model id in header, got %q", got)
 	}
+
+	// Index 8 must stay the extended web capability list and index 17 must carry
+	// the build label: both mirror the 2026-10-14 web baseline (see setGenerationHeaders).
+	capabilities, ok := flashHeader[8].([]interface{})
+	if !ok || len(capabilities) != 14 {
+		t.Fatalf("expected header index 8 to be the 14-element capability list, got %#v", flashHeader[8])
+	}
+	for i, want := range []float64{4, 5, 6, 8, 16, 19, 20, 4, 5, 6, 8, 16, 19, 20} {
+		if got := capabilities[i].(float64); got != want {
+			t.Fatalf("expected header index 8[%d] = %v, got %v", i, want, got)
+		}
+	}
+	buildLabel, ok := flashHeader[17].([]interface{})
+	if !ok || len(buildLabel) != 1 || buildLabel[0] != testBuildLabel {
+		t.Fatalf("expected header index 17 = [%q], got %#v", testBuildLabel, flashHeader[17])
+	}
 }
 
+// TestSetGenerationHeadersUsesThinkingLevel pins header index 15 against the
+// 2026-10-14 web baseline (same account/model/prompt, only the Thinking level
+// picker changed): Low=1, Medium=4, High=2. Legacy names keep their old
+// numeric meaning (standard=1, extended=2).
 func TestSetGenerationHeadersUsesThinkingLevel(t *testing.T) {
-	standardReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
-	if err != nil {
-		t.Fatal(err)
+	cases := map[string]int{
+		"":         1,
+		"low":      1,
+		"standard": 1,
+		"medium":   4,
+		"high":     2,
+		"extended": 2,
 	}
-	setGenerationHeaders(standardReq, modelIDFlash, "standard-req", "standard", false)
+	for level, want := range cases {
+		req, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setGenerationHeaders(req, modelIDFlash, "level-req", level, false, testBuildLabel)
 
-	extendedReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	setGenerationHeaders(extendedReq, modelIDFlash, "extended-req", "extended", false)
-
-	var standardHeader []interface{}
-	if err := json.Unmarshal([]byte(standardReq.Header.Get("x-goog-ext-525001261-jspb")), &standardHeader); err != nil {
-		t.Fatalf("unmarshal standard header: %v", err)
-	}
-	var extendedHeader []interface{}
-	if err := json.Unmarshal([]byte(extendedReq.Header.Get("x-goog-ext-525001261-jspb")), &extendedHeader); err != nil {
-		t.Fatalf("unmarshal extended header: %v", err)
-	}
-
-	if got := int(standardHeader[15].(float64)); got != 1 {
-		t.Fatalf("expected standard thinking mode 1, got %d", got)
-	}
-	if got := int(extendedHeader[15].(float64)); got != 2 {
-		t.Fatalf("expected extended thinking mode 2, got %d", got)
+		var header []interface{}
+		if err := json.Unmarshal([]byte(req.Header.Get("x-goog-ext-525001261-jspb")), &header); err != nil {
+			t.Fatalf("level %q: unmarshal header: %v", level, err)
+		}
+		if got := int(header[15].(float64)); got != want {
+			t.Fatalf("level %q: expected header index 15 = %d, got %d", level, want, got)
+		}
 	}
 }
 
@@ -674,7 +737,7 @@ func TestSetGenerationHeadersUsesThinkingLevel(t *testing.T) {
 // the Temporary chat switch: off = inner[45]null / inner[67]null,
 // on = inner[45]1 / inner[67]0.
 func TestApplyIncognitoMatchesLiveWebCapture(t *testing.T) {
-	inner := buildGenerateInner("hi", nil, "en", "req-incognito", modelIDFlash, nil, nil)
+	inner := buildGenerateInner("hi", nil, "en", "req-incognito", modelIDFlash, "", nil, nil)
 
 	if inner[45] != nil || inner[67] != nil {
 		t.Fatalf("expected incognito markers unset by default, got inner[45]=%#v inner[67]=%#v", inner[45], inner[67])
@@ -708,13 +771,13 @@ func TestSetGenerationHeadersUsesIncognitoFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(normalReq, modelIDFlash, "normal-req", "", false)
+	setGenerationHeaders(normalReq, modelIDFlash, "normal-req", "", false, testBuildLabel)
 
 	incognitoReq, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setGenerationHeaders(incognitoReq, modelIDFlash, "incognito-req", "", true)
+	setGenerationHeaders(incognitoReq, modelIDFlash, "incognito-req", "", true, testBuildLabel)
 
 	var normalHeader []interface{}
 	if err := json.Unmarshal([]byte(normalReq.Header.Get("x-goog-ext-525001261-jspb")), &normalHeader); err != nil {

@@ -406,12 +406,18 @@ func splitThinkingLevelFromModel(model string) (string, string) {
 	return base, level
 }
 
+// normalizeThinkingLevel maps client-facing thinking hints onto the three
+// Gemini Web levels observed on 2026-10-14 (Low / Medium / High). The legacy
+// names keep working: "standard" behaved as today's Low and "extended" as
+// today's High.
 func normalizeThinkingLevel(level string) string {
 	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "standard", "normal", "default", "minimal", "low", "medium", "none":
-		return "standard"
-	case "extended", "high", "deep", "xhigh":
-		return "extended"
+	case "low", "standard", "normal", "default", "minimal", "none":
+		return "low"
+	case "medium", "balanced":
+		return "medium"
+	case "high", "extended", "deep", "xhigh":
+		return "high"
 	default:
 		return ""
 	}

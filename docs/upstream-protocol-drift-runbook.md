@@ -17,7 +17,77 @@
 
 不要用“网页上看到了思考”直接推断本项目一定能收到相同字段。网页 UI 可能把摘要、结构化标题和最终正文组合显示；必须同时对照网络响应。
 
-## 2026-07-13 已验证基线
+## 2026-10-14 已验证基线（当前）
+
+本次网页端更新的内容：新增模型 4 Argon，思考档位从两档改为 Low / Medium / High 三档。
+**三个旧模型的 model ID 均未变化。**
+
+### 模型表
+
+| 网页 UI | model ID（header[4]） | mode（header[14] / inner[79]） | 项目 canonical 名 |
+|:---|:---|:---|:---|
+| 3.5 Flash-Lite | `8c46e95b1a07cecc` | 6 | `gemini-3.5-flash-lite` |
+| 3.8 Flash | `56fdd199312815e2` | 1 | `gemini-3.8-flash` |
+| 3.1 Pro | `e6fa609c3fa255c0` | 3 | `gemini-3.1-pro` |
+| **4 Argon（新增）** | **`95a4c0abcba24364`** | **8** | `gemini-4-argon` |
+
+模式值来自「新开会话 + 只切换模型」的单变量采样，响应 payload 中的显示名（`"4 Argon Medium"` 等）与 UI 标签一致，可作为交叉验证。
+
+### 思考档位
+
+`x-goog-ext-525001261-jspb[15]` 与 `f.req` 的 `inner[80]` 同步取同一个值：
+
+| 网页 UI | header[15] | inner[80] |
+|:---|:---|:---|
+| Low（默认） | 1 | 1 |
+| Medium | 4 | 4 |
+| High | 2 | 2 |
+
+三档不是连续枚举：Medium 是 4 而不是 2，不要按「1/2/3」猜。旧语义仍可用：`standard`＝1（Low）、`extended`＝2（High）。
+
+### 请求头
+
+2026-10-14 的网页客户端发送 20 项 `x-goog-ext-525001261-jspb`，本项目发送 18 项。逐项差异如下：
+
+| 索引 | 网页 | 本项目 | 处理 |
+|:---|:---|:---|:---|
+| `[8]` | `[4,5,6,8,16,19,20,4,5,6,8,16,19,20]` | 同左 | 已对齐（能力列表，长度 14） |
+| `[17]` | `["<build label>"]`（即页面 `bl` / `cfb2h`） | 同左 | 已对齐 |
+| `[19]` | `[[<n>,<nanos>],[<epoch>,<nanos>]]`（遥测，首元素随机） | 不发送 | 观察项，未采纳：与请求结果无相关性，不伪造数据 |
+
+### 请求体
+
+网页端首轮 `f.req` inner 为 **99 项**，本项目为 **92 项**，逐项差异：
+
+| 索引 | 网页（首轮） | 本项目 | 说明 |
+|:---|:---|:---|:---|
+| `[3]` | 约 2.4–2.7KB 不透明 token | null | 网页首轮也带 context token |
+| `[4]` | 32 位 hex | null | |
+| `[6]` | `[0]` | `[1]` | 含义未定，暂不跟随 |
+| `[18]` `[49]` | `0` | 不发送 | |
+| `[30]` | `[4,16,19]` | `[4]` | 与 header[8] 的能力编号呼应 |
+| `[61]` | `[]` | `[1]` | |
+| `[67]` | `0` | null（非隐私模式） | 隐私标记，见隐私模式一节 |
+| `[68]` | `1` | `2` | |
+| `[80]` | 思考档位（1/4/2） | 已对齐 | |
+| `[91]` | `1` | `0` | |
+| `[96]` `[98]` | `1` | 不发送 | |
+
+**不要因为 99 > 92 就整体替换模板。** 2026-10-14 用网页端自己的 transport 回放本项目的 92 项 body，返回正常流（9 个 `wrb.fr` 条目 + 终止 entry，约 28KB），证明当前形状仍被接受。上面的差异是观察记录，不是待办清单：只有出现可复现故障时才逐项 A/B。
+
+### 已知上游抖动（不是本项目缺陷）
+
+2026-10-14 当天，上游会间歇性地对请求只返回一个会话 ACK（约 186 字节，含 `c_`/`r_`/context token）随后立即关闭连接，不产出任何正文，也会直接回传 Google 自己的错误话术（`Sorry, something went wrong...`）。同一账号、同一模型的网页端也会出现同样现象。
+
+分层判定方法：
+
+1. 看 `*.raw.txt` 是否只有 ACK、无终止 entry —— 是则属于本抖动；
+2. 同时用网页端发同一模型/提示词：网页端也失败即为上游抖动；
+3. 客户端表现是可见的错误，不是静默空回复：SSE 会先发 role chunk，再发 `{"error":{"message":"upstream result unknown; request was not retried: gemini stream progress idle timeout after 30s"}}`，然后 `[DONE]`。
+
+处理方式：不要重试、不要迁移会话（上游可能已经消费了该轮），等抖动过去。若要把等待窗口调大只影响「ACK 后长时间无进度」的场景，可调 `GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS`。
+
+## 2026-07-13 已验证基线（历史）
 
 ### 请求侧
 
@@ -252,8 +322,10 @@ go test ./... -count=1
 
 | 目标 | 入口 |
 |:---|:---|
-| Thinking 参数映射 | `internal/modules/openai/openai_service.go` |
-| 请求 header / `f.req` | `internal/modules/providers/gemini_service.go` 中 `setGenerationHeaders`、请求构造函数 |
+| Thinking 参数映射 | `internal/modules/openai/openai_service.go` 的 `normalizeThinkingLevel`、`requestThinkingLevel` |
+| 思考档位数值 | `internal/modules/providers/gemini_service.go` 的 `generationThinkingMode`（header[15] 与 inner[80] 共用） |
+| 模型 ID / 模式值 | 同文件的 `modelID*` 常量、`resolveModels`、`generationHeaderMode` |
+| 请求 header / `f.req` | 同文件的 `setGenerationHeaders`（header）、`buildGenerateInner`（inner 数组） |
 | Thinking 与正文解析 | 同文件的 `ExtractStreamState`、`extractStreamTextFromBuffer` |
 | provider -> OpenAI SSE | `CreateChatCompletionStream` |
 | 账号初始化与刷新 | `internal/modules/providers/gemini_client_pool.go` |

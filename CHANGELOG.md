@@ -7,6 +7,9 @@
 
 ### 新增
 
+- **新模型 4 Argon**：网页端新增 `4 Argon`，model ID `95a4c0abcba24364`、模式值 8，canonical 名 `gemini-4-argon`（三个旧模型 ID 与模式值经抓包确认未变）。e2e `status,stream` 已通过。
+- **思考档位改为三档**：对齐 2026-10-14 网页基线，`reasoning_effort` / `thinking_level` 支持 `low` / `medium` / `high`（网页 Low=1、Medium=4、High=2），`f.req` 的 `inner[80]` 与 header `[15]` 同步下发；旧名 `standard`＝low、`extended`＝high 继续可用。
+- **请求 header 对齐网页基线**：`x-goog-ext-525001261-jspb[8]` 采用网页的 14 项能力列表，新增 `[17]` 回填页面 build label。
 - **三协议真正流式输出**：Claude / Gemini 复用 provider 原生 stream 能力实时转发 delta，首字节延迟与 OpenAI 侧一致（`dd30994`）。
 - **请求记录看板**：控制台调用记录、首字节延迟列、账号列；统计改由前端计算（`0070213`、`caedb54`、`a687325`）。
 - **模型对齐线上**：canonical 三模型 `gemini-3.8-flash` / `gemini-3.5-flash-lite` / `gemini-3.1-pro`，旧名仅作兼容别名，`/models` 只暴露 canonical；e2e 默认模型同步切换（`10550c6`）。

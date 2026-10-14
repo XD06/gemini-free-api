@@ -140,7 +140,9 @@ func WithInputFiles(files []InputFile) GenerateOption {
 }
 
 // WithThinkingLevel sets the Gemini web thinking level. Supported values are
-// "standard" and "extended"; unknown values are ignored by the provider.
+// "low", "medium" and "high" (the web picker's Low/Medium/High); legacy
+// "standard" maps to low and "extended" to high. Unknown values are ignored by
+// the provider and fall back to the web default (low).
 func WithThinkingLevel(level string) GenerateOption {
 	return func(c *GenerateConfig) {
 		c.ThinkingLevel = level
