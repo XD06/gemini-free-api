@@ -83,9 +83,8 @@ func NewGeminiClient(cfg *configs.Config, log *zap.Logger) GeminiClient {
 
 func NewClientPool(cfg *configs.Config, log *zap.Logger) *ClientPool {
 	accounts := cfg.Gemini.Accounts
-	if len(accounts) == 0 {
-		accounts = []configs.GeminiAccountConfig{defaultGeminiAccountConfig(cfg)}
-	}
+	// An empty pool is valid; accounts can be added from /console. Cache-only
+	// console accounts are merged in here so they survive restarts.
 	accounts = applyCookieCache(cfg, accounts)
 	accounts = orderedAccounts(accounts)
 
@@ -135,7 +134,10 @@ func orderedAccounts(accounts []configs.GeminiAccountConfig) []configs.GeminiAcc
 
 func (p *ClientPool) Init(ctx context.Context) error {
 	if len(p.clients) == 0 {
-		return fmt.Errorf("no Gemini accounts configured")
+		if p.log != nil {
+			p.log.Info("No Gemini accounts configured yet; open /console to add the first account")
+		}
+		return nil
 	}
 	type initResult struct {
 		client *Client
@@ -1108,9 +1110,14 @@ func (p *ClientPool) AddAccount(ctx context.Context, accountID, secure1PSID, sec
 		CookieSource:    "console",
 		ProxyURL:        proxyURL,
 		Priority:        1,
-		StayMinutes:     60,
+		StayMinutes:     180,
 		RefreshInterval: p.cfg.Gemini.RefreshInterval,
 		MaxRetries:      p.cfg.Gemini.MaxRetries,
+	}
+	// Console-added accounts inherit the global default proxy when the form
+	// leaves the per-account proxy empty.
+	if strings.TrimSpace(account.ProxyURL) == "" && p.cfg != nil {
+		account.ProxyURL = strings.TrimSpace(p.cfg.Server.ProxyURL)
 	}
 
 	client := NewClientForAccount(p.cfg, account, p.log)
@@ -1123,7 +1130,7 @@ func (p *ClientPool) AddAccount(ctx context.Context, accountID, secure1PSID, sec
 
 	// Persist to cookie cache file so the account survives restarts.
 	if p.cfg.Gemini.CookieCache {
-		if err := saveAccountCookieCache(p.cfg.Gemini.CookieCachePath, accountID, secure1PSID, secure1PSIDTS, proxyURL, "console"); err != nil && p.log != nil {
+		if err := saveAccountCookieCache(p.cfg.Gemini.CookieCachePath, accountID, secure1PSID, secure1PSIDTS, account.ProxyURL, "console"); err != nil && p.log != nil {
 			p.log.Warn("failed to persist new account to cookie cache",
 				zap.String("account", accountID), zap.Error(err))
 		}
@@ -1132,7 +1139,7 @@ func (p *ClientPool) AddAccount(ctx context.Context, accountID, secure1PSID, sec
 	if p.log != nil {
 		p.log.Info("Gemini account added via console",
 			zap.String("account", accountID),
-			zap.String("proxy", redactProxyURL(proxyURL)),
+			zap.String("proxy", redactProxyURL(account.ProxyURL)),
 		)
 	}
 

@@ -75,6 +75,49 @@ func TestApplyCookieCachePreservesEnvAgainstNonAuthoritativeCache(t *testing.T) 
 	}
 }
 
+func TestApplyCookieCacheAddsConsoleOnlyAccount(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	if err := saveAccountCookieCache(path, "console-only", "console-psid", "console-ts", "", "console"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configs.Config{}
+	cfg.Gemini.CookieCache = true
+	cfg.Gemini.CookieCachePath = path
+	cfg.Server.ProxyURL = "http://127.0.0.1:10808"
+
+	accounts := applyCookieCache(cfg, nil)
+	if len(accounts) != 1 {
+		t.Fatalf("expected console-only account to be restored, got %#v", accounts)
+	}
+	if accounts[0].ID != "console-only" || accounts[0].Secure1PSID != "console-psid" || accounts[0].Secure1PSIDTS != "console-ts" {
+		t.Fatalf("unexpected restored account: %#v", accounts[0])
+	}
+	if accounts[0].CookieSource != "console" {
+		t.Fatalf("expected cookie source console, got %q", accounts[0].CookieSource)
+	}
+	if accounts[0].ProxyURL != cfg.Server.ProxyURL {
+		t.Fatalf("expected console account to inherit the global proxy, got %q", accounts[0].ProxyURL)
+	}
+}
+
+func TestApplyCookieCacheIgnoresNonAuthoritativeCacheOnlyEntry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	if err := saveAccountCookieCache(path, "env-only", "env-psid", "env-ts", "", "env"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configs.Config{}
+	cfg.Gemini.CookieCache = true
+	cfg.Gemini.CookieCachePath = path
+
+	if accounts := applyCookieCache(cfg, nil); len(accounts) != 0 {
+		t.Fatalf("expected env-only cache entries not to create accounts, got %#v", accounts)
+	}
+}
+
 func TestSaveAccountCookieCacheWritesPrivateFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")

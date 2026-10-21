@@ -21,54 +21,60 @@
 ## 快速开始
 
 ```bash
-cp .env.example .env
-# 编辑 .env，至少填写 GEMINI_1PSID 或 GEMINI_ACCOUNTS（configs.Validate() 强制要求）
+cp .env.example .env   # 可选：不创建也能启动，常用项都有默认值
 go run cmd/server/main.go
 ```
 
 服务默认监听 `http://localhost:8787`，API 文档 `http://localhost:8787/docs`。
 
-存活检查：`GET /health`；Gemini 账号就绪检查：`GET /ready`（无健康账号时返回 503）。
+首次启动**不需要填写任何 Cookie**，系统会：
 
-### 基础配置
+1. 自动生成管理 Token，打印在启动日志中，并保存到 `data/state/admin-token`（权限 0600）；
+2. 以空账号池启动，`/health` 正常、`/ready` 返回 503（还没有可用账号）；
+3. 等你在 Web 控制台添加第一个账号。
 
-**获取cookie**：
+### 3 步完成账号接入
 
-1. 请访问[gemini.google.com](https://gemini.google.com/)并登录
-2. 按`F12` →**Application**→**Storage**→ **Cookies**
-3. 复制`__Secure-1PSID`和`__Secure-1PSIDTS`的值
+1. 打开 `http://localhost:8787/console`，粘贴启动日志或 `data/state/admin-token` 中的管理 Token。
+2. 浏览器登录 [gemini.google.com](https://gemini.google.com/)，按 `F12` → **Application** → **Cookies**，复制 `__Secure-1PSID` 所在的那整段 Cookie。
+3. 控制台点「添加账号」，把整段 Cookie 粘进「Cookie」框保存；`__Secure-1PSIDTS` 会自动拆分，也可以留空由系统轮换。
+
+账号会保存到 `data/cookies/accounts.json`，重启后自动恢复，不需要再改配置文件。存活检查 `GET /health`；账号就绪检查 `GET /ready`（无健康账号时返回 503）。
+
+> 想让 Token 固定下来：在 `.env` 设置 `COOKIE_SYNC_TOKEN=...`，或用 `ADMIN_TOKEN_PATH` 指定 Token 文件路径。公网部署建议显式设置。
+
+### 常用默认值
+
+| 项目 | 默认值 | 修改方式 |
+|:---|:---|:---|
+| 端口 | `8787` | `.env` 的 `PORT` |
+| 限流 | 开启，60s 内 30 次 | `RATE_LIMIT_*` |
+| Cookie 自动刷新 | 1440 分钟 | `.env` 的 `GEMINI_REFRESH_INTERVAL` |
+| 控制台新增账号的停留时长 | 180 分钟 | 新增账号时自动采用 |
+| 隐私模式 | 关闭 | 控制台顶栏开关（立即生效）或 `GEMINI_INCOGNITO=true` |
+| 全局代理 | 直连 | `.env` 的 `PROXY_URL`（控制台新增账号留空时自动继承） |
+
+### 可选：用配置文件声明账号
+
+仍然支持 `GEMINI_1PSID` / `GEMINI_ACCOUNTS`，适合 Docker Compose、CI，或希望账号随配置版本化的场景；控制台添加的账号与它们共存，优先级由 `PRIORITY` 控制。完整变量列表见 [`docs/technical-details.md`](docs/technical-details.md) 与 `.env.example`。
 
 ```env
-PORT=8787
-COOKIE_SYNC_TOKEN=你的管理密钥
-PROXY_URL=http://127.0.0.1:10808
-GEMINI_INCOGNITO=false   # 隐私模式启动默认值；控制台顶栏开关可运行时切换，无需改这里
-```
-
-单账号模式直接填写 Cookie：
-
-```env
+# 单账号
 GEMINI_1PSID=你的 __Secure-1PSID
 GEMINI_1PSIDTS=可选，留空自动轮换
-```
 
-多账号模式：
-
-```env
+# 或多账号
 GEMINI_ACCOUNTS=main,backup1
 GEMINI_ACCOUNT_MAIN_1PSID=主号 __Secure-1PSID
-GEMINI_ACCOUNT_MAIN_PROXY=socks5h://127.0.0.1:10808
 GEMINI_ACCOUNT_MAIN_PRIORITY=3
-
 GEMINI_ACCOUNT_BACKUP1_1PSID=备用号 __Secure-1PSID
-GEMINI_ACCOUNT_BACKUP1_PROXY=http://127.0.0.1:10809
 ```
 
 > Docker 环境下代理地址用 `http://host.docker.internal:10808`，`docker-compose.yml` 已内置映射。
 
 ## Web 控制台
 
-访问 `http://localhost:8787/console`，使用 `COOKIE_SYNC_TOKEN` 登录。
+访问 `http://localhost:8787/console`，用管理 Token 登录（未设置 `COOKIE_SYNC_TOKEN` 时使用启动日志 / `data/state/admin-token` 中的自动生成值）。
 
 ![Console](./asset/console.png)
 
@@ -267,23 +273,27 @@ BenchmarkGenerateChatID-12                 crypto/rand     240 ns/op    88 B/op
 ### 快速启动
 
 ```bash
-# 1. 复制环境配置
+# 1. 复制环境配置（可留空，常用项都有默认值）
 cp .env.example .env
-# 编辑 .env 填写 COOKIE_SYNC_TOKEN 和 Cookie
+# 可选：设置 COOKIE_SYNC_TOKEN、PROXY_URL；Cookie 建议到控制台添加
 
 # 2. 启动服务
 docker compose up -d --build
 
-# 3. 查看日志
+# 3. 查看日志，复制自动生成的管理 Token
 docker compose logs -f
 ```
 
 服务启动后访问：
 - API 端点：`http://localhost:8787/openai/v1/chat/completions`
-- Web 控制台：`http://localhost:8787/console`
+- Web 控制台：`http://localhost:8787/console`（粘贴日志中的 Token 后添加账号）
 - API 文档：`http://localhost:8787/docs`
 
+自动生成的 Token 同时保存在挂载卷 `./data/state/admin-token` 中，重启后保持不变。
+
 ### 配置说明
+
+控制台是推荐入口：启动后添加账号、切换隐私模式、测试代理都不需要改 `.env`。下面两种写法仅用于希望账号随配置版本化或无人值守部署的场景。
 
 #### 单账号模式
 
@@ -320,8 +330,8 @@ GEMINI_ACCOUNT_ACC2_PRIORITY=2
 
 | 挂载路径 | 说明 | 建议 |
 |:---|:---|:---|
-| `./data` | Cookie 缓存、账号状态、请求日志 | 必须持久化 |
-| `./.env` | 配置文件（只读挂载） | 修改后 `docker compose restart` 生效 |
+| `./data` | Cookie 缓存、账号状态、自动生成的管理 Token | 必须持久化 |
+| `./.env` | 配置文件（只读挂载），可只写 `COOKIE_SYNC_TOKEN` / `PROXY_URL` | 修改后 `docker compose restart` 生效 |
 | `./.cookies` | Cookie jar 文件 | 可选 |
 
 ### 构建特性
@@ -333,7 +343,7 @@ GEMINI_ACCOUNT_ACC2_PRIORITY=2
 
 ## Admin API
 
-所有 `/admin/*` 请求需带 `Authorization: Bearer <COOKIE_SYNC_TOKEN>`。
+所有 `/admin/*` 请求需带管理 Token（`Authorization: Bearer <token>` 或 `X-Cookie-Sync-Token`）。Token 优先取 `COOKIE_SYNC_TOKEN`；未设置时使用 `data/state/admin-token` 中自动生成的值。
 
 ```bash
 # 列出账号

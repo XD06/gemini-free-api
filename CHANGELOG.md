@@ -16,6 +16,7 @@
 - **控制台与流韧性升级**：账号操作错误分类、stream timings、代理前置校验、Cookie/流状态可靠性（`9ebc237`、`db35f15`、`253b628`、`7fd2eb0`）。
 - **CI 质量门**：`go vet` + `go test` + `-race`（providers/openai）+ `govulncheck`（`e0f778e`）。
 - **网页端隐私模式（Temporary chat）**：新增 `GEMINI_INCOGNITO` 全局开关（默认 false）与控制台顶栏「隐私模式」运行时开关（同一开关，`GET|POST /admin/settings`，无需改 `.env`、无需重启），三协议请求体支持 `incognito` 字段。开启后上游请求带网页基线对齐的隐私标记（`inner[45]=1`、`inner[67]=0`、`x-goog-ext-525001261-jspb[7]=1`），网页端不留记录；`conversation_id` 语义不变，续聊照常。
+- **Cookie Worker CDP 模式（可选扩展）**：设置 `COOKIE_WORKER_CDP_URL` 后，Worker 通过 Chrome DevTools Protocol 附加到已登录的 Chrome，读取现有 Gemini Cookie 并回填服务端，随后一次性退出；`browser.close()` 会发送 `Browser.close` 终断用户浏览器，代码刻意不调用。`COOKIE_WORKER_ACCOUNT` 在该模式下为权威账号 ID，`COOKIE_WORKER_CREATE_ACCOUNT=true` 可在账号不存在时自动创建。未设置该变量时 Worker 行为与原来完全一致。
 - **工具桥接提示词严格化（三协议一致）**：OpenAI / Claude / Gemini 的桥接提示词均明确声明上游模型**没有原生工具调用能力**、工具由本服务执行，必须**按约定 JSON 格式输出**（不得用 markdown 代码围栏、不得在 JSON 前后附加文字），并说明**结果会自动回传**、无需请求许可、也不存在其他获取途径；同时新增「不得凭自身知识或网页自带卡片作答」与「不得凭空编造工具结果」两条约束。repair 提示词同步加入同一前提说明。
 
 ### 修复
@@ -34,6 +35,11 @@
 
 ### 变更
 
+- **零配置启动与控制台开户**：账号池允许为空启动，`/health` 正常、`/ready` 返回 503；控制台可直接添加首个账号并持久化到 `data/cookies/accounts.json`，重启后由 `applyCookieCache` 自动恢复（此前仅存在于缓存的 console 账号会丢失）。
+- **管理 Token 自动生成**：未设置 `COOKIE_SYNC_TOKEN` 时启动生成随机 Token，打印到日志并保存到 `data/state/admin-token`（0600；可用 `ADMIN_TOKEN_PATH` 改路径），重启复用；控制台登录页与错误提示同步说明来源。
+- **控制台开户体验**：支持整段 Cookie 头粘贴并自动拆分 `__Secure-1PSIDTS`；空账号池显示三步引导和「添加第一个账号」按钮；代理输入框用全局 `PROXY_URL` 作占位提示；`GET /admin/settings` 增加只读有效配置（Token 来源、默认代理、端口、刷新间隔、限流）。
+- **常用默认值**：`GEMINI_REFRESH_INTERVAL` 默认 1440 分钟、`RATE_LIMIT_MAX_REQUESTS` 默认 30、控制台新增账号停留时间默认 180 分钟；控制台新增账号留空代理时自动继承全局 `PROXY_URL`。
+- **长思考流等待**：`.env.example` 的 `GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS` 由 30s 上调到 60s（代码兜底仍为 45s），避免 `gemini-4-argon` 等长思考模型在正文出现前被 30s 超时误杀。
 - **流超时对齐线上**：默认首活动 15s→25s、进度空闲 30s→45s、响应头 15s→60s；会话 ACK 视为首活动（`10550c6`）。
 
 ## [2026-07-02] — 性能与可靠性优化

@@ -16,6 +16,28 @@ import (
 	"go.uber.org/zap"
 )
 
+func TestClientPoolInitAllowsEmptyPool(t *testing.T) {
+	pool := &ClientPool{log: zap.NewNop()}
+	if err := pool.Init(context.Background()); err != nil {
+		t.Fatalf("expected an empty pool to initialize without error, got %v", err)
+	}
+	if pool.IsHealthy() {
+		t.Fatal("an empty pool must not report healthy")
+	}
+}
+
+func TestNewClientPoolDoesNotSynthesizeAccount(t *testing.T) {
+	cfg := &configs.Config{}
+	cfg.Gemini.CookieCache = false
+	pool := NewClientPool(cfg, zap.NewNop())
+	if len(pool.clients) != 0 {
+		t.Fatalf("expected no synthesized account, got %d", len(pool.clients))
+	}
+	if statuses := pool.ListAccountStatuses(); len(statuses) != 0 {
+		t.Fatalf("expected no account statuses, got %#v", statuses)
+	}
+}
+
 func TestClientPoolRotatesOnlyForNewConversations(t *testing.T) {
 	now := time.Now()
 	main := &Client{accountID: "main", healthy: true}

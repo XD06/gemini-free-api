@@ -35,6 +35,7 @@ func NewController(client providers.GeminiClient, cfg *configs.Config, log *zap.
 }
 
 func (c *Controller) Register(group fiber.Router) {
+	c.logAdminTokenHint()
 	group.Get("/accounts", c.HandleListAccounts)
 	group.Post("/accounts", c.HandleAddAccount)
 	group.Delete("/accounts/:account_id", c.HandleRemoveAccount)
@@ -96,6 +97,7 @@ func (c *Controller) HandleUpdateCookies(ctx fiber.Ctx) error {
 	}
 
 	accountID := ctx.Params("account_id")
+	req.Secure1PSID, req.Secure1PSIDTS = normalizeCookieInput(req.Secure1PSID, req.Secure1PSIDTS)
 	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := manager.UpdateAccountCookies(reqCtx, accountID, req.Secure1PSID, req.Secure1PSIDTS); err != nil {
@@ -162,6 +164,10 @@ func (c *Controller) HandleAddAccount(ctx fiber.Ctx) error {
 	}
 	if strings.TrimSpace(req.AccountID) == "" {
 		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("account_id is required"), "invalid_request_error"))
+	}
+	req.Secure1PSID, req.Secure1PSIDTS = normalizeCookieInput(req.Secure1PSID, req.Secure1PSIDTS)
+	if req.Secure1PSID == "" {
+		return ctx.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("secure_1psid is required"), "invalid_request_error"))
 	}
 	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -406,17 +412,32 @@ func (c *Controller) HandleTestProxy(ctx fiber.Ctx) error {
 	})
 }
 
-// HandleGetSettings returns the runtime switches that the console can toggle.
+// HandleGetSettings returns the runtime switches that the console can toggle
+// plus a read-only view of effective startup defaults, so operators do not
+// have to open .env just to see what the service is using.
 // incognito_source tells the UI whether the value comes from the console
 // ("runtime") or from the GEMINI_INCOGNITO .env default ("env").
 func (c *Controller) HandleGetSettings(ctx fiber.Ctx) error {
 	if err := c.requireToken(ctx); err != nil {
 		return err
 	}
-	return ctx.JSON(fiber.Map{
+	payload := fiber.Map{
 		"incognito":        providers.IncognitoEnabled(),
 		"incognito_source": providers.IncognitoSource(),
-	})
+	}
+	if c.cfg != nil {
+		payload["admin_token_source"] = c.cfg.Admin.CookieSyncTokenSource
+		payload["admin_token_path"] = c.cfg.Admin.CookieSyncTokenPath
+		payload["default_proxy"] = c.cfg.Server.ProxyURL
+		payload["port"] = c.cfg.Server.Port
+		payload["refresh_interval_minutes"] = c.cfg.Gemini.RefreshInterval
+		payload["rate_limit"] = fiber.Map{
+			"enabled":      c.cfg.RateLimit.Enabled,
+			"max_requests": c.cfg.RateLimit.MaxRequests,
+			"window_ms":    c.cfg.RateLimit.WindowMs,
+		}
+	}
+	return ctx.JSON(payload)
 }
 
 type updateSettingsRequest struct {
@@ -485,13 +506,84 @@ func (c *Controller) accountManager() (providers.AccountManager, error) {
 	return manager, nil
 }
 
+func (c *Controller) logAdminTokenHint() {
+	if c == nil || c.cfg == nil || c.log == nil {
+		return
+	}
+	admin := c.cfg.Admin
+	switch admin.CookieSyncTokenSource {
+	case "generated":
+		c.log.Info("Generated a new admin token; use it to sign in at /console",
+			zap.String("token", admin.CookieSyncToken),
+			zap.String("path", admin.CookieSyncTokenPath))
+	case "file":
+		c.log.Info("Loaded the admin token from disk; use it to sign in at /console",
+			zap.String("path", admin.CookieSyncTokenPath))
+	case "ephemeral":
+		c.log.Warn("Admin token could not be persisted and will change on restart",
+			zap.String("token", admin.CookieSyncToken),
+			zap.String("path", admin.CookieSyncTokenPath))
+	case "unavailable":
+		c.log.Warn("Admin token could not be generated; set COOKIE_SYNC_TOKEN to enable /admin")
+	}
+}
+
+// normalizeCookieInput accepts either two isolated cookie values or a full
+// "Cookie: ..." header pasted from DevTools, which is what users normally copy.
+func normalizeCookieInput(psid, psidts string) (string, string) {
+	psid = strings.TrimSpace(psid)
+	psidts = strings.TrimSpace(psidts)
+
+	if looksLikeCookieHeader(psid) {
+		values := parseCookieHeader(psid)
+		if value := values["__Secure-1PSID"]; value != "" {
+			psid = value
+		}
+		if psidts == "" {
+			psidts = values["__Secure-1PSIDTS"]
+		}
+	}
+	if looksLikeCookieHeader(psidts) {
+		values := parseCookieHeader(psidts)
+		if value := values["__Secure-1PSID"]; value != "" {
+			psid = value
+		}
+		if value := values["__Secure-1PSIDTS"]; value != "" {
+			psidts = value
+		}
+	}
+	psid = strings.TrimSpace(strings.TrimPrefix(psid, "__Secure-1PSID="))
+	psidts = strings.TrimSpace(strings.TrimPrefix(psidts, "__Secure-1PSIDTS="))
+	return psid, psidts
+}
+
+func looksLikeCookieHeader(raw string) bool {
+	return strings.Contains(raw, "__Secure-1PSID") || strings.Contains(raw, ";")
+}
+
+func parseCookieHeader(raw string) map[string]string {
+	values := make(map[string]string)
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(part, "=")
+		if idx <= 0 {
+			continue
+		}
+		values[strings.TrimSpace(part[:idx])] = strings.TrimSpace(part[idx+1:])
+	}
+	return values
+}
+
 func (c *Controller) requireToken(ctx fiber.Ctx) error {
 	expected := ""
 	if c.cfg != nil {
 		expected = strings.TrimSpace(c.cfg.Admin.CookieSyncToken)
 	}
 	if expected == "" {
-		return ctx.Status(fiber.StatusForbidden).JSON(utils.ErrorToResponse(fmt.Errorf("COOKIE_SYNC_TOKEN is not configured"), "forbidden"))
+		return ctx.Status(fiber.StatusForbidden).JSON(utils.ErrorToResponse(fmt.Errorf("admin token is not configured; check the startup log or set COOKIE_SYNC_TOKEN"), "forbidden"))
 	}
 	token := strings.TrimSpace(ctx.Get("X-Cookie-Sync-Token"))
 	if token == "" {

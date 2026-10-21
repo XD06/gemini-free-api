@@ -19,10 +19,22 @@ type adminAccountManagerStub struct {
 	refreshErr      error
 	testErr         error
 	updateCookieErr error
+	addedAccountID  string
+	addedPSID       string
+	addedPSIDTS     string
+	addedProxy      string
 }
 
 func (s *adminAccountManagerStub) UpdateAccountCookies(context.Context, string, string, string) error {
 	return s.updateCookieErr
+}
+
+func (s *adminAccountManagerStub) AddAccount(_ context.Context, accountID, secure1PSID, secure1PSIDTS, proxyURL string) error {
+	s.addedAccountID = accountID
+	s.addedPSID = secure1PSID
+	s.addedPSIDTS = secure1PSIDTS
+	s.addedProxy = proxyURL
+	return nil
 }
 
 func (s *adminAccountManagerStub) RefreshAccount(context.Context, string) error {
@@ -136,6 +148,82 @@ func TestAdminRefreshMapsCookiePairMismatchToActionableError(t *testing.T) {
 	}
 	if payload.Error.Code != providers.AccountErrorCookiePairMismatch || payload.Error.State != providers.AccountStateNeedsManualLogin || payload.Error.Retryable || payload.Error.Action == "" {
 		t.Fatalf("unexpected error payload: %#v", payload.Error)
+	}
+}
+
+func TestAdminAddAccountNormalizesFullCookieHeader(t *testing.T) {
+	stub := &adminAccountManagerStub{}
+	app := fiber.New()
+	controller := NewController(stub, &configs.Config{
+		Admin: configs.AdminConfig{CookieSyncToken: "secret"},
+	}, zap.NewNop())
+	controller.Register(app.Group("/admin"))
+
+	body := `{"account_id":"acc1","secure_1psid":"__Secure-1PSID=psid-value; __Secure-1PSIDTS=ts-value; NID=other"}`
+	req := httptest.NewRequest("POST", "/admin/accounts", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if stub.addedAccountID != "acc1" || stub.addedPSID != "psid-value" || stub.addedPSIDTS != "ts-value" {
+		t.Fatalf("unexpected normalized account: %#v", stub)
+	}
+}
+
+func TestAdminSettingsReportsEffectiveConfig(t *testing.T) {
+	cfg := &configs.Config{
+		Admin: configs.AdminConfig{
+			CookieSyncToken:       "secret",
+			CookieSyncTokenSource: "file",
+			CookieSyncTokenPath:   "data/state/admin-token",
+		},
+		RateLimit: configs.RateLimitConfig{Enabled: true, WindowMs: 60000, MaxRequests: 30},
+	}
+	cfg.Server.Port = "8787"
+	cfg.Server.ProxyURL = "http://127.0.0.1:10808"
+	cfg.Gemini.RefreshInterval = 1440
+
+	app := fiber.New()
+	controller := NewController(&providers.Client{}, cfg, zap.NewNop())
+	controller.Register(app.Group("/admin"))
+
+	req := httptest.NewRequest("GET", "/admin/settings", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var payload struct {
+		AdminTokenSource       string `json:"admin_token_source"`
+		AdminTokenPath         string `json:"admin_token_path"`
+		DefaultProxy           string `json:"default_proxy"`
+		Port                   string `json:"port"`
+		RefreshIntervalMinutes int    `json:"refresh_interval_minutes"`
+		RateLimit              struct {
+			Enabled     bool `json:"enabled"`
+			MaxRequests int  `json:"max_requests"`
+			WindowMs    int  `json:"window_ms"`
+		} `json:"rate_limit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.AdminTokenSource != "file" || payload.AdminTokenPath != "data/state/admin-token" {
+		t.Fatalf("unexpected token fields: %#v", payload)
+	}
+	if payload.DefaultProxy != "http://127.0.0.1:10808" || payload.Port != "8787" || payload.RefreshIntervalMinutes != 1440 {
+		t.Fatalf("unexpected effective config: %#v", payload)
+	}
+	if !payload.RateLimit.Enabled || payload.RateLimit.MaxRequests != 30 || payload.RateLimit.WindowMs != 60000 {
+		t.Fatalf("unexpected rate limit payload: %#v", payload.RateLimit)
 	}
 }
 

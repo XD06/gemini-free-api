@@ -1946,9 +1946,9 @@ body.overlay-open { overflow: hidden; }
       <svg viewBox="0 0 24 24" fill="none"><path d="M12 1a4 4 0 00-4 4v6a4 4 0 008 0V5a4 4 0 00-4-4z" stroke="currentColor" stroke-width="1.5"/><path d="M5 11v1a7 7 0 0014 0v-1M12 19v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
     </div>
     <div class="gate-title">连接到管理后台</div>
-    <div class="gate-sub">输入 COOKIE_SYNC_TOKEN 以管理你的 Gemini 账号池。Token 会保存在本地浏览器中。</div>
+    <div class="gate-sub">Token 会保存在本地浏览器中。首次启动时系统会自动生成一个管理 Token：查看服务启动日志，或读取 <code>data/state/admin-token</code>；也可以在 <code>.env</code> 中设置 <code>COOKIE_SYNC_TOKEN</code> 覆盖。</div>
     <label class="form-label" for="gateToken">管理 Token</label>
-    <input class="gate-input" type="password" id="gateToken" name="admin-token" autocomplete="current-password" spellcheck="false" placeholder="输入 COOKIE_SYNC_TOKEN…" onkeydown="if(event.key==='Enter')connect()">
+    <input class="gate-input" type="password" id="gateToken" name="admin-token" autocomplete="current-password" spellcheck="false" placeholder="粘贴启动日志中的 Token…" onkeydown="if(event.key==='Enter')connect()">
     <div class="gate-actions"><button class="btn btn-primary" id="gateConnect" type="button" onclick="connect()">连接控制台</button></div>
     <div class="gate-error" id="gateError" role="alert"></div>
     </div>
@@ -1974,9 +1974,9 @@ body.overlay-open { overflow: hidden; }
       <div class="form-hint">账号唯一标识，创建后不可修改</div>
     </div>
     <div class="form-group">
-      <label class="form-label" for="formPSID">__Secure-1PSID</label>
-      <textarea class="form-textarea" id="formPSID" name="secure-1psid" autocomplete="off" spellcheck="false" placeholder="粘贴完整 Cookie 值…" style="min-height:56px"></textarea>
-      <div class="form-hint">从 gemini.google.com 的 Cookie 中获取</div>
+      <label class="form-label" for="formPSID">Cookie</label>
+      <textarea class="form-textarea" id="formPSID" name="secure-1psid" autocomplete="off" spellcheck="false" placeholder="粘贴整段 Cookie 头（推荐），或只粘贴 __Secure-1PSID 的值…" style="min-height:56px"></textarea>
+      <div class="form-hint">支持下述两种方式：从 gemini.google.com 复制整段 Cookie 头直接粘贴，__Secure-1PSIDTS 会自动拆分；或只填 __Secure-1PSID 值。</div>
     </div>
     <div class="form-group">
       <label class="form-label" for="formPSIDTS">__Secure-1PSIDTS</label>
@@ -1989,7 +1989,7 @@ body.overlay-open { overflow: hidden; }
         <input class="form-input" id="formProxy" name="proxy-url" type="url" autocomplete="off" spellcheck="false" placeholder="例如 http://host.docker.internal:10808…" style="flex:1">
         <button class="btn btn-ghost btn-sm" id="proxyTestBtn" type="button" onclick="doTestProxy(this)" style="white-space:nowrap">测试代理</button>
       </div>
-      <div class="form-hint">该账号专属代理，留空则使用全局 PROXY_URL</div>
+      <div class="form-hint">该账号专属代理；留空时自动继承全局默认代理（<code>PROXY_URL</code>，当前值会显示在下方输入框的占位提示中）</div>
     </div>
   </div>
   <div class="drawer-foot">
@@ -2015,6 +2015,7 @@ const State = {
   editing: null,
   refreshTimer: null,
   incognito: false,
+  settings: { defaultProxy: '' },
 };
 
 // ===== Token management =====
@@ -2383,10 +2384,44 @@ function closeDrawer() {
   State.editing = null;
 }
 
+// Accept a pasted Cookie header as well as bare values. The backend performs
+// the same normalization; splitting here keeps the form readable and shows
+// which cookies were recognized before saving.
+function parseCookieInput(rawPSID, rawPSIDTS) {
+  const result = { psid: (rawPSID || '').trim(), psidts: (rawPSIDTS || '').trim() };
+  const readPairs = raw => {
+    const values = {};
+    raw.split(';').forEach(part => {
+      const idx = part.indexOf('=');
+      if (idx <= 0) return;
+      values[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+    });
+    return values;
+  };
+  const looksLikeHeader = raw => raw.includes('__Secure-1PSID') || raw.includes(';');
+  if (looksLikeHeader(result.psid)) {
+    const values = readPairs(result.psid);
+    if (values['__Secure-1PSID']) result.psid = values['__Secure-1PSID'];
+    if (!result.psidts && values['__Secure-1PSIDTS']) result.psidts = values['__Secure-1PSIDTS'];
+  }
+  if (looksLikeHeader(result.psidts)) {
+    const values = readPairs(result.psidts);
+    if (values['__Secure-1PSID']) result.psid = values['__Secure-1PSID'];
+    if (values['__Secure-1PSIDTS']) result.psidts = values['__Secure-1PSIDTS'];
+  }
+  result.psid = result.psid.replace(/^__Secure-1PSID=/, '').trim();
+  result.psidts = result.psidts.replace(/^__Secure-1PSIDTS=/, '').trim();
+  return result;
+}
+
 async function saveDrawer() {
   const id = document.getElementById('formAccountId').value.trim();
-  const psid = document.getElementById('formPSID').value.trim();
-  const psidts = document.getElementById('formPSIDTS').value.trim();
+  const parsed = parseCookieInput(
+    document.getElementById('formPSID').value,
+    document.getElementById('formPSIDTS').value
+  );
+  const psid = parsed.psid;
+  const psidts = parsed.psidts;
   const proxy = document.getElementById('formProxy').value.trim();
 
   if (!id) { toast('\u8bf7\u586b\u5199 Account ID', 'err'); return; }
@@ -2548,7 +2583,12 @@ async function fetchSettings() {
     const res = await fetch('/admin/settings', { headers: apiHeaders() });
     if (!res.ok) return;
     const data = await res.json();
+    State.settings.defaultProxy = data.default_proxy || '';
     renderIncognito(data.incognito, data.incognito_source);
+    if (State.editing === 'add') {
+      const proxyInput = document.getElementById('formProxy');
+      if (proxyInput && !proxyInput.value) proxyInput.placeholder = State.settings.defaultProxy || '例如 http://host.docker.internal:10808…';
+    }
   } catch (e) { /* non-fatal: keep the default label */ }
 }
 
@@ -3153,7 +3193,7 @@ function connect() {
   const token = input.value.trim();
   error.textContent = '';
   if (!token) {
-    error.textContent = '请输入 COOKIE_SYNC_TOKEN。';
+    error.textContent = '请输入管理 Token。';
     input.focus();
     return;
   }
@@ -3168,10 +3208,15 @@ async function verifyAndEnter() {
   if (gateError) gateError.textContent = '';
   try {
     const res = await fetch('/admin/accounts', { headers: apiHeaders() });
-    if (res.status === 401 || res.status === 403) {
+    if (res.status === 403) {
       clearToken();
       State.token = '';
-      throw new Error('Token 无效，或服务端未配置 COOKIE_SYNC_TOKEN。');
+      throw new Error('服务端没有可用的管理 Token：请查看启动日志，或读取 data/state/admin-token，也可以在 .env 中设置 COOKIE_SYNC_TOKEN。');
+    }
+    if (res.status === 401) {
+      clearToken();
+      State.token = '';
+      throw new Error('管理 Token 不正确，请从启动日志或 data/state/admin-token 重新复制。');
     }
     if (!res.ok) throw new Error('管理接口返回 HTTP ' + res.status + '。');
     const data = await res.json();
@@ -3384,6 +3429,11 @@ function accountNotice(account) {
 function renderAccounts() {
   const grid = document.getElementById('accountsGrid');
   const accounts = getVisibleAccounts();
+  if (!State.accounts.length) {
+    grid.innerHTML = '<div class="empty" style="grid-column:1/-1"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2"/><path d="M24 18v12M18 24h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><div style="font-size:15px;font-weight:600;color:var(--tx)">还没有账号，先加一个</div><div class="form-hint" style="max-width:520px;line-height:1.7">1. 在浏览器打开 <code>gemini.google.com</code> 并登录 Google 账号<br>2. 打开开发者工具 → Application → Cookies，复制 <code>__Secure-1PSID</code> 所在的那整段 Cookie（或只复制该值）<br>3. 点击下方按钮粘贴保存，无需修改配置文件</div><div style="margin-top:14px"><button class="btn btn-primary" type="button" onclick="openAddDrawer()">添加第一个账号</button></div></div>';
+    renderBatchBar();
+    return;
+  }
   if (!accounts.length) {
     grid.innerHTML = '<div class="empty" style="grid-column:1/-1"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2"/><path d="M14 20h20M14 28h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><div>没有匹配的账号</div><div class="form-hint">调整搜索词或状态筛选后重试。</div></div>';
     renderBatchBar();
@@ -3517,7 +3567,9 @@ function openAddDrawer() {
   document.getElementById('formPSID').value = '';
   document.getElementById('formPSIDTS').value = '';
   document.getElementById('formProxy').value = '';
+  document.getElementById('formProxy').placeholder = State.settings.defaultProxy || '例如 http://host.docker.internal:10808…';
   document.getElementById('drawerDelete').style.display = 'none';
+  if (!State.settings.defaultProxy) fetchSettings();
   showDrawer();
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,28 +37,76 @@ func applyCookieCache(cfg *configs.Config, accounts []configs.GeminiAccountConfi
 	}
 
 	applied := append([]configs.GeminiAccountConfig(nil), accounts...)
+	index := make(map[string]int, len(applied))
 	for i := range applied {
+		index[applied[i].ID] = i
 		entry, ok := cache.Accounts[applied[i].ID]
 		if !ok {
 			continue
 		}
-		// Console/worker updates are deliberate runtime operator changes and must
-		// survive restart even when .env still contains the original pair.
-		cacheSource := strings.ToLower(strings.TrimSpace(entry.Source))
-		cacheIsAuthoritative := cacheSource == "console" || cacheSource == "worker" || cacheSource == "runtime"
-		if (cacheIsAuthoritative || strings.TrimSpace(applied[i].Secure1PSID) == "") && strings.TrimSpace(entry.Secure1PSID) != "" {
-			applied[i].Secure1PSID = entry.Secure1PSID
-			applied[i].Secure1PSIDTS = entry.Secure1PSIDTS
-			applied[i].CookieSource = cacheSource
-			if applied[i].CookieSource == "" {
-				applied[i].CookieSource = "cache"
-			}
-		}
-		if strings.TrimSpace(applied[i].ProxyURL) == "" && strings.TrimSpace(entry.ProxyURL) != "" {
-			applied[i].ProxyURL = entry.ProxyURL
+		applyCookieCacheEntry(&applied[i], entry)
+	}
+
+	// Accounts added from the console exist only in the cache. Without this
+	// merge they would vanish on restart unless the same ID was also declared
+	// in GEMINI_ACCOUNTS.
+	ids := make([]string, 0, len(cache.Accounts))
+	for id := range cache.Accounts {
+		if _, exists := index[id]; !exists {
+			ids = append(ids, id)
 		}
 	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		entry := cache.Accounts[id]
+		source := strings.ToLower(strings.TrimSpace(entry.Source))
+		if !cacheSourceIsAuthoritative(source) || strings.TrimSpace(entry.Secure1PSID) == "" {
+			continue
+		}
+		proxyURL := strings.TrimSpace(entry.ProxyURL)
+		if proxyURL == "" {
+			proxyURL = strings.TrimSpace(cfg.Server.ProxyURL)
+		}
+		applied = append(applied, configs.GeminiAccountConfig{
+			ID:              id,
+			Secure1PSID:     entry.Secure1PSID,
+			Secure1PSIDTS:   entry.Secure1PSIDTS,
+			CookieSource:    source,
+			ProxyURL:        proxyURL,
+			Priority:        0,
+			StayMinutes:     180,
+			RefreshInterval: cfg.Gemini.RefreshInterval,
+			MaxRetries:      cfg.Gemini.MaxRetries,
+		})
+	}
 	return applied
+}
+
+func applyCookieCacheEntry(dst *configs.GeminiAccountConfig, entry cookieCacheEntry) {
+	// Console/worker updates are deliberate runtime operator changes and must
+	// survive restart even when .env still contains the original pair.
+	cacheSource := strings.ToLower(strings.TrimSpace(entry.Source))
+	cacheIsAuthoritative := cacheSourceIsAuthoritative(cacheSource)
+	if (cacheIsAuthoritative || strings.TrimSpace(dst.Secure1PSID) == "") && strings.TrimSpace(entry.Secure1PSID) != "" {
+		dst.Secure1PSID = entry.Secure1PSID
+		dst.Secure1PSIDTS = entry.Secure1PSIDTS
+		dst.CookieSource = cacheSource
+		if dst.CookieSource == "" {
+			dst.CookieSource = "cache"
+		}
+	}
+	if strings.TrimSpace(dst.ProxyURL) == "" && strings.TrimSpace(entry.ProxyURL) != "" {
+		dst.ProxyURL = entry.ProxyURL
+	}
+}
+
+func cacheSourceIsAuthoritative(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "console", "worker", "runtime":
+		return true
+	default:
+		return false
+	}
 }
 
 func saveAccountCookieCache(path, accountID, secure1PSID, secure1PSIDTS, proxyURL, source string) error {

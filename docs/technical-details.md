@@ -2,6 +2,14 @@
 
 本文档收录 Gemini Web to API 的实现细节、排错指南和内部机制说明。
 
+## 启动与账号接入
+
+- 服务允许在没有任何 Gemini 账号时启动；此时 `/health` 返回 200、`/ready` 返回 503，请求路径会因无健康账号返回错误。
+- 推荐在 `/console` 添加首个账号：整段 Cookie 头可直接粘贴，前端与服务端都会拆出 `__Secure-1PSID` / `__Secure-1PSIDTS`。
+- 控制台新增账号写入 `data/cookies/accounts.json`（`source=console`）；启动时 `applyCookieCache` 会把仅存在于缓存的 console/worker/runtime 账号重新加入账号池，因此无需在 `GEMINI_ACCOUNTS` 重复声明。
+- 管理 Token：`COOKIE_SYNC_TOKEN` 优先；留空时启动生成随机值并保存到 `data/state/admin-token`（0600），日志会打印。文件不可写时退化为进程内临时 token（重启后变化）。
+- `GET /admin/settings` 除 `incognito` 外还返回只读有效配置：`admin_token_source`、`admin_token_path`、`default_proxy`、`port`、`refresh_interval_minutes`、`rate_limit`。
+
 ## 多轮上下文
 
 OpenAI Chat Completions 本身是无状态协议。本项目通过两种方式接入 Gemini Web 服务端上下文。
@@ -83,7 +91,7 @@ Gemini Web 没有稳定的隐藏 system 字段。首轮会把 system 作为提�
 
 - **控制台开关与 `.env` 是同一个开关**：`POST /admin/settings {"incognito":true}` 写入运行时设置（进程级、加锁），立即对后续所有请求生效，无需改 `.env`、无需重启。重启后回落到 `.env` 默认值。
 - 运行时设置由 `providers.RuntimeSettings`（`runtime_settings.go`，`sync.RWMutex`）持有，是进程内唯一可变态；请求路径读、admin 路径写，必须走锁。
-- `GET /admin/settings` 返回 `{"incognito":bool,"incognito_source":"env"|"runtime"}`；`incognito_source` 表明当前值来自 `.env` 还是控制台覆盖。
+- `GET /admin/settings` 返回 `{"incognito":bool,"incognito_source":"env"|"runtime", ...}`：`incognito_source` 表明当前值来自 `.env` 还是控制台覆盖；其余字段（`admin_token_source`、`admin_token_path`、`default_proxy`、`port`、`refresh_interval_minutes`、`rate_limit`）是只读有效配置，供控制台展示与预填，写入时只接受 `incognito`。
 - 优先级：控制台覆盖 > `.env` 默认；三协议请求体 `incognito: true` 与全局值为**或**关系（只加不减）。
 - **续聊语义不变**：同一 `conversation_id` 仍映射到同一 Gemini 侧会话，多轮上下文照常（本地已验证第二轮能回忆起第一轮内容）。
 - 上游差异（2026-09-10 网页单变量基线，同一账号/模型/提示词，仅切换 Temporary chat）：
@@ -188,7 +196,7 @@ HTTPS_PROXY=http://host.docker.internal:10808 wget -S -O- --timeout=15 https://w
 
 ## Cookie 同步与 Worker
 
-主服务提供 `/admin/*` 接口供 Playwright Cookie Worker 同步账号 Cookie。所有请求需带 `COOKIE_SYNC_TOKEN`。
+主服务提供 `/admin/*` 接口供 Playwright Cookie Worker 同步账号 Cookie。所有请求需带管理 Token：优先使用 `COOKIE_SYNC_TOKEN`；未配置时使用启动时自动生成并落盘到 `data/state/admin-token`（0600）的值，启动日志会打印它。Token 来源（`env` / `file` / `generated` / `ephemeral`）可通过 `GET /admin/settings` 的 `admin_token_source` 查看。
 
 控制台或 Worker 提交 Cookie 后先原子写入 `data/cookies/accounts.json`，接口立即返回 `202 Accepted`；服务随后在后台初始化 session 并更新账号状态。`refreshing` 表示已保存、正在验证，验证失败会保留新值并显示可执行错误，不会让保存按钮一直等待上游。
 
@@ -216,15 +224,68 @@ COOKIE_WORKER_ACCOUNT=acc1 npm run login
 COOKIE_WORKER_ACCOUNT=acc1 npm run sync
 ```
 
+### CDP 模式（复用已登录浏览器）
+
+设置 `COOKIE_WORKER_CDP_URL` 后，Worker 不再启动自己的 profile，而是通过 Chrome DevTools Protocol 附加到已运行的 Chrome，读取该浏览器当前的 Gemini 登录 Cookie，然后退出。适合"日常 Chrome 已登录，不想再登一次"的场景；不设置该变量时行为与原来完全一致。
+
+#### 方式一：复用日常 Chrome（推荐，Chrome 144+）
+
+从 Chrome 144 起，默认 profile 可以通过设置页开启远程调试，不需要重启浏览器或再登录：
+
+1. 在日常 Chrome 打开 `chrome://inspect/#remote-debugging`，按页面提示启用远程调试（只需一次）。
+2. 直接运行 Worker，`COOKIE_WORKER_CDP_URL=auto` 会读取默认用户目录下的 `DevToolsActivePort` 并连接到这个正在运行的 Chrome。
+
+```bash
+cd tools/cookie-worker
+API_BASE=http://127.0.0.1:8787 \
+COOKIE_SYNC_TOKEN=你的token \
+COOKIE_WORKER_CDP_URL=auto \
+COOKIE_WORKER_ACCOUNT=chrome \
+COOKIE_WORKER_CREATE_ACCOUNT=true \
+node src/worker.mjs
+```
+
+Chrome 的连接请求可能弹出授权对话框，允许后才会建立调试会话。默认用户目录按平台自动定位（Windows 为 `%LOCALAPPDATA%\Google\Chrome\User Data`），需要指向其他目录时设置 `COOKIE_WORKER_CDP_PROFILE_DIR`。
+
+#### 方式二：独立调试实例（Chrome 136+ 起不能对默认目录使用命令行开关）
+
+`--remote-debugging-port` 自 Chrome 136 起只对非默认数据目录生效，因此可以用一个独立目录启动 Chrome（这个实例仍需登录一次）：
+
+```bash
+# Windows 示例
+"C:\Program Files\Google\Chrome\Application\chrome.exe" \
+  --remote-debugging-port=9222 \
+  --user-data-dir=%TEMP%\gemini-cdp
+```
+
+```bash
+COOKIE_WORKER_CDP_URL=http://127.0.0.1:9222 \
+COOKIE_WORKER_ACCOUNT=acc1 \
+node src/worker.mjs
+```
+
+行为说明：
+
+- 控制台页面本身无法读取浏览器 Cookie；控制台的「添加账号」仍需粘贴 Cookie，自动读取由本 Worker 完成。
+- `COOKIE_WORKER_ACCOUNT` 在该模式下是权威账号 ID，即使 `GEMINI_ACCOUNTS` 中没有它也可以。
+- 账号已存在时调用 `POST /admin/accounts/:id/cookies`；不存在且 `COOKIE_WORKER_CREATE_ACCOUNT=true` 时调用 `POST /admin/accounts` 新建。
+- 一次性同步，完成后进程退出；**不会关闭你的 Chrome**（Playwright 的 `browser.close()` 会发送 `Browser.close`，代码刻意没有调用）。
+- 只读取浏览器里已有的 Cookie，不会触发登录；未登录时返回 `read_cookies` 阶段错误并以非零码退出。
+- 无法探测 Chrome 自身使用的代理；新建账号的代理留空，继承服务端全局 `PROXY_URL`，需要专属代理时到控制台补充。
+- 附加 CDP 等于把浏览器控制权交给本地 Worker，仅应在本机使用；不要把调试端口暴露到网络。
+
 ### Worker 开关
 
 | 变量 | 说明 |
 |:---|:---|
-| `COOKIE_WORKER_ACCOUNT` | 只处理指定账号 |
+| `COOKIE_WORKER_ACCOUNT` | 只处理指定账号；CDP 模式下即使未列入 `GEMINI_ACCOUNTS` 也生效 |
 | `COOKIE_WORKER_OPEN_ONLY` | 只打开浏览器供人工登录 |
 | `COOKIE_WORKER_ONCE` | 同步一轮后退出 |
 | `COOKIE_WORKER_FORCE` | 强制同步，忽略远端 healthy 状态 |
 | `COOKIE_WORKER_HEADLESS` | 无头运行；首次登录建议 `false` |
+| `COOKIE_WORKER_CDP_URL` | 默认空；设为 `auto` 复用日常 Chrome（Chrome 144+），或填 `http://127.0.0.1:9222` / `ws://...` 附加到调试实例 |
+| `COOKIE_WORKER_CDP_PROFILE_DIR` | `auto` 模式使用的 Chrome User Data 目录，默认按平台自动定位 |
+| `COOKIE_WORKER_CREATE_ACCOUNT` | 默认 `false`；CDP 模式下账号不存在时自动创建 |
 
 ## 端到端测试
 
@@ -252,11 +313,12 @@ go run ./tools/e2e \
 | `PORT` | `8787` | 服务端口 |
 | `LOG_LEVEL` | `info` | 日志级别 |
 | `APP_ENV` | `development` | 运行环境 |
-| `COOKIE_SYNC_TOKEN` | 空 | admin 接口鉴权 token |
-| `PROXY_URL` | 空 | 单账号模式代理 |
-| `GEMINI_1PSID` | 空 | 单账号 `__Secure-1PSID` |
-| `GEMINI_1PSIDTS` | 空 | 单账号 `__Secure-1PSIDTS` |
-| `GEMINI_REFRESH_INTERVAL` | `2` | Cookie 自动刷新间隔（分钟） |
+| `COOKIE_SYNC_TOKEN` | 空（自动生成） | admin 接口鉴权 token；留空时启动生成随机值并落盘 |
+| `ADMIN_TOKEN_PATH` | `data/state/admin-token` | 自动生成 token 的落盘路径（0600）；设为空则只存内存 |
+| `PROXY_URL` | 空 | 默认代理；控制台新增账号留空时继承 |
+| `GEMINI_1PSID` | 空 | 单账号 `__Secure-1PSID`（可选，推荐控制台添加） |
+| `GEMINI_1PSIDTS` | 空 | 单账号 `__Secure-1PSIDTS`（可选） |
+| `GEMINI_REFRESH_INTERVAL` | `1440` | Cookie 自动刷新间隔（分钟） |
 | `GEMINI_MAX_RETRIES` | `2` | 请求未写入上游时的最大尝试次数；实际最多重试一次 |
 | `GEMINI_COOKIE_CACHE_ENABLED` | `true` | Cookie 缓存开关 |
 | `GEMINI_COOKIE_CACHE_PATH` | `data/cookies/accounts.json` | Cookie 缓存路径 |
@@ -283,7 +345,7 @@ go run ./tools/e2e \
 | `OPENAI_TRACE_STREAM_FORWARD` | `false` | provider 事件到 OpenAI SSE 的转发日志 |
 | `GEMINI_STREAM_FINISH_IDLE_MS` | `1500` | 流式 idle 收尾等待 |
 | `GEMINI_STREAM_FIRST_ACTIVITY_TIMEOUT_MS` | `15000` | 首个可见流活动（思考或正文）最大等待；旧的 `GEMINI_STREAM_FIRST_CONTENT_TIMEOUT_MS` 仍兼容 |
-| `GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS` | `30000` | 思考已开始、正文未出现时的连续无进度最大等待 |
+| `GEMINI_STREAM_PROGRESS_IDLE_TIMEOUT_MS` | `60000` | 思考已开始、正文未出现时的连续无进度最大等待；未设置时代码兜底 45s |
 | `GEMINI_WEB_STREAM_QUERY` | `false` | 强制带 Gemini Web 流式查询参数 |
 | `OPENAI_CONTEXT_LOCAL_FALLBACK` | `true` | 服务端会话不可信时从本地历史重建 |
 | `GEMINI_INCOGNITO` | `false` | 网页端隐私模式（Temporary chat）的启动默认值；控制台顶栏开关可运行时覆盖（`/admin/settings`），三协议请求体 `incognito` 字段可单请求开启 |

@@ -1,6 +1,11 @@
 package configs
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestLoadGeminiAccountsFromEnvironment(t *testing.T) {
 	t.Setenv("GEMINI_ACCOUNTS", "main, backup-1")
@@ -71,10 +76,26 @@ func TestValidateAllowsNamedAccountsWithoutInitialCookies(t *testing.T) {
 	}
 }
 
+func TestValidateAllowsEmptyAccountPool(t *testing.T) {
+	cfg := Config{Server: ServerConfig{Port: "8787"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected an empty account pool to validate, got %v", err)
+	}
+}
+
+func TestLoadGeminiAccountsEmptyWithoutConfig(t *testing.T) {
+	t.Setenv("GEMINI_ACCOUNTS", "")
+	accounts := loadGeminiAccounts(Config{})
+	if len(accounts) != 0 {
+		t.Fatalf("expected no synthesized accounts, got %#v", accounts)
+	}
+}
+
 func TestNewLoadsStartupCookieRotateFlag(t *testing.T) {
 	t.Setenv("PORT", "8787")
 	t.Setenv("GEMINI_ACCOUNTS", "acc1")
 	t.Setenv("GEMINI_STARTUP_COOKIE_ROTATE", "false")
+	t.Setenv("ADMIN_TOKEN_PATH", filepath.Join(t.TempDir(), "admin-token"))
 
 	cfg, err := New()
 	if err != nil {
@@ -82,5 +103,62 @@ func TestNewLoadsStartupCookieRotateFlag(t *testing.T) {
 	}
 	if cfg.Gemini.StartupCookieRotate {
 		t.Fatal("expected startup cookie rotation to be disabled")
+	}
+}
+
+func TestNewGeneratesAndReusesAdminToken(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "admin-token")
+	t.Setenv("PORT", "8787")
+	t.Setenv("GEMINI_ACCOUNTS", "")
+	t.Setenv("GEMINI_1PSID", "")
+	t.Setenv("COOKIE_SYNC_TOKEN", "")
+	t.Setenv("ADMIN_TOKEN_PATH", tokenPath)
+
+	cfg, err := New()
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if cfg.Admin.CookieSyncToken == "" {
+		t.Fatal("expected New to generate an admin token")
+	}
+	if cfg.Admin.CookieSyncTokenSource != "generated" || !cfg.Admin.CookieSyncTokenGenerated {
+		t.Fatalf("unexpected token source: %q generated=%v", cfg.Admin.CookieSyncTokenSource, cfg.Admin.CookieSyncTokenGenerated)
+	}
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatalf("expected token file to be written: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != cfg.Admin.CookieSyncToken {
+		t.Fatal("persisted token does not match the active token")
+	}
+
+	second, err := New()
+	if err != nil {
+		t.Fatalf("second New returned error: %v", err)
+	}
+	if second.Admin.CookieSyncToken != cfg.Admin.CookieSyncToken {
+		t.Fatal("expected the persisted admin token to be reused")
+	}
+	if second.Admin.CookieSyncTokenSource != "file" || second.Admin.CookieSyncTokenGenerated {
+		t.Fatalf("unexpected second-run token source: %q generated=%v", second.Admin.CookieSyncTokenSource, second.Admin.CookieSyncTokenGenerated)
+	}
+}
+
+func TestNewPrefersConfiguredAdminToken(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "admin-token")
+	t.Setenv("PORT", "8787")
+	t.Setenv("GEMINI_ACCOUNTS", "")
+	t.Setenv("COOKIE_SYNC_TOKEN", "explicit-token")
+	t.Setenv("ADMIN_TOKEN_PATH", tokenPath)
+
+	cfg, err := New()
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if cfg.Admin.CookieSyncToken != "explicit-token" || cfg.Admin.CookieSyncTokenSource != "env" {
+		t.Fatalf("expected env token to win, got %q from %q", cfg.Admin.CookieSyncToken, cfg.Admin.CookieSyncTokenSource)
+	}
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no token file when COOKIE_SYNC_TOKEN is set, got err=%v", err)
 	}
 }
